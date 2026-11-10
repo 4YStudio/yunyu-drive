@@ -812,12 +812,18 @@ defineExpose({ refresh });
 
     <!-- action bar -->
     <div class="actions">
+      <!-- Narrow windows drop the button labels (see the `max-width: 1179px`
+           block below), so every action keeps a `title` for its tooltip. -->
       <div class="actions-left">
-        <button class="btn btn--solid" @click="prompt = { mode: 'mkdir', value: '' }">
+        <button
+          class="btn btn--solid"
+          title="新建文件夹"
+          @click="prompt = { mode: 'mkdir', value: '' }"
+        >
           <Icon name="folder-plus" :size="14.5" />
           <span>新建文件夹</span>
         </button>
-        <button class="btn btn--ghost" :disabled="uploading" @click="pickUpload">
+        <button class="btn btn--ghost" title="上传文件" :disabled="uploading" @click="pickUpload">
           <Icon name="upload" :size="14.5" :spin="uploading" />
           <span>上传</span>
         </button>
@@ -832,27 +838,28 @@ defineExpose({ refresh });
         </button>
         <template v-if="selectedEntries.length">
           <span class="chip">已选 {{ selectedEntries.length }} 项</span>
-          <button class="btn btn--ghost" @click="downloadSelected">
+          <button class="btn btn--ghost" title="下载" @click="downloadSelected">
             <Icon name="download" :size="14.5" />
             <span>下载</span>
           </button>
-          <button class="btn btn--ghost" @click="openRelocate('move')">
+          <button class="btn btn--ghost" title="移动到…" @click="openRelocate('move')">
             <Icon name="move" :size="14.5" />
             <span>移动</span>
           </button>
-          <button class="btn btn--ghost" @click="openRelocate('copy')">
+          <button class="btn btn--ghost" title="复制到…" @click="openRelocate('copy')">
             <Icon name="copy" :size="14.5" />
             <span>复制</span>
           </button>
           <button
             v-if="selectedEntries.length === 1"
             class="btn btn--ghost"
+            title="重命名 (F2)"
             @click="prompt = { mode: 'rename', value: selectedEntries[0].name, target: selectedEntries[0] }"
           >
             <Icon name="rename" :size="14.5" />
             <span>重命名</span>
           </button>
-          <button class="btn btn--ghost" @click="requestDelete(selectedEntries)">
+          <button class="btn btn--ghost" title="删除 (Delete)" @click="requestDelete(selectedEntries)">
             <Icon name="trash" :size="14.5" />
             <span>删除</span>
           </button>
@@ -1265,7 +1272,10 @@ defineExpose({ refresh });
   position: relative;
   display: flex;
   align-items: center;
-  width: 210px;
+  /* Shrinks before the breadcrumbs do: the trail is the only thing telling the
+     user where they are, while the search box keeps working when narrow. */
+  flex: 0 1 210px;
+  min-width: 120px;
   height: 30px;
   padding: 0 9px 0 28px;
   border-radius: var(--radius-sm);
@@ -1309,11 +1319,17 @@ defineExpose({ refresh });
 }
 
 /* ------------------------------- actions ------------------------------- */
+/* The action bar is the one row that genuinely does not fit at the minimum
+   window width: nine buttons plus the selected-count chip and the view toggle
+   need ~920px, but a 940px window leaves 716px of content. Wrapping is the
+   safety net; the two `max-width` blocks below shrink the bar instead, so it
+   normally stays on one line rather than pushing the list down. */
 .actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   padding: 12px 16px 10px;
   flex: none;
 }
@@ -1321,7 +1337,37 @@ defineExpose({ refresh });
 .actions-right {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
+}
+/* The toggle keeps its two buttons side by side even when the bar wraps. */
+.actions-right {
+  flex-wrap: nowrap;
+}
+
+/* Nine action buttons plus the selected-count chip and the view toggle need
+   ~987px of content width on one line. Content is `window - 224px sidebar -
+   32px padding`, so the labels fit from 1243px up. Tightening the padding and
+   gaps brings that down to ~907px, which covers the default 1220px window.
+   Below that the bar would wrap into a second row and push the file list down,
+   so the labels go away and the bar shrinks to ~389px. Every button carries a
+   `title`, so the tooltip still names it. */
+@media (max-width: 1279px) {
+  .actions-left {
+    gap: 6px;
+  }
+  .actions-left .btn {
+    padding: 0 10px;
+  }
+}
+@media (max-width: 1179px) {
+  .actions-left .btn {
+    padding: 0 9px;
+  }
+  .actions-left .btn span {
+    display: none;
+  }
 }
 
 /* List / grid switch. Two icon buttons in one sunken pill. */
