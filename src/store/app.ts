@@ -40,7 +40,7 @@ interface AppStore {
   account: AccountInfo | null;
   /** Bumped whenever the file list should refetch (login, share saved, …). */
   filesToken: number;
-  /** A `quark-drive://` link queued for the share view. */
+  /** A deep-linked share queued for the share view. */
   shareLink: string | null;
   shareNonce: number;
   /** Drive currently shown in the file browser. */
@@ -269,7 +269,7 @@ export async function loadProviderProfiles() {
  * Signs out of one drive.
  *
  * Lives here rather than in a view because both the sidebar account bubble and
- * the settings rows need it. Quark keeps its session in the legacy
+ * the settings rows need it. Quark keeps its session in the single-drive
  * `authenticated`/`account` fields, so it is cleared separately.
  */
 export async function logoutProvider(id: ProviderId) {
@@ -333,11 +333,9 @@ export async function ensureUsableProvider() {
 }
 
 export async function bootstrap() {
-  // Read the pre-rename key once so the theme survives the rebrand.
   const storedProvider = localStorage.getItem(storageKey("provider")) as ProviderId | null;
   if (storedProvider) app.activeProvider = storedProvider;
-  const stored = (localStorage.getItem(storageKey("theme")) ??
-    localStorage.getItem("quark.theme")) as ThemeMode | null;
+  const stored = localStorage.getItem(storageKey("theme")) as ThemeMode | null;
   if (stored === "light" || stored === "dark" || stored === "system") {
     app.themeMode = stored;
   }

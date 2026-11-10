@@ -34,7 +34,7 @@ pub struct AppState {
     pub transfers: Arc<TransferManager>,
     /// Nickname + avatar of the signed-in account, filled lazily.
     pub account: RwLock<Option<crate::share::AccountInfo>>,
-    /// A `quark-drive://` link that arrived before the UI could listen.
+    /// A deep-linked share that arrived before the UI could listen.
     pub pending_link: RwLock<Option<String>>,
     /// Mirrors of the two settings the tray and the notification code need.
     ///

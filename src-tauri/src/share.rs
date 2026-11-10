@@ -243,9 +243,8 @@ pub fn parse_link(input: &str) -> AppResult<ShareTarget> {
         return Err(AppError::new("请输入分享链接"));
     }
     let mut url = raw.to_string();
-    // Our current scheme plus the pre-rebrand one; `deeplink::normalize` emits
-    // the former, links saved before the rename still carry the latter.
-    let own_scheme = ["yunyu-drive://", "quark-drive://"]
+    // Our own link form; `deeplink::normalize` produces it from every other shape.
+    let own_scheme = ["yunyu-drive://"]
         .into_iter()
         .find(|prefix| url.to_ascii_lowercase().starts_with(prefix));
     if let Some(scheme) = own_scheme {

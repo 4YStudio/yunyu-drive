@@ -6,14 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 
 /// Directory name under `~/.config`, `~/.cache` and `~/.local/share`.
-///
-/// Renamed from `quark-desktop` when the app grew into a multi-drive client.
-/// [`AppPaths::resolve`] migrates the old directory once, so an existing user
-/// keeps their cookie, settings and transfer history instead of being logged out.
 pub const APP_DIR_NAME: &str = "yunyu-drive";
-
-/// Name used before the rebrand; only read during migration.
-const LEGACY_DIR_NAME: &str = "quark-desktop";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -82,37 +75,11 @@ impl AppPaths {
         let dirs = ProjectDirs::from("", "", APP_DIR_NAME).ok_or_else(|| {
             AppError::new("无法定位系统配置目录（XDG_CONFIG_HOME 未设置）")
         })?;
-        let paths = Self {
+        Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             cache_dir: dirs.cache_dir().to_path_buf(),
             log_dir: dirs.data_local_dir().join("logs"),
-        };
-        paths.migrate_legacy();
-        Ok(paths)
-    }
-
-    /// Copies the pre-rename `quark-desktop` directories over the first time the
-    /// renamed build starts.
-    ///
-    /// Copy (not move) on purpose: if anything goes wrong half-way the old data
-    /// is still intact, and a user who downgrades keeps their session. The
-    /// marker file makes this a one-shot that never overwrites newer data.
-    fn migrate_legacy(&self) {
-        let marker = self.config_dir.join(".migrated-from-quark-desktop");
-        if marker.exists() {
-            return;
-        }
-        let Some(legacy) = ProjectDirs::from("", "", LEGACY_DIR_NAME) else {
-            return;
-        };
-        let moved = copy_dir_if_missing(legacy.config_dir(), &self.config_dir);
-        let _ = copy_dir_if_missing(legacy.cache_dir(), &self.cache_dir);
-        if moved > 0 {
-            let _ = std::fs::write(
-                &marker,
-                format!("migrated {moved} files from {LEGACY_DIR_NAME}\n"),
-            );
-        }
+        })
     }
 
     pub fn cookie_file(&self) -> PathBuf {
@@ -133,35 +100,6 @@ impl AppPaths {
         }
         Ok(())
     }
-}
-
-/// Copies files from `from` into `to`, skipping anything that already exists.
-/// Returns how many files were actually copied.
-fn copy_dir_if_missing(from: &Path, to: &Path) -> usize {
-    if !from.is_dir() {
-        return 0;
-    }
-    let _ = std::fs::create_dir_all(to);
-    let mut copied = 0;
-    let Ok(entries) = std::fs::read_dir(from) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let src = entry.path();
-        if !src.is_file() {
-            continue;
-        }
-        let Some(name) = src.file_name() else { continue };
-        let dst = to.join(name);
-        if dst.exists() {
-            continue;
-        }
-        if std::fs::copy(&src, &dst).is_ok() {
-            restrict_permissions(&dst);
-            copied += 1;
-        }
-    }
-    copied
 }
 
 /// Cookie resolution order mirrors the CLI: env var first, then the config file.

@@ -63,8 +63,7 @@ const anchor = ref<string | null>(null);
 const sortKey = ref<SortKey>("name");
 const sortAsc = ref(true);
 function initialDensity(): "comfortable" | "compact" {
-  const stored =
-    localStorage.getItem(storageKey("density")) ?? localStorage.getItem("quark.density");
+  const stored = localStorage.getItem(storageKey("density"));
   return stored === "compact" ? "compact" : "comfortable";
 }
 const density = ref<"comfortable" | "compact">(initialDensity());

@@ -96,7 +96,8 @@ pub async fn provider_profiles(state: State<'_, Arc<AppState>>) -> AppResult<Vec
     Ok(out)
 }
 
-/// Legacy single-drive query, kept for the existing UI which shows one status.
+/// Single-drive status query the older UI rows still use (the per-drive status
+/// lives in `auth_states`).
 #[tauri::command]
 pub async fn auth_status(state: State<'_, Arc<AppState>>) -> AppResult<AuthStatus> {
     let cookie = state.cookie.read().await.clone();

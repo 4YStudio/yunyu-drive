@@ -29,7 +29,7 @@ fn system_theme() -> &'static str {
     theme::detect()
 }
 
-/// Event emitted when a `quark-drive://` link arrives while the app is running.
+/// Event emitted when a deep-linked share arrives while the app is running.
 pub const EVENT_DEEPLINK: &str = "deeplink://open";
 /// Asks the UI to switch screens (tray "传输列表").
 pub const EVENT_NAVIGATE: &str = "app://navigate";
@@ -43,7 +43,7 @@ async fn deeplink_take(
     Ok(state.pending_link.write().await.take())
 }
 
-/// First share link among `args`, normalised to `quark-drive://share?url=…`.
+/// First share link among `args`, normalised to `yunyu-drive://share?url=…`.
 ///
 /// A launch can come from our own desktop entry, from the web client's
 /// `qklink://` handler, or from a plain `pan.quark.cn/s/…` URL, so every

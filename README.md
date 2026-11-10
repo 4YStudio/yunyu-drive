@@ -7,9 +7,8 @@
 仓库目录名、包名、可执行文件名统一为 `yunyu-drive`（deb 包名 `Yunyu Drive_<版本>_<架构>.deb`，
 因为 deb 的 `Package` 字段只允许 ASCII，显示名「云语聚合网盘」在桌面模板里）。
 
-> 这个项目是从一个只支持夸克网盘的客户端长出来的，因此源码里仍能找到 `quark` 的痕迹：
-> 那是**五个网盘之一**（`ProviderId::Quark`）、夸克自己的接口地址，以及为了兼容旧安装保留的
-> 旧配置目录 `~/.config/quark-desktop/` 与旧深链 `quark-drive://`。这些都不是历史残留。
+> 源码里仍能找到 `quark` 的痕迹：那是**五个网盘之一**（`ProviderId::Quark`）以及夸克自己的
+> 接口地址与深链 `qklink://`（夸克官网「打开客户端」按钮会触发它）。这些都不是历史残留。
 
 | 文件（深色） | 文件（浅色） |
 | --- | --- |
@@ -62,12 +61,10 @@
 - **分享链接（五个网盘都支持）**：「分享链接」页粘贴链接即可预览分享内容、逐级浏览子目录、
   批量**转存**到自己网盘或**下载**到本地。识别夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘
   五种链接（`?pwd=` 直接认，没有就填右边的「提取码」框）。
-  支持系统级深链 `yunyu-drive://share?url=<encodeURIComponent(链接)>`
-  （旧的 `quark-drive://`、`qklink://`、`qkclouddrive://` 仍然有效）。
+  支持系统级深链 `yunyu-drive://share?url=<encodeURIComponent(链接)>`；
+  夸克官网的 `qklink://` / `qkclouddrive://` 也照收。
   各盘差异见下面「分享链接的实现差异」。
-- **登录凭据只存本地**：`~/.config/yunyu-drive/`（0600）。首次启动会从旧版
-  `~/.config/quark-desktop/` 复制 `cookie.txt` / `settings.json` / `transfers.json`，
-  并留下 `.migrated-from-quark-desktop` 标记（见 `src-tauri/src/config.rs` 的 `LEGACY_DIR_NAME`）。
+- **登录凭据只存本地**：`~/.config/yunyu-drive/`（0600）。
 
 ## 文档
 

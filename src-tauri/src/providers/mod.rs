@@ -164,9 +164,10 @@ pub fn qualify(provider: ProviderId, native: &str) -> String {
 
 /// Strips a `<provider>:` prefix, leaving bare ids untouched.
 ///
-/// Old saved settings and transfer records carry bare ids from before the
-/// multi-drive refactor; they are Quark ids, and each caller already knows which
-/// drive it is talking to, so a bare id is returned as-is.
+/// Bare ids are the normal case internally: `root`, `0` and `/` are passed
+/// around as drive-native markers, and each caller already knows which drive it
+/// is talking to, so anything without a recognised provider prefix is returned
+/// as-is.
 pub fn native_of(raw: &str) -> String {
     match raw.split_once(':') {
         Some((head, native)) if ProviderId::parse(head).is_some() => native.to_string(),
@@ -629,9 +630,9 @@ mod tests {
         assert!(EntryId::parse("").is_err());
     }
 
-    /// Ids saved by the pre-multi-drive build are bare Quark fids.
+    /// Bare ids must survive: `root` / `0` / `/` are drive-native markers.
     #[test]
-    fn native_of_unwraps_and_tolerates_legacy_ids() {
+    fn native_of_unwraps_and_keeps_bare_ids() {
         assert_eq!(native_of("quark:abc"), "abc");
         assert_eq!(native_of("abc"), "abc");
         // A colon inside the native id must not be mistaken for a provider.

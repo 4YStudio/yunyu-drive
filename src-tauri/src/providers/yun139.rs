@@ -36,8 +36,9 @@ use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
 /// Marker id for the root folder.
 const ROOT: &str = "0";
 
-/// Where the `cloud139` CLI keeps its config: `~/.config/cloud139/cloud139rc.toml`.
-fn legacy_config_path() -> std::path::PathBuf {
+/// Where the sibling `cloud139` CLI keeps its config:
+/// `~/.config/cloud139/cloud139rc.toml`.
+fn cli_config_path() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     home.unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".config")
@@ -70,22 +71,23 @@ impl Yun139Provider {
     }
 
     /// Reads the token from the app's own config directory, falling back to the
-    /// path the CLI uses so an existing `cloud139 login` keeps working.
+    /// path the sibling CLI uses so an existing `cloud139 login` keeps working.
     pub fn load(own_dir: &Path) -> AppResult<Self> {
         let own = own_dir.join("yun139.toml");
         let text = if own.exists() {
             std::fs::read_to_string(&own)
                 .map_err(|e| AppError::new(format!("读取 139 配置失败：{e}")))?
         } else {
-            // The CLI stores its config globally; try that before giving up.
+            // The CLI stores its config globally; try that before giving up, so a
+            // user who already ran `cloud139 login` does not have to sign in again.
             // Computed here rather than through `C139Config::config_path()`:
             // `lib.rs` points the crate's own save path at `yun139.toml`, so the
             // crate would answer with our file instead of the CLI's.
-            let legacy = legacy_config_path();
-            if !legacy.exists() {
+            let cli = cli_config_path();
+            if !cli.exists() {
                 return Err(AppError::new("尚未登录中国移动云盘"));
             }
-            std::fs::read_to_string(&legacy)
+            std::fs::read_to_string(&cli)
                 .map_err(|e| AppError::new(format!("读取 139 配置失败：{e}")))?
         };
         let config: C139Config = toml::from_str(&text)

@@ -77,12 +77,11 @@ function rootFid(provider: string) {
   return "0";
 }
 
-/// Turns `quark-drive://share?url=…` / scheme-less links into the canonical
+/// Turns `yunyu-drive://share?url=…` / scheme-less links into the canonical
 /// `https://pan.quark.cn/s/<id>?pwd=<code>` form so the input stays readable.
 function normalizeLink(input: string) {
   let text = input.trim();
-  // `yunyu-drive://` is the current scheme, `quark-drive://` the pre-rename one.
-  if (text.startsWith("yunyu-drive://") || text.startsWith("quark-drive://")) {
+  if (text.startsWith("yunyu-drive://")) {
     const query = text.split("?")[1] ?? "";
     const params = new URLSearchParams(query);
     const inner = params.get("url") || params.get("link");

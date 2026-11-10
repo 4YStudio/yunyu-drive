@@ -9,16 +9,15 @@
 //!   another link in its `url` field.
 //! * `qklink://openShareModal?pwdid=<id>&passcode=<pwd>&…` — the inner link.
 //! * `qkclouddrive://…` — the same thing under the older scheme name.
-//! * our own `yunyu-drive://share?url=<encoded https link>`, plus the
-//!   pre-rebrand `quark-drive://share?…` which must keep working.
+//! * our own `yunyu-drive://share?url=<encoded https link>`.
 //!
-//! Everything is folded into our current form, which `share::parse_link`
-//! already understands, so the rest of the app never sees the difference.
+//! `qklink` and `qkclouddrive` are not ours: they are what the Quark website
+//! fires from its 「打开客户端」 button, so they have to keep working for the
+//! Quark drive to be reachable from the browser. Everything is folded into our
+//! own form, which `share::parse_link` already understands.
 
 /// Scheme we emit today.
 pub const SCHEME: &str = "yunyu-drive";
-/// Scheme emitted by releases before the rebrand.
-pub const LEGACY_SCHEME: &str = "quark-drive";
 
 /// Folds any supported link into `yunyu-drive://share?url=…`, or `None` when the
 /// argument carries no share at all (the web client also sends `…/desktop_info`).
@@ -29,14 +28,9 @@ pub fn normalize(raw: &str) -> Option<String> {
     }
 
     let lower = raw.to_ascii_lowercase();
-    // Already in our own form (current or pre-rebrand).
+    // Already in our own form.
     if lower.starts_with(&format!("{SCHEME}://")) {
         return Some(raw.to_string());
-    }
-    if lower.starts_with(&format!("{LEGACY_SCHEME}://")) {
-        // Re-tag the scheme but keep the `share?url=…` payload as is.
-        let rest = &raw[LEGACY_SCHEME.len() + 3..];
-        return Some(format!("{SCHEME}://{rest}"));
     }
 
     // A plain share page URL (that is what a copied browser link looks like).
@@ -173,17 +167,6 @@ mod tests {
         assert_eq!(
             link,
             "yunyu-drive://share?url=https%3A%2F%2Fpan.quark.cn%2Fs%2Fabc123%3Fpwd%3D9zZ9"
-        );
-    }
-
-    #[test]
-    fn keeps_pre_rebrand_links_working() {
-        // Releases before the rename emitted `quark-drive://`; those links may
-        // still sit in someone's browser or shell history.
-        let link = normalize("quark-drive://share?url=https%3A%2F%2Fpan.quark.cn%2Fs%2Fabc").unwrap();
-        assert_eq!(
-            link,
-            "yunyu-drive://share?url=https%3A%2F%2Fpan.quark.cn%2Fs%2Fabc"
         );
     }
 

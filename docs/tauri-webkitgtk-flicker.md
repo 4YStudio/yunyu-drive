@@ -422,7 +422,7 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 探测不到才退化成"下载客户端"。所以光注册 `x-scheme-handler/xxx` 不够：
 
 ```ini
-MimeType=x-scheme-handler/quark-drive;x-scheme-handler/qklink;x-scheme-handler/qkclouddrive;
+MimeType=x-scheme-handler/yunyu-drive;x-scheme-handler/qklink;x-scheme-handler/qkclouddrive;
 ```
 
 再加上一个 loopback HTTP 服务应答 `/desktop_info`、`/desktop_caller?deeplink=…`。

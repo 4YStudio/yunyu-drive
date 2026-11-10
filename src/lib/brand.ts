@@ -16,8 +16,6 @@ export const BRAND = {
   storagePrefix: "yunyu",
   /** Custom protocol the app answers. */
   scheme: "yunyu-drive",
-  /** Protocols from previous versions we still accept. */
-  legacySchemes: ["quark-drive", "qklink", "qkclouddrive"],
 } as const;
 
 /** `localStorage` key inside the brand namespace. */
