@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Yunyu Drive",
+  "version": "0.1.0",
+  "identifier": "io.github.yunyudrive.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5183",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "云语聚合网盘",
+        "width": 1220,
+        "height": 800,
+        "minWidth": 940,
+        "minHeight": 620,
+        "center": true,
+        "resizable": true,
+        "decorations": false,
+        "transparent": false,
+        "theme": null,
+        "dragDropEnabled": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "deb"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "category": "Utility",
+    "shortDescription": "云语聚合网盘桌面客户端",
+    "longDescription": "一个把夸克、中国移动云盘、阿里云盘、123 云盘聚合在一个界面里的 Linux 桌面客户端，基于 Tauri 与 Vue 3 构建。",
+    "linux": {
+      "deb": {
+        "desktopTemplate": "desktop-template.hbs"
+      }
+    }
+  }
+}

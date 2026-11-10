@@ -1,0 +1,71 @@
+云语聚合网盘 (Yunyu Drive)
+==========================
+
+本程序以 GPL-3.0-or-later 发布。它把若干云盘的客户端协议实现在同一个界面里，
+下面列出这些实现所依据的上游项目及其许可。
+
+本程序自身代码
+--------------
+Copyright (C) 2026
+License: GPL-3.0-or-later（见 LICENSE）
+
+直接链接的库
+------------
+* libquarkpan —— 夸克网盘协议客户端
+  来源: quark-cli/libquarkpan (https://github.com/…)
+  License: GPL-3.0-only
+  说明: 作为 Rust 库直接依赖。GPL-3.0-only 与 GPL-3.0-or-later 兼容，
+        因此本程序的整体许可为 GPL-3.0。
+
+* cloud139 —— 中国移动云盘（139 云盘）协议客户端
+  来源: https://github.com/Cnotech/cloud139
+  License: MIT
+  说明: 作为 Rust 库直接依赖。MIT 与 GPL-3.0 兼容。
+
+协议实现参考的上游项目
+----------------------
+以下项目**没有**被链接或包含在二进制中；其公开的接口定义与请求格式被用作
+实现同一协议的参考资料，据此用 Rust 独立重写。按各自许可要求在此致谢：
+
+* quark-cli / kuake_cli (GPL-3.0 / AGPL-3.0)
+  夸克网盘文件、分享与传输接口的参考资料。
+
+* tickstep/aliyunpan-api (Apache-2.0)
+  阿里云盘接口的端点、参数与响应结构（网页版 `api.aliyundrive.com` 的
+  `/adrive/v3/file/list`、`/adrive/v4/batch`、`/v2/file/get_download_url` 等，
+  以及设备签名 `x-device-id`/`x-signature` 的算法）。本程序的阿里云盘客户端
+  据此独立实现。
+
+* kazutoiris/ali_ecc (无显式许可，仅作算法核对)
+  仅用于交叉验证 secp256k1 设备签名的字节布局（`hex(sig) + "01"`、
+  公钥 `"04" + hex(point)`），未复制任何代码。
+
+* gngpp/aliyundrive-cli (MIT)
+  阿里云盘扫码登录与 token 刷新流程的参考资料。
+
+* 123panNextGen/123pan-cli (GPL-3.0)
+  123 云盘 Android 客户端协议（文件列表、下载直链、S3 分片上传、分享）
+  的参考资料。
+
+* yuexiaoliang/baidupan-cli (MIT)
+  百度网盘接口的端点、参数与响应结构（`/rest/2.0/xpan/file` 的
+  `list`/`precreate`/`create`/`filemanager`、`/rest/2.0/xpan/multimedia`
+  的 `filemetas`、`/api/quota`）以及分片与 `block_list` 的形状。
+  本程序的百度网盘客户端据此独立实现，未链接其代码（该项目为 TypeScript）。
+
+* OpenListTeam/OpenList (Apache-2.0)
+  `drivers/baidu_netdisk` 与 `drivers/baidu_photo` 被用作协议核对：分片大小
+  策略（4/16/32 MiB）、`slice-md5` 取前 256 KiB、`filelist` 在
+  `rename`/`move`/`copy`/`delete` 下的不同形状、`dlink` 到 CDN 的
+  `Location` 跳转，以及网页版 cookie 会话（`BDUSS`/`STOKEN` + `bdstoken`）。
+  同样未复制其代码。
+
+* Bao-qing/123pan 与 OlyMarco/123pan-uploader-cli
+  仅用于核对 123 云盘的字段细节。这两个项目分别声明「禁止商用/仅限学习」
+  与「无许可证」，因此本程序**没有**使用它们的任何代码，也没有复制其实现；
+  123 云盘部分完全依据上述 GPL-3.0 的 123pan-cli 实现。
+
+第三方运行时依赖
+----------------
+Rust crates（tauri、reqwest、tokio、serde 等）与前端依赖（Vue 3 等）
+的许可见各自 crate / package 的元数据。

@@ -1,0 +1,43 @@
+# --- 前端 ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+.vite-inspect/
+
+# 构建/预览时生成的 mock 包（scripts 里会写到 /tmp，这里只是兜底）
+/mock-dist/
+
+# --- Rust / Tauri ---
+src-tauri/target/
+# tauri-build 每次构建都会重写这两处，不入库
+src-tauri/gen/schemas/
+src-tauri/gen/android/app/src/main/assets/
+src-tauri/gen/apple/Assets.xcassets/
+src-tauri/gen/apple/build/
+# 打包产物
+*.deb
+*.rpm
+*.AppImage
+*.snap
+*.msi
+*.dmg
+
+# --- 运行时产物 ---
+# cloud139 曾经把配置丢在这里（现已改到 ~/.config/yunyu-drive/）
+src-tauri/cloud139rc.toml
+# 手滑留下的调试输出
+src-tauri/err.txt
+*.log
+logs/
+
+# --- 编辑器 / 系统 ---
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

@@ -1,0 +1,57 @@
+[package]
+name = "yunyu-drive"
+version = "0.1.0"
+description = "云语聚合网盘 —— 夸克 / 移动云盘 / 阿里云盘 / 123 云盘 聚合客户端"
+license = "GPL-3.0-or-later"
+edition = "2021"
+rust-version = "1.82"
+
+[lib]
+name = "yunyu_drive_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# Used for production builds: serve the bundled frontend instead of a dev server.
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+futures-util = "0.3"
+bytes = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+directories = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+libquarkpan = { path = "../../quark-cli/libquarkpan", default-features = false, features = ["rustls"] }
+tauri-plugin-single-instance = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "query", "cookies", "form", "multipart"] }
+base64 = "0.22"
+tauri-plugin-notification = "2"
+async-trait = "0.1"
+# 中国移动云盘 (139): MIT-licensed Rust client, used as a library.
+cloud139 = { path = "../../cloud139" }
+# Hex encoding for the 139 token / 123 云盘 signatures.
+toml = "0.9"
+hex = "0.4"
+percent-encoding = "2"
+k256 = { version = "0.13.4", features = ["ecdsa"] }
+sha2 = "0.10.9"
+# AES-256-CBC for the 139 user-profile endpoint (`cloud139` only does AES-128).
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,5 @@
+# `tauri dev` rebuilds on every change under `src-tauri/`. The cloud139
+# crate used to drop its config in here; it now writes to the app config dir
+# (see `set_config_override` in `lib.rs`), but ignore it anyway so a stray
+# copy from an older build cannot restart the dev server in a loop.
+cloud139rc.toml

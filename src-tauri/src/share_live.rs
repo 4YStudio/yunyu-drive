@@ -1,0 +1,916 @@
+//! End-to-end probes for the share implementations.
+//!
+//! These talk to the real drives with the credentials in
+//! `~/.config/yunyu-drive/`, so they are `#[ignore]`d. Run them with
+//!
+//! ```text
+//! cargo test --lib share_live -- --ignored --nocapture
+//! ```
+
+use std::sync::Arc;
+
+use crate::error::AppResult;
+use crate::providers::{DriveProvider, ProviderId};
+use crate::share::{self, ShareSession};
+
+fn config_dir() -> std::path::PathBuf {
+    crate::config::AppPaths::resolve().unwrap().config_dir
+}
+
+fn drive(provider: ProviderId) -> Option<Arc<dyn DriveProvider>> {
+    let dir = config_dir();
+    let built: AppResult<Arc<dyn DriveProvider>> = match provider {
+        ProviderId::Quark => {
+            let cookie = std::fs::read_to_string(dir.join("cookie.txt")).ok()?;
+            let client = libquarkpan::QuarkPan::builder()
+                .cookie(cookie.trim())
+                .api_base_url("https://drive.quark.cn")
+                .prepare()
+                .ok()?;
+            Ok(Arc::new(crate::providers::quark::QuarkProvider::new(
+                client,
+                cookie.trim().to_string(),
+                dir.join("cookie.txt").to_string_lossy().to_string(),
+            )))
+        }
+        ProviderId::Yun139 => crate::providers::yun139::Yun139Provider::load(&dir).map(|p| {
+            let p: Arc<dyn DriveProvider> = Arc::new(p);
+            p
+        }),
+        ProviderId::Pan123 => crate::providers::pan123::Pan123Provider::load(&dir).map(|p| {
+            let p: Arc<dyn DriveProvider> = Arc::new(p);
+            p
+        }),
+        ProviderId::Aliyun => crate::providers::aliyun::AliyunProvider::load(&dir).map(|p| {
+            let p: Arc<dyn DriveProvider> = Arc::new(p);
+            p
+        }),
+        ProviderId::Baidu => crate::providers::baidu::BaiduProvider::load(&dir).map(|p| {
+            let p: Arc<dyn DriveProvider> = Arc::new(p);
+            p
+        }),
+    };
+    match built {
+        Ok(d) => Some(d),
+        Err(err) => {
+            println!("  [skip] {} 未登录：{err}", provider.as_str());
+            None
+        }
+    }
+}
+
+fn show(session: &ShareSession, entries: &[crate::share::ShareEntry]) {
+    println!(
+        "  title={:?} owner={:?} files={} size={} canSave={} avatar={}",
+        session.title,
+        session.owner,
+        session.file_num,
+        session.total_size,
+        session.can_save,
+        session.owner_avatar.is_some()
+    );
+    for entry in entries.iter().take(8) {
+        println!(
+            "    {:<40} dir={:<5} size={:<12} token={}",
+            entry.name,
+            entry.is_dir,
+            entry.size,
+            if entry.token.is_empty() {
+                "-".to_string()
+            } else {
+                entry.token.chars().take(18).collect::<String>()
+            }
+        );
+    }
+}
+
+async fn probe(provider: ProviderId, link: &str) {
+    println!("\n=== {} ===", provider.as_str());
+    let Some(drive) = drive(provider) else { return };
+    println!(
+        "  capabilities share_open={} share_create={}",
+        drive.capabilities().share_open,
+        drive.capabilities().share_create
+    );
+    let target = match share::parse_link(link) {
+        Ok(t) => t,
+        Err(err) => {
+            println!("  parse ERR {err}");
+            return;
+        }
+    };
+    println!("  parsed id={} pwd={:?}", target.id, target.passcode);
+    let session = match drive.share_open(&target.id, &target.passcode).await {
+        Ok(s) => s,
+        Err(err) => {
+            println!("  share_open ERR {err}");
+            return;
+        }
+    };
+    let dir = match provider {
+        ProviderId::Yun139 | ProviderId::Aliyun => "root",
+        ProviderId::Baidu => "/",
+        _ => "0",
+    };
+    let share_ref = crate::transfer::ShareRef {
+        provider: provider.as_str().to_string(),
+        pwd_id: session.pwd_id.clone(),
+        stoken: session.stoken.clone(),
+        fid_token: String::new(),
+        passcode: session.passcode.clone(),
+    };
+    match drive.share_list(&share_ref, dir).await {
+        Ok(listing) => {
+            show(&session, &listing.entries);
+            println!("  total={}", listing.total);
+            // Descend into the first folder to prove paging/nesting works.
+            if let Some(folder) = listing.entries.iter().find(|e| e.is_dir) {
+                println!("  → 进入「{}」", folder.name);
+                match drive.share_list(&share_ref, &folder.fid).await {
+                    Ok(inner) => {
+                        for entry in inner.entries.iter().take(5) {
+                            println!(
+                                "    {:<40} dir={:<5} size={}",
+                                entry.name, entry.is_dir, entry.size
+                            );
+                        }
+                        println!("  inner total={}", inner.total);
+                    }
+                    Err(err) => println!("  inner ERR {err}"),
+                }
+            }
+            match drive.share_walk(&share_ref, dir).await {
+                Ok(files) => {
+                    println!("  walk {} files", files.len());
+                    for file in files.iter().take(4) {
+                        println!("    {} ({} B)", file.relative.display(), file.size);
+                    }
+                }
+                Err(err) => println!("  walk ERR {err}"),
+            }
+            // Walk gives the deepest first file; a share whose root holds only
+            // folders has none in `listing.entries`.
+            let first_file: Option<(String, String, String, u64)> = match drive
+                .share_walk(&share_ref, dir)
+                .await
+            {
+                Ok(files) => files
+                    .iter()
+                    .min_by_key(|f| f.size)
+                    .map(|f| (f.fid.clone(), f.token.clone(), f.name.clone(), f.size)),
+                Err(_) => None,
+            };
+            if let Some((fid, token, name, _size)) = first_file.as_ref() {
+                let mut single = share_ref.clone();
+                single.fid_token = token.clone();
+                println!("  link 「{name}」（最小文件）…");
+                match drive.share_link(&single, fid).await {
+                    Ok(link) => {
+                        println!(
+                            "    url={}… size={} cleanup={:?}",
+                            link.url.chars().take(90).collect::<String>(),
+                            link.size,
+                            link.cleanup_fid
+                        );
+                        match share::probe_link(&link.url, &link.headers).await {
+                            Ok(info) => println!("    GET → {info}"),
+                            Err(err) => println!("    GET ERR {err}"),
+                        }
+                        if let Some(fid) = &link.cleanup_fid {
+                            drive.share_cleanup(fid).await;
+                            println!("    cleanup done");
+                        }
+                    }
+                    Err(err) => println!("    link ERR {err}"),
+                }
+            }
+            if let Some(first) = listing.entries.iter().find(|e| !e.is_dir) {
+                let mut single = share_ref.clone();
+                single.fid_token = first.token.clone();
+                println!("  link 「{}」…", first.name);
+                match drive.share_link(&single, &first.fid).await {
+                    Ok(link) => {
+                        println!(
+                            "    url={}… size={} cleanup={:?}",
+                            link.url.chars().take(90).collect::<String>(),
+                            link.size,
+                            link.cleanup_fid
+                        );
+                        match share::probe_link(&link.url, &link.headers).await {
+                            Ok(info) => println!("    GET → {info}"),
+                            Err(err) => println!("    GET ERR {err}"),
+                        }
+                        if let Some(fid) = &link.cleanup_fid {
+                            drive.share_cleanup(fid).await;
+                            println!("    cleanup done");
+                        }
+                    }
+                    Err(err) => println!("    link ERR {err}"),
+                }
+            }
+        }
+        Err(err) => println!("  share_list ERR {err}"),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn share_live_quark() {
+    probe(
+        ProviderId::Quark,
+        "https://pan.quark.cn/s/af886c338574?pwd=6M1m",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn share_live_yun139() {
+    probe(
+        ProviderId::Yun139,
+        "https://yun.139.com/shareweb/#/w/i/2yA8EKhoE66zy?pwd=oa5t",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123() {
+    probe(
+        ProviderId::Pan123,
+        "https://1818505815.share.123pan.cn/123pan/yYphjv-HgZXH?pwd=YfKu",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn share_live_aliyun() {
+    probe(ProviderId::Aliyun, "https://www.alipan.com/s/iqj4mzirYtX").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn share_live_baidu() {
+    probe(
+        ProviderId::Baidu,
+        "https://pan.baidu.com/s/1Gb3CPF1uBTgEaH5BdXwbAQ",
+    )
+    .await;
+}
+
+/// Saves the first file of a share and reports where it landed.
+#[tokio::test]
+#[ignore]
+async fn share_live_save() {
+    for (provider, link) in [
+        (ProviderId::Quark, "https://pan.quark.cn/s/af886c338574?pwd=6M1m"),
+        (ProviderId::Yun139, "https://yun.139.com/shareweb/#/w/i/2yA8EKhoE66zy?pwd=oa5t"),
+        (
+            ProviderId::Pan123,
+            "https://1818505815.share.123pan.cn/123pan/yYphjv-HgZXH?pwd=YfKu",
+        ),
+        (ProviderId::Aliyun, "https://www.alipan.com/s/iqj4mzirYtX"),
+        (
+            ProviderId::Baidu,
+            "https://pan.baidu.com/s/1Gb3CPF1uBTgEaH5BdXwbAQ",
+        ),
+    ] {
+        println!("\n=== save {} ===", provider.as_str());
+        let Some(drive) = drive(provider) else { continue };
+        let Ok(target) = share::parse_link(link) else {
+            continue;
+        };
+        let Ok(session) = drive.share_open(&target.id, &target.passcode).await else {
+            println!("  open failed");
+            continue;
+        };
+        let share_ref = crate::transfer::ShareRef {
+            provider: provider.as_str().to_string(),
+            pwd_id: session.pwd_id.clone(),
+            stoken: session.stoken.clone(),
+            fid_token: String::new(),
+            passcode: session.passcode.clone(),
+        };
+        let dir = match provider {
+            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            ProviderId::Baidu => "/",
+            _ => "0",
+        };
+        // Shares whose root holds only folders need a walk to reach a file.
+        let Ok(files) = drive.share_walk(&share_ref, dir).await else {
+            println!("  walk failed");
+            continue;
+        };
+        let Some(file) = files.iter().min_by_key(|f| f.size) else {
+            println!("  no file to save");
+            continue;
+        };
+        let entry = crate::share::ShareEntry {
+            fid: file.fid.clone(),
+            token: file.token.clone(),
+            name: file.name.clone(),
+            size: file.size,
+            is_dir: false,
+            updated_at: 0,
+        };
+        println!("  saving 「{}」 ({} B)", entry.name, entry.size);
+        match drive.share_save(&share_ref, &[entry], None).await {
+            Ok(count) => println!("  saved {count}"),
+            Err(err) => println!("  save ERR {err}"),
+        }
+    }
+}
+
+/// Prints every drive's nickname + avatar, exactly as the sidebar sees them.
+///
+/// This is the probe for the `auth_states` path: it goes through `profile()`,
+/// which is the call that may hit the network once per process.
+#[tokio::test]
+#[ignore]
+async fn share_live_profiles() {
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        let auth = drive.auth_state().await;
+        if !auth.authenticated {
+            println!("{}: 未登录", provider.as_str());
+            continue;
+        }
+        let profile = drive.profile().await;
+        match profile {
+            Ok(Some(info)) => println!(
+                "{}: nickname={:?} avatar={} (auth_state avatar={})",
+                provider.as_str(),
+                info.nickname,
+                info.avatar
+                    .as_ref()
+                    .map(|a| format!("{} bytes", a.len()))
+                    .unwrap_or_else(|| "none".to_string()),
+                auth.avatar.is_some()
+            ),
+            Ok(None) => println!("{}: profile none", provider.as_str()),
+            Err(err) => println!("{}: profile ERR {err}", provider.as_str()),
+        }
+    }
+}
+
+/// Verifies the avatar inline-conversion used by the share header.
+#[tokio::test]
+#[ignore]
+async fn share_live_avatars() {
+    let client = share::http().unwrap();
+    for url in [
+        "https://p1.music.126.net/x.jpg",
+        "https://pan.quark.cn/favicon.ico",
+    ] {
+        match share::fetch_avatar(&client, url).await {
+            Some(data) => println!("{} → {} bytes", url, data.len()),
+            None => println!("{} → none", url),
+        }
+    }
+}
+
+/// Dumps the share page so the field extraction can be checked.
+#[tokio::test]
+#[ignore]
+async fn share_live_baidu_page() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::baidu::BaiduProvider::load(&dir) else {
+        println!("not logged in");
+        return;
+    };
+    let page = drive.debug_share_page("Gb3CPF1uBTgEaH5BdXwbAQ").await;
+    match page {
+        Ok(text) => {
+            println!("len={}\n{}", text.len(), text.chars().take(1200).collect::<String>());
+            for key in ["shareid", "share_uk", "linkusername", "share_photo"] {
+                println!("  contains {key}: {}", text.contains(key));
+            }
+            if let Some(pos) = text.find("\"shareid\"") {
+                let start = pos.saturating_sub(40);
+                println!("  ctx: {:?}", &text[start..(pos + 80).min(text.len())]);
+            }
+        }
+        Err(err) => println!("ERR {err}"),
+    }
+}
+
+/// Prints the raw `dlFromOutLinkV3` payload to see why no url comes back.
+#[tokio::test]
+#[ignore]
+async fn share_live_yun139_raw() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::yun139::Yun139Provider::load(&dir) else {
+        println!("not logged in");
+        return;
+    };
+    let out = drive
+        .debug_share_post(
+            "/IOutLink/dlFromOutLinkV3",
+            &serde_json::json!({
+                "dlFromOutLinkReqV3": {
+                    "account": drive.debug_account().await,
+                    "linkID": "2yA8EKhoE66zy",
+                    "passwd": "oa5t",
+                    "coIDLst": { "item": ["Fsc6rEmba5WukmSs07jJFH6f7e403WvLr"] },
+                }
+            }),
+        )
+        .await;
+    println!("{out}");
+}
+
+/// Removes the files the save probe dropped into the user's drives.
+#[tokio::test]
+#[ignore]
+async fn share_live_cleanup_saved() {
+    for (provider, name) in [
+        (ProviderId::Quark, "跨界对决"),
+        (ProviderId::Yun139, "AxureRP9"),
+        (ProviderId::Pan123, "临时文件"),
+        (ProviderId::Aliyun, "临时文件"),
+    ] {
+        println!("\n=== cleanup {} ===", provider.as_str());
+        let Some(drive) = drive(provider) else { continue };
+        let root = match provider {
+            ProviderId::Yun139 => "/",
+            _ => "0",
+        };
+        let Ok(listing) = drive.list(root).await else {
+            println!("  list failed");
+            continue;
+        };
+        let hits: Vec<String> = listing
+            .entries
+            .iter()
+            .filter(|e| e.name == name)
+            .map(|e| crate::providers::native_of(&e.fid))
+            .collect();
+        println!("  found {} × {name}", hits.len());
+        if hits.is_empty() {
+            continue;
+        }
+        match drive.delete(&hits).await {
+            Ok(()) => println!("  deleted"),
+            Err(err) => println!("  delete ERR {err}"),
+        }
+    }
+}
+
+/// engine does, and checks the byte count against the size the drive reported.
+#[tokio::test]
+#[ignore]
+async fn share_live_download() {
+    use std::sync::atomic::AtomicU64;
+    for (provider, link) in [
+        (ProviderId::Quark, "https://pan.quark.cn/s/af886c338574?pwd=6M1m"),
+        (ProviderId::Yun139, "https://yun.139.com/shareweb/#/w/i/2yA8EKhoE66zy?pwd=oa5t"),
+        (
+            ProviderId::Pan123,
+            "https://1818505815.share.123pan.cn/123pan/yYphjv-HgZXH?pwd=YfKu",
+        ),
+        (ProviderId::Aliyun, "https://www.alipan.com/s/iqj4mzirYtX"),
+    ] {
+        println!("\n=== download {} ===", provider.as_str());
+        let Some(drive) = drive(provider) else { continue };
+        let Ok(target) = share::parse_link(link) else {
+            continue;
+        };
+        let Ok(session) = drive.share_open(&target.id, &target.passcode).await else {
+            println!("  open failed");
+            continue;
+        };
+        let share_ref = crate::transfer::ShareRef {
+            provider: provider.as_str().to_string(),
+            pwd_id: session.pwd_id.clone(),
+            stoken: session.stoken.clone(),
+            fid_token: String::new(),
+            passcode: session.passcode.clone(),
+        };
+        let dir = match provider {
+            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        let Ok(files) = drive.share_walk(&share_ref, dir).await else {
+            println!("  walk failed");
+            continue;
+        };
+        // Keep the probe quick: a few hundred MB over a shared link is minutes.
+        let Some(file) = files
+            .iter()
+            .filter(|f| f.size > 0 && f.size < 150 * 1024 * 1024)
+            .min_by_key(|f| f.size)
+        else {
+            println!("  no small file (<150 MB)");
+            continue;
+        };
+        let mut single = share_ref.clone();
+        single.fid_token = file.token.clone();
+        let Ok(link_info) = drive.share_link(&single, &file.fid).await else {
+            println!("  link failed");
+            continue;
+        };
+        let part = std::env::temp_dir().join(format!("shareprobe-{}", provider.as_str()));
+        let _ = std::fs::remove_file(&part);
+        let token = tokio_util::sync::CancellationToken::new();
+        let done = Arc::new(AtomicU64::new(0));
+        let started = std::time::Instant::now();
+        match share::stream_to_file(&link_info.url, &link_info.headers, &part, done.clone(), &token)
+            .await
+        {
+            Ok(written) => {
+                let expected = if link_info.size > 0 {
+                    link_info.size
+                } else {
+                    file.size
+                };
+                let on_disk = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                println!(
+                    "  {} → {} bytes on disk (expected {}) in {:?}",
+                    file.name,
+                    written,
+                    expected,
+                    started.elapsed()
+                );
+                println!(
+                    "  {}",
+                    if on_disk == written && (expected == 0 || written == expected) {
+                        "OK"
+                    } else {
+                        "MISMATCH"
+                    }
+                );
+            }
+            Err(err) => println!("  stream ERR {err}"),
+        }
+        let _ = std::fs::remove_file(&part);
+        if let Some(fid) = &link_info.cleanup_fid {
+            drive.share_cleanup(fid).await;
+        }
+    }
+}
+
+/// accept folder entries in their transfer call.
+#[tokio::test]
+#[ignore]
+async fn share_live_save_folder() {
+    for (provider, link) in [
+        (ProviderId::Quark, "https://pan.quark.cn/s/af886c338574?pwd=6M1m"),
+        (ProviderId::Yun139, "https://yun.139.com/shareweb/#/w/i/2yA8EKhoE66zy?pwd=oa5t"),
+        (
+            ProviderId::Pan123,
+            "https://1818505815.share.123pan.cn/123pan/yYphjv-HgZXH?pwd=YfKu",
+        ),
+        (ProviderId::Aliyun, "https://www.alipan.com/s/iqj4mzirYtX"),
+    ] {
+        println!("\n=== save folder {} ===", provider.as_str());
+        let Some(drive) = drive(provider) else { continue };
+        let Ok(target) = share::parse_link(link) else { continue };
+        let Ok(session) = drive.share_open(&target.id, &target.passcode).await else {
+            println!("  open failed");
+            continue;
+        };
+        let share_ref = crate::transfer::ShareRef {
+            provider: provider.as_str().to_string(),
+            pwd_id: session.pwd_id.clone(),
+            stoken: session.stoken.clone(),
+            fid_token: String::new(),
+            passcode: session.passcode.clone(),
+        };
+        let dir = match provider {
+            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        let Ok(listing) = drive.share_list(&share_ref, dir).await else {
+            println!("  list failed");
+            continue;
+        };
+        let folders: Vec<_> = listing.entries.iter().filter(|e| e.is_dir).cloned().collect();
+        if folders.is_empty() {
+            println!("  no folder at root");
+            continue;
+        }
+        let folder = folders[0].clone();
+        println!("  folder 「{}」", folder.name);
+        match drive.share_save(&share_ref, std::slice::from_ref(&folder), None).await {
+            Ok(n) => println!("  saved {n}"),
+            Err(err) => println!("  save ERR {err}"),
+        }
+    }
+}
+
+/// Lists the root of a drive — used to check what the save probes left behind.
+#[tokio::test]
+#[ignore]
+async fn share_live_root_listing() {
+    for provider in [ProviderId::Aliyun, ProviderId::Pan123, ProviderId::Quark, ProviderId::Yun139] {
+        let Some(drive) = drive(provider) else { continue };
+        let root = match provider {
+            ProviderId::Yun139 => "/",
+            _ => "0",
+        };
+        match drive.list(root).await {
+            Ok(listing) => {
+                println!("\n=== {} ({} entries) ===", provider.as_str(), listing.entries.len());
+                for e in &listing.entries {
+                    println!("  {} {} ({} B)", if e.is_dir { "DIR " } else { "FILE" }, e.name, e.size);
+                }
+            }
+            Err(err) => println!("\n=== {} ===\n  list ERR {err}", provider.as_str()),
+        }
+    }
+}
+
+/// Finds a video in the signed-in 阿里 drive and downloads the first chunk.
+#[tokio::test]
+#[ignore]
+async fn share_live_aliyun_own_video() {
+    use futures_util::StreamExt;
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::aliyun::AliyunProvider::load(&dir) else {
+        return;
+    };
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back("0".to_string());
+    let mut seen = 0;
+    while let Some(parent) = queue.pop_front() {
+        seen += 1;
+        if seen > 40 {
+            break;
+        }
+        let Ok(listing) = drive.list(&parent).await else { continue };
+        for entry in &listing.entries {
+            if entry.is_dir {
+                queue.push_back(crate::providers::native_of(&entry.fid));
+                continue;
+            }
+            if !entry.name.to_lowercase().ends_with(".mkv") {
+                continue;
+            }
+            let native = crate::providers::native_of(&entry.fid);
+            println!("try {} {} bytes", entry.name, entry.size);
+            match drive.open_download(&native, 0).await {
+                Ok(mut handle) => {
+                    let mut got = 0u64;
+                    let mut err = None;
+                    while let Some(chunk) = handle.stream.next().await {
+                        match chunk {
+                            Ok(bytes) => {
+                                got += bytes.len() as u64;
+                                if got > 2 << 20 {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                err = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    println!("  ok read={got} size={} err={err:?}", handle.size);
+                    return;
+                }
+                Err(e) => println!("  ERR {e}"),
+            }
+        }
+    }
+    println!("no mkv found");
+}
+
+/// Restores specific 123 ids from the recycle bin (recovery helper).
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_restore_ids() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    let ids: Vec<i64> = std::env::var("PAN123_RESTORE")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    if ids.is_empty() {
+        println!("set PAN123_RESTORE=1,2,3");
+        return;
+    }
+    let list: Vec<serde_json::Value> = ids.iter().map(|id| serde_json::json!({ "FileId": id })).collect();
+    let body = serde_json::json!({ "driveId": 0, "fileTrashInfoList": list, "operation": false });
+    match drive
+        .debug_post("https://www.123pan.cn/a/api/file/trash", body)
+        .await
+    {
+        Ok(v) => println!("restore → {v}"),
+        Err(e) => println!("restore ERR {e}"),
+    }
+}
+
+/// Prints both the 123 root and 临时文件 so leftovers are visible.
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_dump() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    for (label, fid) in [("root", "0"), ("临时文件", "17116059")] {
+        match drive.list(fid).await {
+            Ok(l) => {
+                println!("{label} ({} entries):", l.entries.len());
+                for e in &l.entries {
+                    println!(
+                        "  {} {} ({} B) id={}",
+                        if e.is_dir { "DIR " } else { "FILE" },
+                        e.name,
+                        e.size,
+                        crate::providers::native_of(&e.fid)
+                    );
+                }
+            }
+            Err(e) => println!("{label} ERR {e}"),
+        }
+    }
+}
+
+/// Lists the 123 recycle bin so lost files can be found and restored.
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_trash_list() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    let url = "https://www.123pan.cn/api/file/list/new?driveId=0&limit=100&next=0\
+               &orderBy=file_id&orderDirection=desc&parentFileId=0&trashed=true\
+               &SearchData=&Page=1&OnlyLookAbnormalFile=0";
+    match drive.debug_get(url).await {
+        Ok(v) => {
+            let rows = v.pointer("/data/InfoList").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+            println!("trash has {} rows", rows.len());
+            for row in rows {
+                println!(
+                    "  {} {} ({} B) id={} parent={}",
+                    row.get("Type").map(|t| t.to_string()).unwrap_or_default(),
+                    row.get("FileName").and_then(|x| x.as_str()).unwrap_or(""),
+                    row.get("Size").map(|s| s.to_string()).unwrap_or_default(),
+                    row.get("FileId").map(|s| s.to_string()).unwrap_or_default(),
+                    row.get("ParentFileId").map(|s| s.to_string()).unwrap_or_default(),
+                );
+            }
+        }
+        Err(e) => println!("trash ERR {e}"),
+    }
+}
+
+/// Deletes one 123 file by exact native id.
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_delete_id() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    let ids: Vec<String> = std::env::var("PAN123_DELETE")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if ids.is_empty() {
+        println!("set PAN123_DELETE=<native id>");
+        return;
+    }
+    for id in ids {
+        match drive.delete(std::slice::from_ref(&id)).await {
+            Ok(()) => println!("deleted {id}"),
+            Err(e) => println!("delete {id} ERR {e}"),
+        }
+    }
+}
+
+/// Verifies the real 123 copy path end to end, then deletes only what it made.
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_copy_real() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    let drive: Arc<dyn DriveProvider> = Arc::new(drive);
+    let target = "3383124"; // Umi
+    let before = drive.list(target).await.map(|l| l.entries).unwrap_or_default();
+    let before_names: Vec<String> = before.iter().map(|e| e.name.clone()).collect();
+    println!("Umi before: {} entries", before.len());
+    match drive
+        .transfer_entries(&["21128189".to_string()], target, true)
+        .await
+    {
+        Ok(n) => println!("copy → {n}"),
+        Err(e) => {
+            println!("copy ERR {e}");
+            return;
+        }
+    }
+    let after = drive.list(target).await.map(|l| l.entries).unwrap_or_default();
+    let fresh: Vec<_> = after
+        .iter()
+        .filter(|e| !before_names.contains(&e.name))
+        .cloned()
+        .collect();
+    println!("Umi after: {} entries, new: {}", after.len(), fresh.len());
+    for e in &fresh {
+        println!(
+            "  NEW {} {} ({} B)",
+            if e.is_dir { "DIR " } else { "FILE " },
+            e.name,
+            e.size
+        );
+        match drive.delete(&[crate::providers::native_of(&e.fid)]).await {
+            Ok(()) => println!("  cleaned {}", e.name),
+            Err(err) => println!("  cleanup ERR {err}"),
+        }
+    }
+    let parent = drive.list("17116059").await.map(|l| l.entries).unwrap_or_default();
+    println!("临时文件 still has {} entries", parent.len());
+}
+
+/// Prints a folder by native id so leftovers are visible.
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_ls() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    let fid = std::env::var("PAN123_LS").unwrap_or_else(|_| "3383124".into());
+    match drive.list(&fid).await {
+        Ok(l) => {
+            println!("{} entries:", l.entries.len());
+            for e in &l.entries {
+                if e.name.contains("奥运会") {
+                    println!("  {} {} ({})", if e.is_dir { "DIR " } else { "FILE" }, e.name, crate::providers::native_of(&e.fid));
+                }
+            }
+        }
+        Err(e) => println!("ERR {e}"),
+    }
+}
+
+/// Verifies the real 123 move path: root → 临时文件 → back.
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_move_verify() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    let drive: Arc<dyn DriveProvider> = Arc::new(drive);
+    let src_id = "49472830"; // 奥运会项目框架.7z in the root
+    let folder = "17116059"; // 临时文件
+    println!(
+        "root before: {} entries, 临时文件 before: {}",
+        drive.list("0").await.map(|l| l.entries.len()).unwrap_or(0),
+        drive.list(folder).await.map(|l| l.entries.len()).unwrap_or(0)
+    );
+    match drive.transfer_entries(&[src_id.to_string()], folder, false).await {
+        Ok(n) => println!("move in → {n}"),
+        Err(e) => println!("move in ERR {e}"),
+    }
+    println!(
+        "root after: {} entries, 临时文件 after: {}",
+        drive.list("0").await.map(|l| l.entries.len()).unwrap_or(0),
+        drive.list(folder).await.map(|l| l.entries.len()).unwrap_or(0)
+    );
+    match drive.transfer_entries(&[src_id.to_string()], "0", false).await {
+        Ok(n) => println!("move back → {n}"),
+        Err(e) => println!("move back ERR {e}"),
+    }
+    let root = drive.list("0").await.map(|l| l.entries).unwrap_or_default();
+    println!("root final: {} entries", root.len());
+    for e in &root {
+        println!("  {} {}", if e.is_dir { "DIR " } else { "FILE " }, e.name);
+    }
+    println!(
+        "临时文件 final: {} entries",
+        drive.list(folder).await.map(|l| l.entries.len()).unwrap_or(0)
+    );
+}
+
+/// Renames one 123 file by native id (repairs names the probes changed).
+#[tokio::test]
+#[ignore]
+async fn share_live_pan123_rename_id() {
+    let dir = config_dir();
+    let Ok(drive) = crate::providers::pan123::Pan123Provider::load(&dir) else {
+        return;
+    };
+    let spec = std::env::var("PAN123_RENAME").unwrap_or_default();
+    let Some((id, name)) = spec.split_once('=') else {
+        println!("set PAN123_RENAME=<id>=<new name>");
+        return;
+    };
+    match drive.rename(id.trim(), name.trim()).await {
+        Ok(()) => println!("renamed {id} → {name}"),
+        Err(e) => println!("rename ERR {e}"),
+    }
+}

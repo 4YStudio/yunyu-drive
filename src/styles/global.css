@@ -1,0 +1,320 @@
+@import "./tokens.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg-sunken);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  font-feature-settings: "cv02" 1, "tnum" 1;
+  transition: background-color var(--dur-3) var(--ease-out),
+    color var(--dur-3) var(--ease-out);
+}
+
+::selection {
+  background: var(--text);
+  color: var(--bg);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* ---------- scrollbars ---------- */
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border: 3.5px solid transparent;
+  background-clip: content-box;
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+  background-clip: content-box;
+}
+
+/* ---------- shared primitives ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 520;
+  letter-spacing: -0.005em;
+  white-space: nowrap;
+  color: var(--text);
+  background: transparent;
+  transition: background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out), opacity var(--dur-1) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out);
+}
+.btn:hover {
+  background: var(--bg-hover);
+}
+/* Press feedback is a background tint, never a `scale()`.
+   Scaling a layer that carries text and a box-shadow makes WebKitGTK
+   re-rasterise it on every frame of the transition, and when the transform is
+   dropped at the end the layer is torn down and the whole button repaints —
+   the "everything flickers after an animation" report. See
+   docs/tauri-webkitgtk-flicker.md. */
+.btn:active {
+  background: var(--bg-active);
+}
+.btn:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.btn--solid {
+  background: var(--fill);
+  color: var(--on-fill);
+  box-shadow: var(--shadow-sm);
+}
+.btn--solid:hover {
+  background: var(--fill-hover);
+  box-shadow: var(--shadow-md);
+}
+
+.btn--ghost {
+  border: 1px solid var(--line);
+}
+.btn--ghost:hover {
+  border-color: var(--line-strong);
+  background: var(--bg-hover);
+}
+
+.btn--danger:hover {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  transition: background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+.icon-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.icon-btn:active {
+  background: var(--bg-active);
+}
+
+.input {
+  height: 34px;
+  padding: 0 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  transition: border-color var(--dur-2) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out), background-color var(--dur-2) var(--ease-out);
+}
+.input::placeholder {
+  color: var(--text-3);
+}
+.input:focus {
+  outline: none;
+  border-color: var(--line-strong);
+  box-shadow: 0 0 0 3.5px var(--bg-active);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: var(--radius-pill);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-2);
+  background: var(--bg-active);
+  letter-spacing: 0.01em;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: -0.01em;
+}
+
+.muted {
+  color: var(--text-2);
+}
+
+.dim {
+  color: var(--text-3);
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- theme cross-fade ---------- */
+/* `.theme-anim` is toggled for one beat around a light/dark switch so every
+   surface dissolves into the new palette instead of repainting hard. */
+.theme-anim,
+.theme-anim *:not(.no-theme-anim),
+.theme-anim *::before,
+.theme-anim *::after {
+  transition: background-color var(--dur-3) var(--ease-out),
+    border-color var(--dur-3) var(--ease-out),
+    color var(--dur-3) var(--ease-out),
+    fill var(--dur-3) var(--ease-out),
+    stroke var(--dur-3) var(--ease-out),
+    box-shadow var(--dur-3) var(--ease-out) !important;
+}
+
+/* ---------- transitions ---------- */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity var(--dur-2) var(--ease-out);
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+/* The stage holds every screen as an equal, absolutely positioned layer, so a
+   swap never reflows anything. */
+.stage > .view {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+/* Rest on an identity transform rather than `none`: WebKitGTK tears the
+   compositing layer down when the animated transform goes away and repaints the
+   screen from scratch, which is the second way this swap used to flash. */
+:where(.stage > .view) {
+  transform: translateY(0);
+}
+
+/* View swap — one screen at a time, deliberately.
+   Earlier versions cross-faded two mounted screens (the outgoing one pinned
+   underneath, the incoming one sliding over it). That reads fine in Chromium
+   but flashes in the packaged app: WebKitGTK keeps a compositing layer per
+   transformed element and, when the outgoing node is dropped at the end of the
+   animation, can repaint one frame from that stale tile — which the user sees
+   as the previous page blinking back before the new one settles.
+   Only the incoming screen is animated now and the outgoing one is unmounted
+   the moment the swap starts, so at no instant are two screens in the DOM and
+   nothing stale can be painted.
+
+   The swap is NOT a CSS transition any more — `App.vue` runs it through the Web
+   Animations API (`:css="false"` + `@enter`). The same transform driven by
+   `transition` left 11 anomalous frames over 10 runs of 8 swaps (each one a
+   full-content-area repaint), while `element.animate()` left 0 over 18 runs.
+   The identity transform below stays because it is what keeps the resting layer
+   from being torn down between swaps. Do not re-add `.view-enter-*` rules; they
+   are inert now that the transition has no CSS phase. */
+:where(.stage > .view) {
+  transform: translateY(0);
+}
+
+/* Popups (context menu, drive switcher, account bubble).
+   The animation lives in `lib/motion.ts` and runs through the Web Animations
+   API (`<Transition :css="false" v-bind="pop">`), not through these classes.
+   As a CSS `transition` it was not stepped at all on WebKitGTK: one
+   intermediate frame, then a 200 ms stall, then a jump to the final state —
+   the "twitch" that surrounded the drive switcher, plus a full-content-area
+   repaint (21k–43k px outside the popup). Through `element.animate()` the same
+   motion produces 10 distinct frames with a 26 ms worst gap. Do not re-add
+   `.pop-enter-*` rules; they are inert now that the transition has no CSS
+   phase.
+
+   Whatever animates them must stay transform+opacity only — no `scale`. */
+:where(.switcher-menu, .account-pop, .menu) {
+  transform: translateY(0);
+}
+
+.list-move,
+.list-enter-active,
+.list-leave-active {
+  transition: opacity var(--dur-2) var(--ease-out),
+    transform var(--dur-2) var(--ease-out);
+}
+.list-enter-from {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+.list-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+.list-leave-active {
+  position: absolute;
+  width: 100%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+  .theme-anim,
+  .theme-anim *:not(.no-theme-anim) {
+    transition: none !important;
+  }
+}
