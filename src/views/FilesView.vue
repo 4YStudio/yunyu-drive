@@ -21,6 +21,7 @@ import Modal from "@/components/Modal.vue";
 import Segmented from "@/components/Segmented.vue";
 
 import { api } from "@/lib/backend";
+import { copyText } from "@/lib/clipboard";
 import { storageKey } from "@/lib/brand";
 import type { DirListing, EntryDto, PathNode, SearchHit, ShareCreated } from "@/lib/types";
 import { formatDate, formatFullDate, formatSize, fileKind, kindLabel } from "@/lib/format";
@@ -541,8 +542,8 @@ async function onMenuSelect(id: string) {
       break;
     case "copy-name":
       if (target) {
-        await navigator.clipboard.writeText(target.name);
-        toast("已复制文件名", "success");
+        const ok = await copyText(target.name);
+        toast(ok ? "已复制文件名" : "复制失败", ok ? "success" : "error");
       }
       break;
     case "share":
@@ -817,8 +818,8 @@ const shareLine = computed(() => {
 
 async function copyShareLink() {
   if (!shareLine.value) return;
-  await navigator.clipboard.writeText(shareLine.value);
-  toast("已复制分享链接", "success");
+  const ok = await copyText(shareLine.value);
+  toast(ok ? "已复制分享链接" : "复制失败，请手动选中链接", ok ? "success" : "error");
 }
 
 /** Revokes the share the dialog just created. */

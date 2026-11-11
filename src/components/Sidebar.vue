@@ -29,6 +29,11 @@ const items = computed<{ view: View; label: string; icon: IconName }[]>(() => {
   if (activeProviderState.value?.capabilities.shareOpen !== false) {
     list.push({ view: "share", label: "分享链接", icon: "link" });
   }
+  // Creating a share is not universal either: 139 has no endpoint for it, so
+  // the manager page would only ever be empty there.
+  if (activeProviderState.value?.capabilities.shareCreate) {
+    list.push({ view: "myShares", label: "我的分享", icon: "share" });
+  }
   // The recycle bin is only offered where the drive exposes one; 百度 and 139
   // reject every restore call, so the entry would be a dead end.
   if (activeProviderState.value?.capabilities.recycle) {

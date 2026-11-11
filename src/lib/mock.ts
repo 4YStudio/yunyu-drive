@@ -24,6 +24,7 @@ import type {
   ShareListing,
   ShareSession,
   ShareCreated,
+  ShareRecord,
   TransferTask,
 } from "@/lib/types";
 
@@ -339,6 +340,55 @@ function mockStates(): ProviderAuthState[] {
   ];
 }
 
+/** Shares created during this mock session, newest first. */
+const shareRecords: ShareRecord[] = [
+  {
+    shareId: "1-演示",
+    url: "https://pan.mock/s/demo1234",
+    title: "演示分享",
+    passcode: "ab12",
+    expiredAt: now + 7 * day,
+    createdAt: now - 2 * day,
+    fileNum: 3,
+    size: 12_582_912,
+    visitCount: 18,
+    saveCount: 4,
+    downloadCount: 9,
+    expired: false,
+    fids: [],
+  },
+  {
+    shareId: "2-永久",
+    url: "https://pan.mock/s/keep5678",
+    title: "长期分享",
+    passcode: "",
+    expiredAt: 0,
+    createdAt: now - 30 * day,
+    fileNum: 1,
+    size: 2_097_152,
+    visitCount: 2,
+    saveCount: 0,
+    downloadCount: 1,
+    expired: false,
+    fids: [],
+  },
+  {
+    shareId: "3-过期",
+    url: "https://pan.mock/s/old9999",
+    title: "过期的分享",
+    passcode: "",
+    expiredAt: now - 3 * day,
+    createdAt: now - 20 * day,
+    fileNum: 2,
+    size: 1_048_576,
+    visitCount: 5,
+    saveCount: 1,
+    downloadCount: 0,
+    expired: true,
+    fids: [],
+  },
+];
+
 export const mockApi = {
   authStatus: async (): Promise<AuthStatus> => ({
     authenticated: loggedIn.has("quark"),
@@ -638,16 +688,41 @@ export const mockApi = {
     // 百度 always invents a code when none is given; the others accept an open
     // link. Mirroring that keeps the UI branch visible in mock builds.
     const code = passcode?.trim() || (provider === "baidu" ? "p4y6" : "");
-    return {
+    const shareId = `${fids.length}-${title ?? "分享"}`;
+    const created: ShareCreated = {
       url: `https://pan.mock/s/${Math.random().toString(36).slice(2, 10)}`,
       passcode: code,
       expiredAt: days === 0 ? 0 : Date.now() + days * 86_400_000,
-      shareId: `${fids.length}-${title ?? "分享"}`,
+      shareId,
     };
+    // Keep it so "我的分享" shows the share that was just created.
+    shareRecords.unshift({
+      shareId,
+      url: created.url,
+      title: title?.trim() || "分享",
+      passcode: code,
+      expiredAt: created.expiredAt,
+      createdAt: Date.now(),
+      fileNum: fids.length,
+      size: 0,
+      visitCount: 0,
+      saveCount: 0,
+      downloadCount: 0,
+      expired: false,
+      fids,
+    });
+    return created;
   },
 
-  shareRevoke: async (_provider: string, _shareId: string, _fids: string[]): Promise<void> => {
+  shareRevoke: async (_provider: string, shareId: string, _fids: string[]): Promise<void> => {
     await sleep(300);
+    const at = shareRecords.findIndex((row) => row.shareId === shareId);
+    if (at >= 0) shareRecords.splice(at, 1);
+  },
+
+  shareRecords: async (_provider: string): Promise<ShareRecord[]> => {
+    await sleep(300);
+    return shareRecords.map((row) => ({ ...row }));
   },
 
   deeplinkTake: async (): Promise<string | null> => null,

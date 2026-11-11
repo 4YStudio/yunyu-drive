@@ -2009,6 +2009,97 @@ impl DriveProvider for AliyunProvider {
         }
         Err(AppError::new(format!("取消分享失败（status={status}）")))
     }
+
+    /// `POST /adrive/v3/share_link/list` — the shares this account owns.
+    ///
+    /// Needs the device signature like every other file endpoint; the plain
+    /// bearer token answers 403. `expiration` is an empty string for a
+    /// permanent share, and `expired` is authoritative.
+    async fn share_records(&self) -> AppResult<Vec<crate::share::ShareRecord>> {
+        let user_id = self.creds.read().await.user_id.clone();
+        if user_id.is_empty() {
+            return Err(AppError::new("阿里云盘账号信息缺失，请重新登录"));
+        }
+        let body = json!({
+            "category": "file,album",
+            "creator": user_id,
+            "include_canceled": false,
+            "order_by": "created_at",
+            "order_direction": "DESC",
+            "limit": 100,
+        });
+        let value = self.call("/adrive/v3/share_link/list", body).await?;
+        let list = value
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(list
+            .iter()
+            .map(|row| {
+                let stamp = |key: &str| {
+                    row.get(key)
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+                        .map(|d| d.timestamp_millis())
+                        .unwrap_or(0)
+                };
+                crate::share::ShareRecord {
+                    share_id: row
+                        .get("share_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    url: row
+                        .get("share_url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: row
+                        .get("share_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    passcode: row
+                        .get("share_pwd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    expired_at: stamp("expiration"),
+                    created_at: stamp("created_at"),
+                    file_num: row
+                        .get("file_id_list")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len() as u32)
+                        .unwrap_or(1),
+                    size: 0,
+                    visit_count: row
+                        .get("preview_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    save_count: row.get("save_count").and_then(|v| v.as_i64()).unwrap_or(0),
+                    download_count: row
+                        .get("download_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    expired: row
+                        .get("expired")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    fids: row
+                        .get("file_id_list")
+                        .and_then(|v| v.as_array())
+                        .map(|v| {
+                            v.iter()
+                                .filter_map(|id| id.as_str())
+                                .map(|id| id.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect())
+    }
 }
 
 impl AliyunProvider {

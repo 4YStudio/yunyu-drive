@@ -595,6 +595,14 @@ pub trait DriveProvider: Send + Sync {
             self.id().display_name()
         )))
     }
+
+    /// Lists the shares the user has already created, newest first.
+    async fn share_records(&self) -> AppResult<Vec<crate::share::ShareRecord>> {
+        Err(AppError::new(format!(
+            "{}暂不支持查看我的分享",
+            self.id().display_name()
+        )))
+    }
 }
 
 // ------------------------------------------------------------------ registry ---

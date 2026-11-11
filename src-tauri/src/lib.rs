@@ -214,6 +214,7 @@ pub fn run() {
             share::share_save,
             share::share_create,
             share::share_revoke,
+            share::share_records,
             share::share_download,
             login::open_web_login,
             login::open_web_login_139,

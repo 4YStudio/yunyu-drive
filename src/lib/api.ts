@@ -17,6 +17,7 @@ import type {
   ShareListing,
   ShareSession,
   ShareCreated,
+  ShareRecord,
   TransferTask,
 } from "@/lib/types";
 
@@ -196,6 +197,9 @@ export const api = {
   /** Revokes a share this app created. */
   shareRevoke: (provider: string, shareId: string, fids: string[]) =>
     invoke<void>("share_revoke", { provider, shareId, fids }),
+
+  /** Lists the shares the account has already created on a drive. */
+  shareRecords: (provider: string) => invoke<ShareRecord[]>("share_records", { provider }),
 };
 
 export interface WebLoginEvent {

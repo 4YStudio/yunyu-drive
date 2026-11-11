@@ -1880,6 +1880,97 @@ impl DriveProvider for BaiduProvider {
         // `post_form` already maps a non-zero `errno` to an error.
         self.post_form(&url, &form, "取消分享").await.map(|_| ())
     }
+
+    /// `GET /share/record` — the shares this account owns.
+    ///
+    /// The record carries no title (百度 puts the shared path in
+    /// `typicalPath` and a placeholder `name`), so the path is used instead.
+    /// `passwd` is always empty here even for coded shares; only the web UI
+    /// knows the code.
+    async fn share_records(&self) -> AppResult<Vec<crate::share::ShareRecord>> {
+        let token = self.bdstoken().await?;
+        let url = format!(
+            "{BASE}/share/record?channel=chunlei&clienttype=0&web=1&app_id=250528\
+             &bdstoken={token}&page=1&num=100&order=time&desc=1"
+        );
+        let value = self.get_json(&url, "读取我的分享").await?;
+        check_errno(&value, "读取我的分享")?;
+        let list = value
+            .get("list")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(list
+            .iter()
+            .map(|row| {
+                let path = row
+                    .get("typicalPath")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let title = path
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or("分享")
+                    .to_string();
+                let short = row
+                    .get("shorturl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                crate::share::ShareRecord {
+                    share_id: row
+                        .get("shareId")
+                        .map(|v| v.to_string().trim_matches('"').to_string())
+                        .unwrap_or_default(),
+                    url: if short.is_empty() {
+                        String::new()
+                    } else {
+                        format!("https://pan.baidu.com/s/{short}")
+                    },
+                    title,
+                    passcode: row
+                        .get("passwd")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    expired_at: {
+                        // `expiredType` 0 means "N days from ctime" and the
+                        // record also carries an absolute `lastExpireTime` in
+                        // seconds; 0/absent means permanent.
+                        let abs = row
+                            .get("lastExpireTime")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+                        if abs > 0 { abs * 1000 } else { 0 }
+                    },
+                    created_at: row.get("ctime").and_then(|v| v.as_i64()).unwrap_or(0) * 1000,
+                    file_num: row
+                        .get("fsIds")
+                        .and_then(|v| v.as_array())
+                        .map(|v| v.len() as u32)
+                        .unwrap_or(0),
+                    size: 0,
+                    visit_count: row.get("vCnt").and_then(|v| v.as_i64()).unwrap_or(0),
+                    save_count: row.get("tCnt").and_then(|v| v.as_i64()).unwrap_or(0),
+                    download_count: row.get("dCnt").and_then(|v| v.as_i64()).unwrap_or(0),
+                    // `expiredType: 1` is 百度's "permanent".
+                    expired: row
+                        .get("expiredType")
+                        .and_then(|v| v.as_i64())
+                        .map(|kind| kind != 1 && row.get("lastExpireTime").and_then(|v| v.as_i64()).unwrap_or(0) * 1000 < chrono::Utc::now().timestamp_millis())
+                        .unwrap_or(false),
+                    fids: row
+                        .get("fsIds")
+                        .and_then(|v| v.as_array())
+                        .map(|v| {
+                            v.iter()
+                                .map(|id| id.to_string().trim_matches('"').to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect())
+    }
 }
 
 /// Shows only the shape of a cookie header, never its contents.

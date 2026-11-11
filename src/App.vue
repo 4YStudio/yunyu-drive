@@ -8,6 +8,7 @@ import Toasts from "@/components/Toasts.vue";
 import Icon from "@/components/Icon.vue";
 import FilesView from "@/views/FilesView.vue";
 import RecycleView from "@/views/RecycleView.vue";
+import MySharesView from "@/views/MySharesView.vue";
 import TransfersView from "@/views/TransfersView.vue";
 import SettingsView from "@/views/SettingsView.vue";
 import ShareView from "@/views/ShareView.vue";
@@ -23,6 +24,7 @@ const currentView = computed(() => {
   const map = {
     files: FilesView,
     recycle: RecycleView,
+    myShares: MySharesView,
     share: ShareView,
     transfers: TransfersView,
     settings: SettingsView,

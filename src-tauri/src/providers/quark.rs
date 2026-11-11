@@ -936,6 +936,74 @@ impl DriveProvider for QuarkProvider {
         .await?;
         envelope(value).map(|_| ())
     }
+
+    /// `GET /1/clouddrive/share/mypage/detail` — the shares this cookie owns.
+    ///
+    /// The response already carries the public link, the passcode and the
+    /// counters, so no extra round trip is needed. `/share/mypage/detail` is
+    /// the *page* path; the API path keeps the `/1/clouddrive` prefix.
+    async fn share_records(&self) -> AppResult<Vec<crate::share::ShareRecord>> {
+        let value = get_json(
+            &format!("{QUARK_API}/1/clouddrive/share/mypage/detail"),
+            &self.cookie,
+            &[
+                ("pr", "ucpro".to_string()),
+                ("fr", "pc".to_string()),
+                ("page", "1".to_string()),
+                ("size", "100".to_string()),
+                ("order_by", "created_at".to_string()),
+                ("order", "desc".to_string()),
+                ("_fetch_total", "1".to_string()),
+            ],
+        )
+        .await?;
+        let data = envelope(value)?;
+        let list = data
+            .get("list")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(list
+            .iter()
+            .map(|row| crate::share::ShareRecord {
+                share_id: text(row, "share_id"),
+                url: text(row, "share_url"),
+                title: text(row, "title"),
+                passcode: text(row, "passcode"),
+                // A permanent share is stamped 2100-01-01; report it as 0.
+                expired_at: row
+                    .get("expired_at")
+                    .and_then(|v| v.as_i64())
+                    .filter(|at| *at < 4_102_444_800_000)
+                    .unwrap_or(0),
+                created_at: row.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0),
+                file_num: row
+                    .get("file_num")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                size: row.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+                visit_count: row
+                    .get("visit_user_count")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                save_count: row.get("save_pv").and_then(|v| v.as_i64()).unwrap_or(0),
+                download_count: row.get("download_pv").and_then(|v| v.as_i64()).unwrap_or(0),
+                expired: row
+                    .get("expired_at")
+                    .and_then(|v| v.as_i64())
+                    .map(|at| at > 0 && at < chrono::Utc::now().timestamp_millis())
+                    .unwrap_or(false),
+                // The list only names the first file; revoking goes by
+                // `share_id`, so the id list stays empty.
+                fids: row
+                    .get("first_fid")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| vec![v.to_string()])
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
 }
 
 /// Quota lives on the same host libquarkpan is pointed at, but we do not have

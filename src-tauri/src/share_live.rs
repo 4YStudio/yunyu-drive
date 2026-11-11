@@ -1893,3 +1893,36 @@ async fn live_revoke_share() {
         }
     }
 }
+
+/// Lists the shares each drive reports as already created. Read-only.
+#[tokio::test]
+#[ignore]
+async fn live_share_records() {
+    for provider in crate::providers::ProviderId::all() {
+        let Some(drive) = drive(provider) else {
+            println!("{}: not logged in", provider.as_str());
+            continue;
+        };
+        match drive.share_records().await {
+            Ok(records) => {
+                println!("{}: {} shares", provider.as_str(), records.len());
+                for row in records.iter().take(6) {
+                    println!(
+                        "  id={} title={:?} url={} pwd={:?} files={} created={} expired={} visits={} saves={} fids={}",
+                        row.share_id,
+                        row.title,
+                        row.url,
+                        row.passcode,
+                        row.file_num,
+                        row.created_at,
+                        row.expired,
+                        row.visit_count,
+                        row.save_count,
+                        row.fids.len(),
+                    );
+                }
+            }
+            Err(err) => println!("{}: list failed: {err}", provider.as_str()),
+        }
+    }
+}

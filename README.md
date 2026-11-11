@@ -89,6 +89,9 @@
 - **创建分享（四个网盘，139 除外）**：选中文件或文件夹右键「创建分享链接」，可选分享名称、
   有效期（永久 / 7 天 / 30 天）和 4 位提取码，创建完直接复制链接，也能在弹窗里「取消分享」。
   各盘限制见下面「创建分享的实现差异」。
+- **我的分享**：侧栏「我的分享」列出当前网盘里已经创建的分享——标题、链接、提取码、
+  到期时间、浏览 / 转存 / 下载次数，可以复制链接或直接取消；已过期的收在折叠区里。
+  四个能建分享的网盘都能列，139 没有接口所以连入口都不显示。
 - **登录凭据只存本地**：`~/.config/yunyu-drive/`（0600）。
 
 ## 文档
@@ -207,6 +210,20 @@ src-tauri/src/
 | 阿里云盘 | `POST /adrive/v2/share_link/create` | `adrive/v4/batch` 的 `/share_link/cancel` | 每日创建次数有上限（`SharelinkCreateExceedDailyLimit`） |
 | 百度网盘 | `POST /share/set`（`schannel=4`） | `/share/cancel` | **必须有 4 位提取码**，没填就随机生成 |
 | 中国移动云盘 | 不支持 | — | 网页端没有任何「创建分享」的接口，候选路径全部回「资源不存在」 |
+
+对应的列表接口（`share_records`，供「我的分享」页用）：
+
+| 网盘 | 列表端点 | 标题来源 | 提取码 |
+| --- | --- | --- | --- |
+| 夸克 | `GET /1/clouddrive/share/mypage/detail`（**必须 GET，POST 回 405**） | `title` | `passcode` |
+| 123 云盘 | `GET /b/api/share/list` | `ShareName`（自己建的时候填的） | `SharePwd`（只有这里会回显） |
+| 阿里云盘 | `POST /adrive/v3/share_link/list`（**要设备签名，裸 token 回 403**） | `share_name` | `share_pwd` |
+| 百度网盘 | `GET /share/record` | `typicalPath` 的最后一段（`name` 恒为 `"0"`） | **恒空** |
+
+- 夸克和 123 把「永久」记成 `4102416000000` / `9999-12-31T23:59:59+08:00`，
+  归一化时按 2100 年截断回 0，否则界面会显示「9999 年到期」。
+- 百度拿不到提取码（`passwd` 恒空），123 的 `/b/api/share/info` 也不回显，
+  所以这两个盘的「复制链接」只复制 URL，提取码需要用户自己记得。
 
 - 夸克的创建端点**不是** `/1/clouddrive/share/create`（404），而是 `/1/clouddrive/share`；
   返回的 `share_id` 是 32 位 hex，还要再调 `share/password` 才拿到 12 位 `pwd_id` 和链接。

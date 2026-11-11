@@ -280,6 +280,36 @@ pub struct ShareCreated {
     pub share_id: String,
 }
 
+/// One share the user has already created, as listed by the drive.
+///
+/// The drives report wildly different sets of counters and one of them (百度)
+/// does not even return a usable title, so the provider normalises whatever it
+/// can and leaves the rest at zero.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareRecord {
+    /// Drive-side id, the same value [`ShareCreated::share_id`] carries.
+    pub share_id: String,
+    /// Browser address; empty when the drive does not echo it back.
+    pub url: String,
+    pub title: String,
+    pub passcode: String,
+    /// Expiry in ms since the epoch; 0 when permanent or unknown.
+    pub expired_at: i64,
+    /// Creation time in ms since the epoch; 0 when unknown.
+    pub created_at: i64,
+    pub file_num: u32,
+    /// Total size of the shared files when the drive reports it.
+    pub size: i64,
+    pub visit_count: i64,
+    pub save_count: i64,
+    pub download_count: i64,
+    /// True once the drive itself considers the share dead.
+    pub expired: bool,
+    /// Native ids the share covers, when the drive reports them.
+    pub fids: Vec<String>,
+}
+
 /// A parsed share link.
 #[derive(Debug, Clone)]
 pub struct ShareTarget {
@@ -722,6 +752,18 @@ pub async fn share_revoke(
         .map(|fid| crate::providers::native_of(fid))
         .collect();
     drive.revoke_share(&share_id, &natives).await
+}
+
+/// Lists the shares the user has created on a drive.
+#[tauri::command]
+pub async fn share_records(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+) -> AppResult<Vec<ShareRecord>> {
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    drive.share_records().await
 }
 
 /// Downloads share entries: expands folders into their files and queues one

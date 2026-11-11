@@ -1618,6 +1618,90 @@ impl DriveProvider for Pan123Provider {
         .await
         .map(|_| ())
     }
+
+    /// `GET /b/api/share/list` — the shares this account owns, newest first.
+    ///
+    /// `SharePwd` is echoed here even though `/b/api/share/info` hides it, and
+    /// `Expiration` is an ISO string (`9999-12-31…` means permanent).
+    async fn share_records(&self) -> AppResult<Vec<crate::share::ShareRecord>> {
+        let value = self
+            .call(
+                "GET",
+                &format!(
+                    "{SHARE_BASE}/b/api/share/list?limit=100&next=0&orderBy=createAt&orderDirection=desc"
+                ),
+                None,
+            )
+            .await?;
+        let list = value
+            .pointer("/data/InfoList")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(list
+            .iter()
+            .map(|row| {
+                let expiry = row.get("Expiration").and_then(|v| v.as_str()).unwrap_or("");
+                crate::share::ShareRecord {
+                    share_id: row
+                        .get("ShareId")
+                        .map(|v| v.to_string())
+                        .unwrap_or_default(),
+                    url: row
+                        .pointer("/shareLinkList/list/0")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    title: text_at(row, "ShareName"),
+                    passcode: text_at(row, "SharePwd"),
+                    expired_at: parse_iso_ms(expiry),
+                    created_at: parse_iso_ms(&text_at(row, "CreateAt")),
+                    file_num: row
+                        .get("FileIdList")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.split(',').filter(|p| !p.trim().is_empty()).count() as u32)
+                        .unwrap_or(0),
+                    size: 0,
+                    visit_count: row
+                        .get("PreviewCount")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    save_count: row.get("SaveCount").and_then(|v| v.as_i64()).unwrap_or(0),
+                    download_count: row
+                        .get("DownloadCount")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0),
+                    expired: row
+                        .get("Expired")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    fids: row
+                        .get("FileIdList")
+                        .and_then(|v| v.as_str())
+                        .map(|v| {
+                            v.split(',')
+                                .map(|p| p.trim().to_string())
+                                .filter(|p| !p.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect())
+    }
+}
+
+/// Parses an ISO timestamp into ms since the epoch; 0 when unusable.
+///
+/// A permanent share is spelled `9999-12-31T23:59:59+08:00`; reporting that as
+/// an expiry would render as a date in the year 9999, so anything from 2100 on
+/// is folded back to "no expiry" (0).
+fn parse_iso_ms(text: &str) -> i64 {
+    const PERMANENT: i64 = 4_102_444_800_000; // 2100-01-01T00:00:00Z
+    match chrono::DateTime::parse_from_rfc3339(text) {
+        Ok(at) if at.timestamp_millis() < PERMANENT => at.timestamp_millis(),
+        _ => 0,
+    }
 }
 
 impl Pan123Provider {

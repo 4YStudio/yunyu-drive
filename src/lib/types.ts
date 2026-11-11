@@ -225,3 +225,25 @@ export interface ShareCreated {
   expiredAt: number;
   shareId: string;
 }
+
+/** A share the user already created, as listed by the drive. */
+export interface ShareRecord {
+  /** Drive-side id; pass it back to `shareRevoke`. */
+  shareId: string;
+  /** Browser address; empty when the drive does not echo it back. */
+  url: string;
+  title: string;
+  /** Empty for a code-free share — 百度 never echoes the code. */
+  passcode: string;
+  /** ms since the epoch; 0 when permanent or unknown. */
+  expiredAt: number;
+  createdAt: number;
+  fileNum: number;
+  size: number;
+  visitCount: number;
+  saveCount: number;
+  downloadCount: number;
+  expired: boolean;
+  /** Qualified ids the share covers, when the drive reports them. */
+  fids: string[];
+}
