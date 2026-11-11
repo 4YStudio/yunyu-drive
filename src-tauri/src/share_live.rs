@@ -1534,3 +1534,145 @@ async fn live_probe_cleanup() {
         }
     }
 }
+
+/// Downloads a real file with a speed cap and reports the achieved rate.
+///
+/// ```text
+/// CAP_KBPS=512 PROBE_PROVIDER=quark cargo test --lib live_throttle -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn live_throttle() {
+    let provider = std::env::var("PROBE_PROVIDER")
+        .ok()
+        .and_then(|v| ProviderId::parse(&v))
+        .unwrap_or(ProviderId::Quark);
+    let cap: u64 = std::env::var("CAP_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let Some(drive) = drive(provider) else { return };
+    let root = match provider {
+        ProviderId::Aliyun => "root",
+        _ => "0",
+    };
+    let min_size: u64 = std::env::var("MIN_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600_000);
+    let Ok(list) = drive.list(root).await else { return };
+    let Some(entry) = list
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && e.size > min_size)
+        .min_by_key(|e| e.size)
+    else {
+        println!("no file over 600 KB in the root");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("yunyu-throttle-{}", std::process::id()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let part = dir.join("probe.part");
+    let final_path = dir.join("probe.bin");
+    crate::transfer::set_speed_limit(cap);
+    let started = std::time::Instant::now();
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let token = tokio_util::sync::CancellationToken::new();
+    let result = crate::transfer::run_provider_download_for_test(
+        &drive,
+        &crate::providers::native_of(&entry.fid),
+        &part,
+        &final_path,
+        entry.size,
+        done,
+        token,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    crate::transfer::set_speed_limit(0);
+    match result {
+        Ok(()) => {
+            let rate = entry.size as f64 / elapsed.as_secs_f64() / 1024.0;
+            println!(
+                "{} ({} B) in {:.1}s => {:.0} KiB/s (cap {} KiB/s)",
+                entry.name,
+                entry.size,
+                elapsed.as_secs_f64(),
+                rate,
+                cap
+            );
+            assert!(rate <= cap as f64 * 1.35, "cap not enforced: {rate:.0}");
+        }
+        Err(err) => println!("download failed: {err}"),
+    }
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}
+
+/// Uploads a real file with a speed cap and reports the achieved rate.
+///
+/// ```text
+/// UP_CAP_KBPS=256 UP_MB=8 cargo test --lib live_upload_throttle -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn live_upload_throttle() {
+    let provider = std::env::var("PROBE_PROVIDER")
+        .ok()
+        .and_then(|v| ProviderId::parse(&v))
+        .unwrap_or(ProviderId::Quark);
+    let cap: u64 = std::env::var("UP_CAP_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let mb: usize = std::env::var("UP_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let Some(drive) = drive(provider) else { return };
+    let root = match provider {
+        ProviderId::Aliyun => "root",
+        _ => "0",
+    };
+    let dir = std::env::temp_dir().join(format!("yunyu-upcap-{}", std::process::id()));
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    let local = dir.join("cap.bin");
+    let block: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let mut file = tokio::fs::File::create(&local).await.unwrap();
+    for _ in 0..mb {
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&block).await.unwrap();
+    }
+    drop(file);
+    let size = (mb * 1024 * 1024) as u64;
+    let name = format!("yunyu-upcap-{}.bin", std::process::id());
+    crate::transfer::set_speed_limit(cap);
+    let started = std::time::Instant::now();
+    let sink = crate::transfer::throttled_sink(Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let result = drive
+        .upload(
+            &local,
+            root,
+            &name,
+            sink,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+    crate::transfer::set_speed_limit(0);
+    match result {
+        Ok(fid) => {
+            let rate = size as f64 / elapsed.as_secs_f64() / 1024.0;
+            println!(
+                "{name} ({size} B) in {:.1}s => {:.0} KiB/s (cap {cap} KiB/s)",
+                elapsed.as_secs_f64(),
+                rate
+            );
+            assert!(rate <= cap as f64 * 1.4, "cap not enforced: {rate:.0}");
+            if let Some(fid) = fid {
+                let _ = drive.delete(&[crate::providers::native_of(&fid)]).await;
+            }
+        }
+        Err(err) => println!("upload failed: {err}"),
+    }
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+}

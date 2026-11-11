@@ -110,6 +110,34 @@ pub struct TransferManager {
     store: Option<PathBuf>,
 }
 
+/// Process-wide speed cap in bytes per second (0 = unlimited).
+///
+/// A single number rather than one per task: the point of the setting is to
+/// stop the app from eating the whole link, and every transfer shares it.
+static SPEED_LIMIT: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the cap. `kbps` is KiB/s, matching what the settings UI shows.
+pub fn set_speed_limit(kbps: u64) {
+    SPEED_LIMIT.store(kbps.saturating_mul(1024), Ordering::Relaxed);
+}
+
+/// Sleeps just enough to keep `written` bytes on schedule.
+///
+/// Called after each chunk: the budget is the bytes so far over the cap, and the
+/// deficit against the elapsed time is how long the writer has to wait. Granular
+/// (per chunk) rather than a token bucket, which is plenty for a desktop client.
+pub(crate) async fn throttle(started: Instant, written: u64) {
+    let cap = SPEED_LIMIT.load(Ordering::Relaxed);
+    if cap == 0 || written == 0 {
+        return;
+    }
+    let budget = Duration::from_secs_f64(written as f64 / cap as f64);
+    let elapsed = started.elapsed();
+    if budget > elapsed {
+        tokio::time::sleep(budget - elapsed).await;
+    }
+}
+
 /// Releases a worker slot when the task body finishes (including early returns).
 struct SlotGuard {
     manager: Arc<TransferManager>,
@@ -785,7 +813,10 @@ impl TransferManager {
             );
 
             let sink = Arc::new(crate::providers::CounterSink::new(done.clone()));
-            let sink_trait: Arc<dyn UploadSink> = sink.clone();
+            let sink_trait: Arc<dyn UploadSink> = Arc::new(ThrottledSink {
+                inner: sink.clone(),
+                started: Instant::now(),
+            });
             let native_parent = crate::providers::native_of(&job.pdir_fid);
             let result = drive
                 .upload(&path, &native_parent, &file_name, sink_trait, token.clone())
@@ -796,7 +827,7 @@ impl TransferManager {
 
             match result {
                 Ok(fid) => {
-                    let rapid = sink.phase() != "uploading";
+                    let rapid = sink.current_phase() != "uploading";
                     manager
                         .patch(&id, &handle, move |t| {
                             t.status = "done".to_string();
@@ -1122,6 +1153,60 @@ async fn run_cross_file(
 }
 
 /// Reports `base + bytes` to the task counter.
+/// Uploads report bytes as they go, so the cap is applied there: the wrapper
+/// waits out any surplus before handing the progress to the real sink (which is
+/// what the providers call after each part).
+/// Test hook: the same throttled sink the upload path uses, so a probe can
+/// measure the cap without starting a whole task.
+#[cfg(test)]
+pub fn throttled_sink(done: Arc<AtomicU64>) -> Arc<dyn crate::providers::UploadSink> {
+    Arc::new(ThrottledSink {
+        inner: Arc::new(crate::providers::CounterSink::new(done)),
+        started: Instant::now(),
+    })
+}
+
+struct ThrottledSink {
+    inner: Arc<crate::providers::CounterSink>,
+    started: Instant,
+}
+
+impl UploadSink for ThrottledSink {
+    fn phase(&self, phase: &str) {
+        self.inner.phase(phase);
+    }
+
+    fn progress(&self, bytes: u64) {
+        let cap = SPEED_LIMIT.load(Ordering::Relaxed);
+        if cap > 0 && bytes > 0 {
+            let budget = Duration::from_secs_f64(bytes as f64 / cap as f64);
+            let elapsed = self.started.elapsed();
+            if budget > elapsed {
+                wait_sync(budget - elapsed);
+            }
+        }
+        self.inner.progress(bytes);
+    }
+}
+
+/// Sleeps inside a sync trait method without stalling the whole runtime.
+///
+/// `UploadSink::progress` is called from provider stream closures that cannot
+/// await, so the cap has to block somewhere. On a multi-threaded runtime
+/// `block_in_place` hands the worker's other tasks to a fresh thread first; a
+/// current-thread runtime (the unit tests) has nothing to hand off, so it just
+/// parks.
+fn wait_sync(duration: Duration) {
+    let multi = tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if multi {
+        tokio::task::block_in_place(|| std::thread::sleep(duration));
+    } else {
+        std::thread::sleep(duration);
+    }
+}
+
 struct OffsetSink {
     base: u64,
     inner: Arc<AtomicU64>,
@@ -1335,6 +1420,22 @@ async fn run_provider_download(
     Ok(())
 }
 
+/// Test hook: the download path without a task record, so the live probes can
+/// measure it directly.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_provider_download_for_test(
+    drive: &Arc<dyn DriveProvider>,
+    fid: &str,
+    part_path: &Path,
+    final_path: &Path,
+    size: u64,
+    done: Arc<AtomicU64>,
+    token: CancellationToken,
+) -> AppResult<()> {
+    run_provider_download(drive, fid, part_path, final_path, size, done, token, 0).await
+}
+
 /// Drains `stream` into `part_path`, appending at `start` and reporting progress.
 /// `base` shifts the reported counter so a batch of files can share one number.
 async fn write_stream(
@@ -1358,6 +1459,7 @@ async fn write_stream(
         tokio::fs::File::create(part_path).await?
     };
     let mut written = start;
+    let started = Instant::now();
     loop {
         let chunk = tokio::select! {
             biased;
@@ -1369,6 +1471,7 @@ async fn write_stream(
                 file.write_all(&bytes).await?;
                 written += bytes.len() as u64;
                 done.store(base + written, Ordering::Relaxed);
+                throttle(started, written.saturating_sub(start)).await;
             }
             Some(Err(err)) => return Err(err),
             None => break,
@@ -1594,6 +1697,36 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    /// One test on purpose: the cap is a process-wide static, so two tests
+    /// running in parallel would reset each other's value mid-wait.
+    #[tokio::test]
+    async fn the_cap_only_delays_bytes_that_are_ahead_of_schedule() {
+        set_speed_limit(0);
+        let started = Instant::now();
+        throttle(started, 64 * 1024 * 1024).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "unlimited must not wait"
+        );
+
+        // 256 KiB at 10 MiB/s is ~25ms of budget; asking for all of it at once
+        // means sleeping almost the whole 25ms.
+        set_speed_limit(10 * 1024);
+        let started = Instant::now();
+        throttle(started, 256 * 1024).await;
+        let elapsed = started.elapsed();
+        set_speed_limit(0);
+        assert!(
+            elapsed >= Duration::from_millis(15),
+            "expected a wait, got {elapsed:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod retry_tests {
     use super::*;

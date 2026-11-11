@@ -14,6 +14,9 @@ pub struct Settings {
     pub download_dir: String,
     pub upload_conflict: String,
     pub concurrent_transfers: u32,
+    /// Speed cap in KiB/s; 0 means unlimited.
+    #[serde(default)]
+    pub speed_limit_kbps: u64,
     pub confirm_delete: bool,
     pub api_base_url: String,
     pub show_hidden: bool,
@@ -31,6 +34,7 @@ impl Default for Settings {
             download_dir: default_download_dir(),
             upload_conflict: "rename".to_string(),
             concurrent_transfers: 3,
+            speed_limit_kbps: 0,
             confirm_delete: true,
             api_base_url: "https://drive.quark.cn".to_string(),
             show_hidden: false,

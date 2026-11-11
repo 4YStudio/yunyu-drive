@@ -143,6 +143,7 @@ let settings: Settings = {
   downloadDir: "/home/henvei/下载",
   uploadConflict: "rename",
   concurrentTransfers: 3,
+  speedLimitKbps: 0,
   confirmDelete: true,
   apiBaseUrl: "https://drive.quark.cn",
   showHidden: false,

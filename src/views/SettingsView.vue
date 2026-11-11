@@ -243,6 +243,24 @@ const theme = computed({
             />
           </div>
           <div class="divider" />
+          <div class="row">
+            <div class="row-copy">
+              <span class="row-label">速度限制</span>
+              <span class="row-hint">所有传输共享这个上限，超出的部分靠等待补回来</span>
+            </div>
+            <Segmented
+              :model-value="String(draft.speedLimitKbps)"
+              :options="[
+                { value: '0', label: '不限' },
+                { value: '512', label: '512K' },
+                { value: '2048', label: '2M' },
+                { value: '5120', label: '5M' },
+                { value: '10240', label: '10M' },
+              ]"
+              @update:model-value="(v: string) => draft && (draft.speedLimitKbps = Number(v))"
+            />
+          </div>
+          <div class="divider" />
           <Switch
             :model-value="draft.confirmDelete"
             label="删除前确认"

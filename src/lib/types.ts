@@ -153,6 +153,8 @@ export interface Settings {
   downloadDir: string;
   uploadConflict: string;
   concurrentTransfers: number;
+  /** Speed cap in KiB/s; 0 means unlimited. */
+  speedLimitKbps: number;
   confirmDelete: boolean;
   apiBaseUrl: string;
   showHidden: boolean;

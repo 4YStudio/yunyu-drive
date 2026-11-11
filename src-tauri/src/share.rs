@@ -775,6 +775,7 @@ pub async fn stream_to_file(
     };
     let mut written = if append { start } else { 0 };
     done.store(written, Ordering::Relaxed);
+    let started = std::time::Instant::now();
     let mut stream = res.bytes_stream();
     loop {
         let next = tokio::select! {
@@ -787,6 +788,8 @@ pub async fn stream_to_file(
         file.write_all(&chunk).await?;
         written += chunk.len() as u64;
         done.store(written, Ordering::Relaxed);
+        // Share downloads honour the same cap as ordinary ones.
+        crate::transfer::throttle(started, written.saturating_sub(start)).await;
     }
     file.flush().await?;
     Ok(written)

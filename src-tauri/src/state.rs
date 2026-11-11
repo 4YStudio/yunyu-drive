@@ -65,6 +65,7 @@ impl AppState {
             settings.concurrent_transfers,
             Some(paths.transfers_file()),
         );
+        crate::transfer::set_speed_limit(settings.speed_limit_kbps);
         Ok(Arc::new(Self {
             paths,
             close_to_tray: AtomicBool::new(settings.close_to_tray),
@@ -222,6 +223,7 @@ impl AppState {
         // The concurrency limit lives in the transfer manager so queued jobs
         // can pick it up without a restart.
         self.transfers.set_limit(next.concurrent_transfers);
+        crate::transfer::set_speed_limit(next.speed_limit_kbps);
         Ok(next)
     }
 }

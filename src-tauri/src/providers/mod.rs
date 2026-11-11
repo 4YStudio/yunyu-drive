@@ -370,6 +370,10 @@ pub trait UploadSink: Send + Sync {
     /// bytes are moving. The manager maps this onto the task status.
     fn phase(&self, phase: &str);
     /// Absolute number of bytes hashed / uploaded so far.
+    ///
+    /// Sync on purpose: providers call it from stream closures that cannot
+    /// await. A speed cap therefore waits with `block_in_place` (see
+    /// [`crate::transfer::ThrottledSink`]).
     fn progress(&self, bytes: u64);
 }
 
@@ -617,7 +621,9 @@ impl CounterSink {
         }
     }
 
-    pub fn phase(&self) -> String {
+    /// The last phase the provider reported, e.g. to tell a rapid upload from
+    /// one that actually moved bytes.
+    pub fn current_phase(&self) -> String {
         self.phase
             .lock()
             .map(|p| p.clone())
