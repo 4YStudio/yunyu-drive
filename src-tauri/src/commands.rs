@@ -663,6 +663,7 @@ async fn ensure_remote_dir(
             created_at: 0,
             ext: String::new(),
             provider: drive.id().as_str().to_string(),
+            thumb: None,
         });
     }
     Ok(native)
@@ -941,6 +942,21 @@ pub async fn provider_quota(
         .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
     let drive = state.drive_of(id).await?;
     drive.quota().await
+}
+
+/// Inlines a preview image so the renderer can show it.
+///
+/// The app CSP only allows `data:`/`asset:` images, so a remote thumbnail has
+/// to be fetched here and handed over as a data URL. Thumbnail hosts are
+/// pre-signed and short-lived, which is why this takes the url rather than an
+/// entry id: the listing already carries a fresh one.
+#[tauri::command]
+pub async fn inline_image(url: String) -> AppResult<Option<String>> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Ok(None);
+    }
+    let client = crate::share::http()?;
+    Ok(crate::share::fetch_image(&client, &url, None).await)
 }
 
 /// Lists a drive's recycle bin.

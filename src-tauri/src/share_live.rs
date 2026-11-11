@@ -108,7 +108,7 @@ async fn probe(provider: ProviderId, link: &str) {
         }
     };
     let dir = match provider {
-        ProviderId::Yun139 | ProviderId::Aliyun => "root",
+        ProviderId::Aliyun => "root",
         ProviderId::Baidu => "/",
         _ => "0",
     };
@@ -293,7 +293,7 @@ async fn share_live_save() {
             passcode: session.passcode.clone(),
         };
         let dir = match provider {
-            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            ProviderId::Aliyun => "root",
             ProviderId::Baidu => "/",
             _ => "0",
         };
@@ -488,7 +488,7 @@ async fn share_live_download() {
             passcode: session.passcode.clone(),
         };
         let dir = match provider {
-            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            ProviderId::Aliyun => "root",
             _ => "0",
         };
         let Ok(files) = drive.share_walk(&share_ref, dir).await else {
@@ -578,7 +578,7 @@ async fn share_live_save_folder() {
             passcode: session.passcode.clone(),
         };
         let dir = match provider {
-            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            ProviderId::Aliyun => "root",
             _ => "0",
         };
         let Ok(listing) = drive.share_list(&share_ref, dir).await else {
@@ -924,7 +924,7 @@ async fn live_search() {
     for provider in ProviderId::all() {
         let Some(drive) = drive(provider) else { continue };
         let root = match provider {
-            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            ProviderId::Aliyun => "root",
             ProviderId::Baidu => "/",
             _ => "0",
         };
@@ -1135,7 +1135,7 @@ async fn live_root_listing_one() {
     let provider = ProviderId::parse(&name).expect("unknown provider");
     let Some(drive) = drive(provider) else { return };
     let root = match provider {
-        ProviderId::Yun139 | ProviderId::Aliyun => "root",
+        ProviderId::Aliyun => "root",
         ProviderId::Baidu => "/",
         _ => "0",
     };
@@ -1198,4 +1198,128 @@ async fn live_recycle_clear_aliyun() {
     if let Ok(after) = drive.recycle_list(0, 100).await {
         println!("bin now holds {} row(s)", after.len());
     }
+}
+
+/// Prints the first few raw rows of one drive's listing, thumbnails included.
+#[tokio::test]
+#[ignore]
+async fn live_thumbnail_fields() {
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        let root = match provider {
+            ProviderId::Aliyun => "root",
+            ProviderId::Baidu => "/",
+            _ => "0",
+        };
+        let Ok(list) = drive.list(root).await else { continue };
+        println!("=== {} ({} entries) ===", provider.as_str(), list.entries.len());
+        for entry in list.entries.iter().take(4) {
+            println!("  {} thumb={:?}", entry.name, entry.thumb);
+        }
+    }
+}
+
+/// Walks into `PROBE_DIR` on one drive (`PROBE_PROVIDER`, `PROBE_DIR`) and
+/// prints the thumbnail field of the first rows.
+#[tokio::test]
+#[ignore]
+async fn live_thumbnails_in_dir() {
+    let name = std::env::var("PROBE_PROVIDER").unwrap_or_else(|_| "aliyun".to_string());
+    let dir_name = std::env::var("PROBE_DIR").unwrap_or_else(|_| "头像".to_string());
+    let provider = ProviderId::parse(&name).expect("unknown provider");
+    let Some(drive) = drive(provider) else { return };
+    let root = match provider {
+        ProviderId::Aliyun => "root",
+        ProviderId::Baidu => "/",
+        _ => "0",
+    };
+    // `PROBE_DIR` may be a slash-separated path; each segment is a folder name.
+    let mut cursor = root.to_string();
+    for segment in dir_name.split('/') {
+        let list = match drive.list(&cursor).await {
+            Ok(list) => list,
+            Err(err) => {
+                println!("list {cursor} ERR {err}");
+                return;
+            }
+        };
+        let Some(folder) = list.entries.iter().find(|e| e.name == segment) else {
+            println!("no folder {segment} under {cursor}");
+            return;
+        };
+        // The trait takes native ids; the listing hands back qualified ones.
+        cursor = crate::providers::native_of(&folder.fid);
+    }
+    match drive.list(&cursor).await {
+        Ok(inner) => {
+            println!("=== {} / {} ({} entries) ===", name, dir_name, inner.entries.len());
+            for entry in inner.entries.iter().take(5) {
+                println!("  {} -> {:?}", entry.name, entry.thumb);
+            }
+        }
+        Err(err) => println!("ERR {err}"),
+    }
+}
+
+/// Fetches the preview urls a listing hands out and reports whether they are
+/// actually downloadable (they are pre-signed and short-lived).
+#[tokio::test]
+#[ignore]
+async fn live_thumbnail_download() {
+    let name = std::env::var("PROBE_PROVIDER").unwrap_or_else(|_| "aliyun".to_string());
+    let dir_name = std::env::var("PROBE_DIR").unwrap_or_else(|_| "Umi/头像".to_string());
+    let provider = ProviderId::parse(&name).expect("unknown provider");
+    let Some(drive) = drive(provider) else { return };
+    let root = match provider {
+        ProviderId::Aliyun => "root",
+        ProviderId::Baidu => "/",
+        _ => "0",
+    };
+    let mut cursor = root.to_string();
+    for segment in dir_name.split('/') {
+        let Ok(list) = drive.list(&cursor).await else { return };
+        let Some(folder) = list.entries.iter().find(|e| e.name == segment) else {
+            println!("no folder {segment}");
+            return;
+        };
+        cursor = crate::providers::native_of(&folder.fid);
+    }
+    let Ok(list) = drive.list(&cursor).await else { return };
+    let Some(entry) = list.entries.iter().find(|e| e.thumb.is_some()) else {
+        println!("no thumbnails under {dir_name}");
+        return;
+    };
+    let url = entry.thumb.clone().unwrap_or_default();
+    println!("{} -> {} chars", entry.name, url.len());
+    std::fs::write("/tmp/thumb_url.txt", &url).ok();
+    let client = crate::share::http().expect("client");
+    let started = std::time::Instant::now();
+    match crate::share::fetch_image(&client, &url, None).await {
+        Some(data) => println!(
+            "inlined {} bytes in {:?} (prefix {})",
+            data.len(),
+            started.elapsed(),
+            &data[..data.len().min(32)]
+        ),
+        None => println!("fetch FAILED in {:?}", started.elapsed()),
+    }
+}
+
+/// Prints the thumbnail styles 139 reports for one folder.
+#[tokio::test]
+#[ignore]
+async fn live_yun139_thumb_styles() {
+    let provider = ProviderId::Yun139;
+    let Some(drive) = drive(provider) else { return };
+    let Ok(root) = drive.list("0").await else { return };
+    let Some(folder) = root.entries.iter().find(|e| e.name == "手机图片") else {
+        println!("no 手机图片");
+        return;
+    };
+    let Ok(inner) = drive.list(&crate::providers::native_of(&folder.fid)).await else { return };
+    let Some(entry) = inner.entries.iter().find(|e| e.thumb.is_some()) else {
+        println!("no thumbs");
+        return;
+    };
+    println!("{} thumb len {}", entry.name, entry.thumb.as_deref().unwrap_or("").len());
 }

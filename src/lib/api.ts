@@ -53,6 +53,11 @@ export const api = {
   recyclePurge: (provider: string, entries: RecycleEntry[]) =>
     invoke<number>("recycle_purge", { provider, entries }),
   recycleClear: (provider: string) => invoke<void>("recycle_clear", { provider }),
+  /**
+   * Downloads a pre-signed preview and returns it as a `data:` url. The CSP
+   * blocks remote hosts, so the thumbnail has to travel through the backend.
+   */
+  inlineImage: (url: string) => invoke<string | null>("inline_image", { url }),
   setCookie: (cookie: string) => invoke<AuthStatus>("set_cookie", { cookie }),
   clearCookie: () => invoke<AuthStatus>("clear_cookie"),
   validateCookie: () => invoke<number>("validate_cookie"),

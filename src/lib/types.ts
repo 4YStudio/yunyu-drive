@@ -29,6 +29,12 @@ export interface EntryDto {
   createdAt: number;
   ext: string;
   provider: ProviderId;
+  /**
+   * Pre-signed preview url from the drive's own listing. It expires within
+   * hours and the CSP blocks remote hosts, so it is only ever handed to
+   * `api.inlineImage` — never bound to an `<img src>` directly.
+   */
+  thumb?: string | null;
 }
 
 export interface ProviderCapabilities {

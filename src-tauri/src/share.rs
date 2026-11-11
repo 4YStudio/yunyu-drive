@@ -452,8 +452,25 @@ pub async fn account_info(
 /// Downloads an avatar and inlines it as a `data:` URL — the app CSP does not
 /// allow remote images.
 pub async fn fetch_avatar(client: &reqwest::Client, url: &str) -> Option<String> {
+    fetch_image(client, url, None).await
+}
+
+/// Same, but sends the `Referer` the CDN expects.
+///
+/// Every drive's preview host is picky about it: 阿里云盘 answers 403 without
+/// `https://www.aliyundrive.com/`, and 百度/139/123 have their own. The referer
+/// is derived from the host so callers do not have to know.
+pub async fn fetch_image(
+    client: &reqwest::Client,
+    url: &str,
+    referer: Option<&str>,
+) -> Option<String> {
     let url = decorate_avatar(url);
-    let res = client.get(&url).send().await.ok()?;
+    let mut request = client.get(&url);
+    if let Some(referer) = referer.or_else(|| image_referer(&url)) {
+        request = request.header(reqwest::header::REFERER, referer);
+    }
+    let res = request.send().await.ok()?;
     if !res.status().is_success() {
         return None;
     }
@@ -486,6 +503,29 @@ fn decorate_avatar(url: &str) -> String {
         _ => url,
     };
     base.replacen("http://", "https://", 1)
+}
+
+/// The `Referer` each drive's preview CDN insists on.
+fn image_referer(url: &str) -> Option<&'static str> {
+    let host = url.split("://").nth(1)?.split('/').next()?.to_ascii_lowercase();
+    let referer = if host.ends_with("aliyundrive.net")
+        || host.ends_with("aliyundrive.com")
+        || host.ends_with("alipan.com")
+    {
+        "https://www.aliyundrive.com/"
+    } else if host.ends_with("baidupcs.com") || host.ends_with("bdimg.com") {
+        "https://pan.baidu.com/"
+    } else if host.ends_with("cmecloud.cn") || host.ends_with("139.com") {
+        "https://yun.139.com/"
+    } else if host.ends_with("cjjd19.com") || host.ends_with("cjjd18.com") || host.ends_with("123952.com")
+    {
+        "https://www.123pan.com/"
+    } else if host.ends_with("quark.cn") {
+        "https://pan.quark.cn/"
+    } else {
+        return None;
+    };
+    Some(referer)
 }
 
 async fn drive_for(state: &Arc<AppState>, provider: &str) -> AppResult<Arc<dyn crate::providers::DriveProvider>> {

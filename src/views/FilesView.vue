@@ -13,6 +13,7 @@ import { onFileDrop, pickFiles } from "@/lib/host";
 
 import Icon from "@/components/Icon.vue";
 import FileIcon from "@/components/FileIcon.vue";
+import FileThumb from "@/components/FileThumb.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import ContextMenu from "@/components/ContextMenu.vue";
 import type { MenuItem } from "@/lib/menu";
@@ -1068,7 +1069,8 @@ defineExpose({ refresh });
             @contextmenu.prevent.stop="openMenu($event, row.entry)"
           >
             <div class="card-art">
-              <FileIcon
+              <FileThumb
+                :thumb="row.entry.thumb"
                 :is-dir="row.entry.isDir"
                 :ext="row.entry.ext"
                 :name="row.entry.name"

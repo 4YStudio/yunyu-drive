@@ -96,6 +96,11 @@ add(root.fid, "接口联调记录.md", { size: 24_600, age: 6 });
 add(root.fid, "品牌视觉提案.pptx", { size: 41_200_000, age: 11 });
 add(root.fid, "发布会主视觉.psd", { size: 512_000_000, age: 14 });
 add(root.fid, "组件库源码.zip", { size: 8_940_000, age: 18 });
+// Pictures and a video, so grid mode exercises the preview branch (the mock
+// answers `inlineImage` with a grey square).
+add(root.fid, "发布会现场.jpg", { size: 4_120_000, age: 7 });
+add(root.fid, "主视觉导出.png", { size: 2_240_000, age: 8 });
+add(root.fid, "产品演示.mp4", { size: 96_400_000, age: 9 });
 
 add(projects.fid, "前后端联调", { dir: true, age: 1 });
 add(projects.fid, "需求终稿.docx", { size: 642_000, age: 0 });
@@ -160,6 +165,12 @@ const dto = (n: MockNode): EntryDto => {
     ...rest,
     fid: withPrefix(rest.fid, rest.provider as ProviderId),
     pdirFid: rest.pdirFid ? withPrefix(rest.pdirFid, rest.provider as ProviderId) : rest.pdirFid,
+    // Pictures get a fake signed url so the thumbnail branch renders in mock
+    // builds; `inlineImage` below turns it into a grey square.
+    thumb:
+      !rest.isDir && ["jpg", "jpeg", "png", "webp", "mp4"].includes(rest.ext)
+        ? `https://mock.invalid/thumb/${rest.fid}.jpg`
+        : null,
   };
 };
 
@@ -346,6 +357,10 @@ export const mockApi = {
     return entries.length;
   },
   recycleClear: async (): Promise<void> => {},
+  // A 1×1 grey pixel stands in for every preview, so the grid's thumbnail
+  // branch renders in mock builds without network access.
+  inlineImage: async (_url: string): Promise<string | null> =>
+    "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><rect width='8' height='8' fill='%234a5568'/></svg>",
   providerProfiles: async (): Promise<ProfileInfo[]> =>
     mockStates()
       .filter((s) => s.authenticated)

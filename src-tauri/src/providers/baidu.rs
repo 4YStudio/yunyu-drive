@@ -398,6 +398,15 @@ impl BaiduProvider {
                 updated_at: updated,
                 created_at: created.max(updated),
                 provider: ProviderId::Baidu.as_str().to_string(),
+                // `thumbs` is an object of sized urls; `url2` (~360px) is the
+                // best fit for the grid, `icon` (60px) is the fallback.
+                thumb: row
+                    .pointer("/thumbs/url2")
+                    .or_else(|| row.pointer("/thumbs/url1"))
+                    .or_else(|| row.pointer("/thumbs/icon"))
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string()),
             });
         }
         let total = value.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -1195,6 +1204,7 @@ impl DriveProvider for BaiduProvider {
                     updated_at: updated,
                     created_at: created.max(updated),
                     provider: ProviderId::Baidu.as_str().to_string(),
+                    thumb: None,
                 };
                 chain.push(PathNode {
                     fid: entry.fid.clone(),

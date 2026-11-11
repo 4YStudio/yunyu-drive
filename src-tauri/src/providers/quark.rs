@@ -76,6 +76,9 @@ impl QuarkProvider {
             fid: qualify(ProviderId::Quark, &entry.fid),
             pdir_fid: qualify(ProviderId::Quark, &entry.pdir_fid),
             ext: EntryDto::ext_of(&entry.file_name),
+            // Quark serves previews from a separate endpoint; the listing does
+            // not carry one.
+            thumb: None,
             name: entry.file_name,
             size: entry.size,
             is_dir: entry.dir,
@@ -932,6 +935,7 @@ fn entry_of_json(row: &Value) -> EntryDto {
         updated_at: row.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0),
         created_at: row.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
         provider: ProviderId::Quark.as_str().to_string(),
+        thumb: None,
     }
 }
 

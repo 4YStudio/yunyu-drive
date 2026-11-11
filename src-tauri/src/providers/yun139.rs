@@ -242,6 +242,13 @@ impl Yun139Provider {
             updated_at,
             created_at: updated_at,
             provider: ProviderId::Yun139.as_str().to_string(),
+            // 139 reports `thumbnailUrls: [{style, url}]`; the first entry is
+            // the large one (`use_large_thumbnail` asks for it).
+            thumb: item
+                .thumbnail_urls
+                .as_ref()
+                .and_then(|list| list.iter().find_map(|t| t.url.clone()))
+                .filter(|v| !v.is_empty()),
         }
     }
 }

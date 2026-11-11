@@ -796,6 +796,14 @@ impl AliyunProvider {
             updated_at: updated,
             created_at: created.max(updated),
             provider: ProviderId::Aliyun.as_str().to_string(),
+            // The list call already asks for `image_thumbnail_process` /
+            // `video_thumbnail_process`, so image and video rows come back
+            // with a signed preview url.
+            thumb: item
+                .get("thumbnail")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string()),
         }
     }
 

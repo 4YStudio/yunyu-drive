@@ -733,6 +733,7 @@ mod tests {
             created_at: 0,
             ext: String::new(),
             provider: "quark".to_string(),
+            thumb: None,
         };
         let mut entries = vec![
             entry("beta.txt", false),

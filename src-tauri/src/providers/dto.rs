@@ -23,6 +23,10 @@ pub struct EntryDto {
     pub ext: String,
     /// Which drive this entry belongs to, for the badge in mixed views.
     pub provider: String,
+    /// Preview image url, when the drive reports one. The frontend inlines it
+    /// before rendering (the CSP blocks remote hosts), so this stays `None`
+    /// for drives that need a second request per file.
+    pub thumb: Option<String>,
 }
 
 impl EntryDto {

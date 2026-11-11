@@ -328,6 +328,13 @@ impl Pan123Provider {
             updated_at: updated,
             created_at: created.max(updated),
             provider: ProviderId::Pan123.as_str().to_string(),
+            // `/b/api/file/list/new` carries a `Thumbnail` field, but the
+            // Android protocol leaves it empty for every row we have seen.
+            thumb: item
+                .get("Thumbnail")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string()),
         })
     }
 

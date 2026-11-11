@@ -201,6 +201,7 @@ pub fn run() {
             commands::recycle_restore,
             commands::recycle_purge,
             commands::recycle_clear,
+            commands::inline_image,
             commands::settings_get,
             commands::settings_set,
             commands::app_info,
