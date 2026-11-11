@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto, PathNode,
-    ProviderId, QuotaInfo, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
+    ProviderId, QuotaInfo, RecycleEntry, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -977,6 +977,7 @@ impl DriveProvider for AliyunProvider {
             // saved via `/adrive/v2/batch`; creating a share is not implemented.
             share_open: true,
             share_create: false,
+            recycle: true,
             ..Capabilities::BASIC
         }
     }
@@ -1492,6 +1493,97 @@ impl DriveProvider for AliyunProvider {
             (Some(used), Some(total)) if total > 0 => Ok(Some(QuotaInfo { used, total })),
             _ => Ok(None),
         }
+    }
+
+    // ---------------------------------------------------------- recycle ---
+
+    async fn recycle_list(&self, offset: u32, limit: u32) -> AppResult<Vec<RecycleEntry>> {
+        // The bin is paged by `marker`; replay it to reach `offset`.
+        let drive = self.drive().await?;
+        let size = limit.max(1);
+        let mut marker = String::new();
+        let mut seen = 0u32;
+        loop {
+            let value = self
+                .call(
+                    "/adrive/v2/recyclebin/list",
+                    json!({ "drive_id": drive, "limit": size, "marker": marker }),
+                )
+                .await?;
+            let rows = value
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if seen + rows.len() as u32 > offset {
+                let skip = (offset - seen) as usize;
+                return Ok(rows
+                    .iter()
+                    .skip(skip)
+                    .map(|row| {
+                        let native = row
+                            .get("file_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        RecycleEntry {
+                            fid: qualify(ProviderId::Aliyun, &native),
+                            name: row
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            is_dir: row.get("type").and_then(|v| v.as_str()) == Some("folder"),
+                            size: row.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                            deleted_at: row
+                                .get("trashed_at")
+                                .map(super::parse_time)
+                                .unwrap_or(0),
+                            token: String::new(),
+                            provider: ProviderId::Aliyun.as_str().to_string(),
+                        }
+                    })
+                    .collect());
+            }
+            seen += rows.len() as u32;
+            marker = value
+                .get("next_marker")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if rows.is_empty() || marker.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+    }
+
+    async fn recycle_restore(&self, entries: &[RecycleEntry]) -> AppResult<u32> {
+        if entries.is_empty() {
+            return Err(AppError::new("请先选择要恢复的内容"));
+        }
+        let drive = self.drive().await?;
+        let fids: Vec<String> = entries.iter().map(|e| super::native_of(&e.fid)).collect();
+        self.batch("/recyclebin/restore", &drive, &fids).await?;
+        Ok(entries.len() as u32)
+    }
+
+    async fn recycle_clear(&self) -> AppResult<()> {
+        // Per-item purge is not exposed by the API at all (`/v2/recyclebin/delete`
+        // and the batch variant both 404/400), but emptying the bin is — and it
+        // lives under `/v2/`, not `/adrive/v2/`.
+        let drive = self.drive().await?;
+        let token = self.token().await?;
+        self.raw_post_as(
+            API,
+            "/v2/recyclebin/clear",
+            &json!({ "drive_id": drive }),
+            &token,
+            None,
+            Some(CANARY_ANDROID),
+            &[],
+        )
+        .await?;
+        Ok(())
     }
 
     // ---------------------------------------------------------- shares ---

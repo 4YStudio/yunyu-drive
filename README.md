@@ -53,6 +53,10 @@
   的 `SearchData`、百度 `/api/search?recursion=1`——不再逐目录爬树，因此深层目录也能搜到
   （旧实现走 80 个目录就停）。命中项显示所在文件夹，可直接定位。139 的搜索接口上游返回
   「服务不可用」，暂用本地遍历兜底。
+- **回收站**：夸克 / 123 云盘 / 阿里云盘各有一个「回收站」入口（侧栏只在支持的网盘显示），
+  可多选恢复、彻底删除；阿里云盘只能整站清空（它的 API 没有单条彻底删除），123 云盘只能恢复
+  （没有彻底删除接口）。百度网盘与 139 的回收站接口需要人机验证 / `mcloud-sign` 签名，未接入，
+  这两个网盘删除时提示「永久删除」。文件列表的删除确认文案也会跟着变（「移入回收站，可以再恢复」）。
 - **大目录不会卡死**：列表只挂载前 200 行，滚到底部再续 200（状态栏显示「已显示 N / M」）；
   ↑↓ 走到未挂载的行会自动补上。
 - **容量显示**：侧边栏底部一条容量条，设置页每个网盘一行（已用 / 总量）；网盘不报容量时
@@ -135,7 +139,7 @@ yunyu-drive/             ← 本仓库（前端 + Tauri 壳）
 src/
   components/      Sidebar、Segmented、Modal、EmptyState、Toasts、Icon、FileIcon、
                    AliyunQrLogin（扫码登录）、ProviderBadge、DriveLoader（转圈加载）…
-  views/           FilesView / TransfersView / SettingsView / LoginView / ShareView
+  views/           FilesView / RecycleView / TransfersView / SettingsView / LoginView / ShareView
   store/app.ts     全局状态（含每盘登录态、容量）+ 主题 + 启动编排
   lib/api.ts       全部 Tauri 命令的类型化封装
   lib/host.ts      原生能力桥（对话框 / 打开所在目录 / 拖拽 / 窗口主题），浏览器降级

@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider,
-    EntryDto, PathNode, ProviderId, QuotaInfo, SearchHit, ShareFile, ShareLink, UploadSink,
+    EntryDto, PathNode, ProviderId, QuotaInfo, RecycleEntry, SearchHit, ShareFile, ShareLink,
+    UploadSink,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -748,6 +749,90 @@ impl DriveProvider for QuarkProvider {
             (Some(used), Some(total)) if total > 0 => Ok(Some(QuotaInfo { used, total })),
             _ => Ok(None),
         }
+    }
+
+    // ----------------------------------------------------------- recycle ---
+
+    async fn recycle_list(&self, offset: u32, limit: u32) -> AppResult<Vec<RecycleEntry>> {
+        // The bin is paged by row count, not by cursor: `_page`/`_size` with
+        // the offset folded into the page number.
+        let size = limit.max(1);
+        let page = offset / size + 1;
+        let value = get_json(
+            &format!("{QUARK_API}/1/clouddrive/file/recycle/list"),
+            &self.cookie,
+            &[
+                ("pr", "ucpro".to_string()),
+                ("fr", "pc".to_string()),
+                ("_page", page.to_string()),
+                ("_size", size.to_string()),
+                ("_fetch_total", "1".to_string()),
+            ],
+        )
+        .await?;
+        let data = envelope(value)?;
+        let rows = data
+            .get("list")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let native = text(row, "fid");
+                RecycleEntry {
+                    fid: qualify(ProviderId::Quark, &native),
+                    name: text(row, "file_name"),
+                    is_dir: row.get("file_type").and_then(|v| v.as_i64()).unwrap_or(0) == 0,
+                    size: row.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                    deleted_at: row.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0),
+                    // The record id is what the bin's own endpoints want; the
+                    // fid above is the original file id, which is what restore
+                    // and purge actually take.
+                    token: text(row, "record_id"),
+                    provider: ProviderId::Quark.as_str().to_string(),
+                }
+            })
+            .collect())
+    }
+
+    async fn recycle_restore(&self, entries: &[RecycleEntry]) -> AppResult<u32> {
+        // `select_mode: 1` + a flat `fid_list` is the only shape the endpoint
+        // accepts: `record_list`, `record_ids`, `fids` and a `select_mode: 2`
+        // variant all come back as "Bad Parameter".
+        let fids: Vec<String> = entries.iter().map(|e| native_of(&e.fid)).collect();
+        if fids.is_empty() {
+            return Err(AppError::new("请先选择要恢复的内容"));
+        }
+        let value = post_json(
+            &format!("{QUARK_API}/1/clouddrive/file/recycle/recover?pr=ucpro&fr=pc"),
+            &self.cookie,
+            &json!({ "select_mode": 1, "fid_list": fids }),
+        )
+        .await?;
+        envelope(value)?;
+        Ok(entries.len() as u32)
+    }
+
+    async fn recycle_purge(&self, entries: &[RecycleEntry]) -> AppResult<u32> {
+        let fids: Vec<String> = entries.iter().map(|e| native_of(&e.fid)).collect();
+        if fids.is_empty() {
+            return Err(AppError::new("请先选择要彻底删除的内容"));
+        }
+        // Unlike list/recover, this one rejects the request without an Origin
+        // header (`401 require login [guest]`).
+        let res = crate::share::http()?
+            .post(format!(
+                "{QUARK_API}/1/clouddrive/file/recycle/remove?pr=ucpro&fr=pc"
+            ))
+            .headers(crate::share::quark_headers(&self.cookie))
+            .header(reqwest::header::ORIGIN, "https://pan.quark.cn")
+            .json(&json!({ "select_mode": 1, "fid_list": fids }))
+            .send()
+            .await?;
+        let value: Value = res.json().await?;
+        envelope(value)?;
+        Ok(entries.len() as u32)
     }
 }
 

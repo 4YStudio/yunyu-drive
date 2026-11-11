@@ -402,6 +402,18 @@ function openMenu(event: MouseEvent, entry: EntryDto | null) {
 }
 
 /** What the drive on screen can do; drives differ, so the menu follows. */
+/**
+ * Delete goes to the drive's recycle bin where there is one, so the wording has
+ * to say "可恢复" instead of "不可撤销" — 百度 and 139 delete for good.
+ */
+const deleteHint = computed(() => {
+  const count = confirmDelete.value?.length ?? 0;
+  if (caps.value.recycle) {
+    return `将把 ${count} 项移入${driveName.value}的回收站，可以再恢复。`;
+  }
+  return `将从云端永久删除 ${count} 项，此操作不可撤销。`;
+});
+
 const caps = computed(
   () =>
     app.providers.find((p) => p.provider === app.activeProvider)?.capabilities ?? {
@@ -412,6 +424,7 @@ const caps = computed(
       search: true,
       rename: true,
       folders: true,
+      recycle: false,
     },
 );
 
@@ -1272,7 +1285,7 @@ defineExpose({ refresh });
     <Modal
       :open="confirmDelete !== null"
       title="删除确认"
-      :subtitle="`将从云端永久删除 ${confirmDelete?.length ?? 0} 项，此操作不可撤销。`"
+      :subtitle="deleteHint"
       :width="440"
       @close="confirmDelete = null"
     >

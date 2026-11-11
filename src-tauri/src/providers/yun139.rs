@@ -611,6 +611,7 @@ impl DriveProvider for Yun139Provider {
             search: true,
             rename: true,
             folders: true,
+            recycle: false,
         }
     }
 

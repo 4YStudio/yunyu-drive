@@ -60,6 +60,27 @@ pub struct SearchHit {
     pub path: Vec<PathNode>,
 }
 
+/// One item sitting in a drive's recycle bin.
+///
+/// The drives disagree on what identifies a trashed item: 夸克 keeps a
+/// `record_id` alongside the file id, 阿里 hands back a `file_id` that only
+/// exists inside the bin, 123 keeps the original id. `token` carries whatever
+/// the drive needs besides the id to restore or purge the row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecycleEntry {
+    /// Qualified id (`"<provider>:<native>"`), like every other entry.
+    pub fid: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// When the drive says it was thrown away (ms); 0 when it does not.
+    pub deleted_at: u64,
+    /// Drive-specific handle the restore/purge calls need.
+    pub token: String,
+    pub provider: String,
+}
+
 /// Free/total space, when the drive exposes it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

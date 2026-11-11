@@ -10,6 +10,7 @@ import type {
   PathNode,
   ProfileInfo,
   ProviderAuthState,
+  RecycleEntry,
   QuotaInfo,
   SearchHit,
   Settings,
@@ -45,6 +46,13 @@ export const api = {
   /** Free/total space, when the drive exposes it. */
   providerQuota: (provider: string) =>
     invoke<QuotaInfo | null>("provider_quota", { provider }),
+  recycleList: (provider: string, offset = 0, limit = 100) =>
+    invoke<RecycleEntry[]>("recycle_list", { provider, offset, limit }),
+  recycleRestore: (provider: string, entries: RecycleEntry[]) =>
+    invoke<number>("recycle_restore", { provider, entries }),
+  recyclePurge: (provider: string, entries: RecycleEntry[]) =>
+    invoke<number>("recycle_purge", { provider, entries }),
+  recycleClear: (provider: string) => invoke<void>("recycle_clear", { provider }),
   setCookie: (cookie: string) => invoke<AuthStatus>("set_cookie", { cookie }),
   clearCookie: () => invoke<AuthStatus>("clear_cookie"),
   validateCookie: () => invoke<number>("validate_cookie"),

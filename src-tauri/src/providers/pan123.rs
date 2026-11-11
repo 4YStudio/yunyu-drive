@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto,
-    PathNode, ProviderId, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
+    PathNode, ProviderId, RecycleEntry, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -660,6 +660,7 @@ impl DriveProvider for Pan123Provider {
             search: true,
             rename: true,
             folders: true,
+            recycle: true,
         }
     }
 
@@ -1159,6 +1160,94 @@ impl DriveProvider for Pan123Provider {
             })),
             _ => Ok(None),
         }
+    }
+
+    // ----------------------------------------------------------- recycle ---
+
+    async fn recycle_list(&self, offset: u32, limit: u32) -> AppResult<Vec<RecycleEntry>> {
+        // The bin is the same listing endpoint with `trashed=true`; there is no
+        // separate recycle endpoint and no offset parameter — it pages by
+        // `Next` cursor, which we replay to reach `offset`.
+        let size = limit.max(1);
+        let mut cursor = String::from("0");
+        let mut page = 1u32;
+        let mut seen = 0u32;
+        loop {
+            let url = format!(
+                "{BASE}/b/api/file/list/new?driveId=0&limit={size}&next={cursor}&orderBy=file_id\
+                 &orderDirection=desc&parentFileId=0&trashed=true&Page={page}"
+            );
+            let value = self.call("GET", &url, None).await?;
+            let rows = value
+                .pointer("/data/InfoList")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if seen + rows.len() as u32 > offset {
+                let skip = (offset - seen) as usize;
+                return Ok(rows
+                    .iter()
+                    .skip(skip)
+                    .map(|row| {
+                        let native = row
+                            .get("FileId")
+                            .and_then(|v| v.as_i64())
+                            .map(|v| v.to_string())
+                            .unwrap_or_default();
+                        RecycleEntry {
+                            fid: qualify(ProviderId::Pan123, &native),
+                            name: text_at(row, "FileName"),
+                            is_dir: row.get("Type").and_then(|v| v.as_i64()) == Some(1),
+                            size: row.get("Size").and_then(|v| v.as_u64()).unwrap_or(0),
+                            deleted_at: super::parse_time(
+                                row.get("UpdateAt").unwrap_or(&Value::Null),
+                            ),
+                            token: String::new(),
+                            provider: ProviderId::Pan123.as_str().to_string(),
+                        }
+                    })
+                    .collect());
+            }
+            seen += rows.len() as u32;
+            let next = text_at(&value, "/data/Next");
+            if rows.is_empty() || next.is_empty() || next == "0" || page > 50 {
+                return Ok(Vec::new());
+            }
+            cursor = next;
+            page += 1;
+        }
+    }
+
+    async fn recycle_restore(&self, entries: &[RecycleEntry]) -> AppResult<u32> {
+        let mut list: Vec<Value> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            list.push(json!({ "FileId": numeric_id(&super::native_of(&entry.fid))? }));
+        }
+        if list.is_empty() {
+            return Err(AppError::new("请先选择要恢复的内容"));
+        }
+        // `operation: false` restores; `true` is what `delete` uses to *send*
+        // items to the bin.
+        self.call(
+            "POST",
+            &format!("{BASE}/a/api/file/trash"),
+            Some(json!({ "driveId": 0, "fileTrashInfoList": list, "operation": false })),
+        )
+        .await?;
+        Ok(entries.len() as u32)
+    }
+
+    async fn recycle_purge(&self, entries: &[RecycleEntry]) -> AppResult<u32> {
+        // No public endpoint deletes from the bin for good: every plausible
+        // path (`/a/api/file/trash/delete`, `.../clear`, the `goapi/v1`
+        // variants) answers 404, and `file/clean/trash` only works on a scan
+        // task id. Say so instead of pretending the rows went away.
+        if entries.is_empty() {
+            return Err(AppError::new("请先选择要彻底删除的内容"));
+        }
+        Err(AppError::new(
+            "123 云盘不提供接口彻底删除回收站内容，请在网页版操作",
+        ))
     }
 
     // ---------------------------------------------------------- shares ---

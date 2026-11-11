@@ -17,6 +17,7 @@ import type {
   ProviderAuthState,
   ProviderId,
   QuotaInfo,
+  RecycleEntry,
   SearchHit,
   Settings,
   ShareEntry,
@@ -292,6 +293,7 @@ function mockStates(): ProviderAuthState[] {
         search: true,
         rename: true,
         folders: true,
+        recycle: true,
       },
     },
     // The other drives exist but are not logged in yet, so the switcher shows a
@@ -315,6 +317,8 @@ function mockStates(): ProviderAuthState[] {
         search: true,
         rename: true,
         folders: true,
+        // 123 and 阿里 expose a bin; 百度 and 139 reject every restore call.
+        recycle: provider === "pan123" || provider === "aliyun",
       },
     })),
   ];
@@ -328,6 +332,20 @@ export const mockApi = {
     cookiePath: "/home/henvei/.config/yunyu-drive/cookie.txt",
   }),
   authStates: async (): Promise<ProviderAuthState[]> => mockStates(),
+  recycleList: async (provider: string): Promise<RecycleEntry[]> => {
+    const stamp = Date.now() - 3600_000;
+    return [
+      { fid: `${provider}:1`, name: "旧版安装包.apk", isDir: false, size: 62_400_512, deletedAt: stamp, token: "rec-1", provider: provider as ProviderId },
+      { fid: `${provider}:2`, name: "临时素材", isDir: true, size: 0, deletedAt: stamp - 86_400_000, token: "rec-2", provider: provider as ProviderId },
+      { fid: `${provider}:3`, name: "会议录屏.mp4", isDir: false, size: 1_284_915_200, deletedAt: stamp - 3 * 86_400_000, token: "rec-3", provider: provider as ProviderId },
+    ];
+  },
+  recycleRestore: async (_provider: string, entries: RecycleEntry[]): Promise<number> => entries.length,
+  recyclePurge: async (provider: string, entries: RecycleEntry[]): Promise<number> => {
+    if (provider === "pan123") throw new Error("123 云盘不提供接口彻底删除回收站内容，请在网页版操作");
+    return entries.length;
+  },
+  recycleClear: async (): Promise<void> => {},
   providerProfiles: async (): Promise<ProfileInfo[]> =>
     mockStates()
       .filter((s) => s.authenticated)

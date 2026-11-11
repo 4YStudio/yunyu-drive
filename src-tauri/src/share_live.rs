@@ -957,3 +957,245 @@ async fn live_search() {
         }
     }
 }
+
+/// Recycle bins on every drive: list, then restore the newest row back where it
+/// came from. Only touches what it created — nothing is deleted here.
+#[tokio::test]
+#[ignore]
+async fn live_recycle() {
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        match drive.recycle_list(0, 10).await {
+            Ok(rows) => {
+                println!("=== {} ({} rows) ===", provider.as_str(), rows.len());
+                for row in rows.iter().take(6) {
+                    println!(
+                        "  {} {}  {} B  deleted={}  token={}",
+                        if row.is_dir { "DIR " } else { "FILE" },
+                        row.name,
+                        row.size,
+                        row.deleted_at,
+                        row.token
+                    );
+                }
+            }
+            Err(err) => println!("=== {} LIST ERR {err} ===", provider.as_str()),
+        }
+    }
+}
+
+/// Full recycle round-trip on the drives that support it: create a folder,
+/// delete it (into the bin), find it in the bin, restore it, then delete and
+/// purge it. Leaves nothing behind on success.
+#[tokio::test]
+#[ignore]
+async fn live_recycle_roundtrip() {
+    for provider in ProviderId::all() {
+        if !provider_has_recycle(provider) {
+            continue;
+        }
+        let Some(drive) = drive(provider) else { continue };
+        let root = match provider {
+            ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        let name = format!("yunyu-recycle-probe-{}", std::process::id());
+        println!("=== {} ===", provider.as_str());
+        if let Err(err) = drive.make_dir(root, &name).await {
+            println!("  make_dir ERR {err}");
+            continue;
+        }
+        // Quark's listing lags a beat behind `create_folder`; retry before
+        // declaring the folder missing.
+        let mut created = None;
+        for _ in 0..6 {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            match drive.list(root).await {
+                Ok(list) => {
+                    if let Some(entry) = list.entries.into_iter().find(|e| e.name == name) {
+                        created = Some(entry);
+                        break;
+                    }
+                }
+                Err(err) => {
+                    println!("  list ERR {err}");
+                    break;
+                }
+            }
+        }
+        let Some(created) = created else {
+            println!("  created folder not found in listing");
+            continue;
+        };
+        println!("  created {}", created.fid);
+        // `delete` takes native ids: the providers strip the qualifier
+        // themselves only for *incoming* requests, not for these.
+        let native = crate::providers::native_of(&created.fid);
+        if let Err(err) = drive.delete(&[native]).await {
+            println!("  delete ERR {err}");
+            continue;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let bin = match drive.recycle_list(0, 50).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                println!("  recycle_list ERR {err}");
+                continue;
+            }
+        };
+        let row = bin.into_iter().find(|r| r.name == name);
+        let Some(row) = row else {
+            println!("  deleted folder not in bin");
+            continue;
+        };
+        println!("  in bin: {} ({} B)", row.fid, row.size);
+        match drive.recycle_restore(std::slice::from_ref(&row)).await {
+            Ok(n) => println!("  restored {n}"),
+            Err(err) => {
+                println!("  restore ERR {err}");
+                continue;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let back = drive
+            .list(root)
+            .await
+            .map(|l| l.entries.iter().any(|e| e.name == name))
+            .unwrap_or(false);
+        println!("  back in listing: {back}");
+        if !back {
+            continue;
+        }
+        // Clean up for good: delete again, then purge from the bin.
+        if let Some(entry) = drive
+            .list(root)
+            .await
+            .ok()
+            .and_then(|l| l.entries.into_iter().find(|e| e.name == name))
+        {
+            let _ = drive.delete(&[crate::providers::native_of(&entry.fid)]).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            if let Ok(bin) = drive.recycle_list(0, 50).await {
+                let rows: Vec<_> = bin.into_iter().filter(|r| r.name == name).collect();
+                if !rows.is_empty() {
+                    match drive.recycle_purge(&rows).await {
+                        Ok(n) => println!("  purged {n}"),
+                        Err(err) => println!("  purge ERR {err}"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn provider_has_recycle(provider: ProviderId) -> bool {
+    matches!(
+        provider,
+        ProviderId::Quark | ProviderId::Pan123 | ProviderId::Aliyun
+    )
+}
+
+/// Removes leftovers named `yunyu-recycle-probe-*` from the root of every
+/// recycle-capable drive (they end up in the bin, which is as far as 阿里/123
+/// allow us to go).
+#[tokio::test]
+#[ignore]
+async fn live_recycle_cleanup() {
+    for provider in ProviderId::all() {
+        if !provider_has_recycle(provider) {
+            continue;
+        }
+        let Some(drive) = drive(provider) else { continue };
+        let root = match provider {
+            ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        let Ok(list) = drive.list(root).await else { continue };
+        let fids: Vec<String> = list
+            .entries
+            .iter()
+            .filter(|e| e.name.starts_with("yunyu-recycle-probe"))
+            .map(|e| crate::providers::native_of(&e.fid))
+            .collect();
+        if fids.is_empty() {
+            continue;
+        }
+        println!("{}: removing {} leftover(s)", provider.as_str(), fids.len());
+        if let Err(err) = drive.delete(&fids).await {
+            println!("  ERR {err}");
+        }
+    }
+}
+
+/// Prints the root listing of one drive (`PROBE_PROVIDER=quark`).
+#[tokio::test]
+#[ignore]
+async fn live_root_listing_one() {
+    let name = std::env::var("PROBE_PROVIDER").unwrap_or_else(|_| "quark".to_string());
+    let provider = ProviderId::parse(&name).expect("unknown provider");
+    let Some(drive) = drive(provider) else { return };
+    let root = match provider {
+        ProviderId::Yun139 | ProviderId::Aliyun => "root",
+        ProviderId::Baidu => "/",
+        _ => "0",
+    };
+    match drive.list(root).await {
+        Ok(list) => {
+            println!("=== {} ({} entries, total {}) ===", name, list.entries.len(), list.total);
+            for entry in list.entries.iter().take(20) {
+                println!("  {} {}", if entry.is_dir { "DIR " } else { "FILE" }, entry.name);
+            }
+        }
+        Err(err) => println!("ERR {err}"),
+    }
+}
+
+/// Purges `yunyu-recycle-probe-*` from the bin where the drive allows it
+/// (Quark). 阿里/123 have no per-item purge, so their empty probe folders stay
+/// in the bin until it expires on its own.
+#[tokio::test]
+#[ignore]
+async fn live_recycle_purge_probes() {
+    for provider in ProviderId::all() {
+        if !provider_has_recycle(provider) {
+            continue;
+        }
+        let Some(drive) = drive(provider) else { continue };
+        let Ok(bin) = drive.recycle_list(0, 100).await else { continue };
+        let rows: Vec<_> = bin
+            .into_iter()
+            .filter(|r| r.name.starts_with("yunyu-recycle-probe"))
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        println!("{}: {} probe row(s) in bin", provider.as_str(), rows.len());
+        match drive.recycle_purge(&rows).await {
+            Ok(n) => println!("  purged {n}"),
+            Err(err) => println!("  purge ERR {err}"),
+        }
+    }
+}
+
+/// Empties 阿里云盘's bin — only safe while it contains nothing but probes.
+#[tokio::test]
+#[ignore]
+async fn live_recycle_clear_aliyun() {
+    let provider = ProviderId::Aliyun;
+    let Some(drive) = drive(provider) else { return };
+    let Ok(bin) = drive.recycle_list(0, 100).await else { return };
+    let foreign: Vec<_> = bin.iter().filter(|r| !r.name.starts_with("yunyu-recycle-probe")).collect();
+    if !foreign.is_empty() {
+        println!("refusing to clear: {} non-probe row(s) present", foreign.len());
+        return;
+    }
+    println!("bin holds {} probe row(s); clearing", bin.len());
+    match drive.recycle_clear().await {
+        Ok(()) => println!("cleared"),
+        Err(err) => println!("clear ERR {err}"),
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    if let Ok(after) = drive.recycle_list(0, 100).await {
+        println!("bin now holds {} row(s)", after.len());
+    }
+}

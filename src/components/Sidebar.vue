@@ -29,6 +29,11 @@ const items = computed<{ view: View; label: string; icon: IconName }[]>(() => {
   if (activeProviderState.value?.capabilities.shareOpen !== false) {
     list.push({ view: "share", label: "分享链接", icon: "link" });
   }
+  // The recycle bin is only offered where the drive exposes one; 百度 and 139
+  // reject every restore call, so the entry would be a dead end.
+  if (activeProviderState.value?.capabilities.recycle) {
+    list.push({ view: "recycle", label: "回收站", icon: "trash" });
+  }
   list.push(
     { view: "transfers", label: "传输列表", icon: "arrow-up-down" },
     { view: "settings", label: "设置", icon: "settings" },

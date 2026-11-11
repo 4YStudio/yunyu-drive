@@ -7,6 +7,7 @@ import ResizeFrame from "@/components/ResizeFrame.vue";
 import Toasts from "@/components/Toasts.vue";
 import Icon from "@/components/Icon.vue";
 import FilesView from "@/views/FilesView.vue";
+import RecycleView from "@/views/RecycleView.vue";
 import TransfersView from "@/views/TransfersView.vue";
 import SettingsView from "@/views/SettingsView.vue";
 import ShareView from "@/views/ShareView.vue";
@@ -21,6 +22,7 @@ const bootFailed = ref(false);
 const currentView = computed(() => {
   const map = {
     files: FilesView,
+    recycle: RecycleView,
     share: ShareView,
     transfers: TransfersView,
     settings: SettingsView,

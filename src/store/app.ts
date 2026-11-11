@@ -11,7 +11,7 @@ import type {
   TransferTask,
 } from "@/lib/types";
 
-export type View = "files" | "transfers" | "settings" | "login" | "share";
+export type View = "files" | "recycle" | "transfers" | "settings" | "login" | "share";
 export type ThemeMode = "light" | "dark" | "system";
 
 export interface Toast {

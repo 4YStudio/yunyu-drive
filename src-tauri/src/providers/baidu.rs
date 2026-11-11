@@ -889,6 +889,7 @@ impl DriveProvider for BaiduProvider {
             search: true,
             rename: true,
             folders: true,
+            recycle: false,
         }
     }
 

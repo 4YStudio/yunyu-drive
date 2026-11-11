@@ -943,6 +943,60 @@ pub async fn provider_quota(
     drive.quota().await
 }
 
+/// Lists a drive's recycle bin.
+#[tauri::command]
+pub async fn recycle_list(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> AppResult<Vec<crate::providers::RecycleEntry>> {
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    drive
+        .recycle_list(offset.unwrap_or(0), limit.unwrap_or(100))
+        .await
+}
+
+/// Restores entries from the recycle bin.
+#[tauri::command]
+pub async fn recycle_restore(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+    entries: Vec<crate::providers::RecycleEntry>,
+) -> AppResult<u32> {
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    drive.recycle_restore(&entries).await
+}
+
+/// Deletes recycle-bin entries for good, where the drive allows it.
+#[tauri::command]
+pub async fn recycle_purge(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+    entries: Vec<crate::providers::RecycleEntry>,
+) -> AppResult<u32> {
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    drive.recycle_purge(&entries).await
+}
+
+/// Empties the whole bin (aliyun has no per-item purge).
+#[tauri::command]
+pub async fn recycle_clear(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+) -> AppResult<()> {
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    drive.recycle_clear().await
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {

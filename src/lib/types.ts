@@ -39,6 +39,22 @@ export interface ProviderCapabilities {
   search: boolean;
   rename: boolean;
   folders: boolean;
+  /** Has a recycle bin we can list and restore from. */
+  recycle: boolean;
+}
+
+/** One row of a drive's recycle bin (`recycle_list`). */
+export interface RecycleEntry {
+  /** Qualified id: `"<provider>:<native>"`. */
+  fid: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  /** Unix ms of the deletion, when the drive reports it. */
+  deletedAt: number;
+  /** Drive-specific handle (Quark's recycle `record_id`). */
+  token: string;
+  provider: ProviderId;
 }
 
 export interface ProviderAuthState {

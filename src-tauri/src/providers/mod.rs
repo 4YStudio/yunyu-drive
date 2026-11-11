@@ -44,7 +44,7 @@ pub mod pan123;
 pub mod quark;
 pub mod yun139;
 
-pub use dto::{DirListing, DownloadRequest, EntryDto, PathNode, QuotaInfo, SearchHit};
+pub use dto::{DirListing, DownloadRequest, EntryDto, PathNode, QuotaInfo, RecycleEntry, SearchHit};
 
 // ---------------------------------------------------------------- identity ---
 
@@ -263,6 +263,8 @@ pub struct Capabilities {
     pub rename: bool,
     /// Nested folders (all of them have this, but the UI checks anyway).
     pub folders: bool,
+    /// Has a recycle bin we can list and restore from.
+    pub recycle: bool,
 }
 
 impl Capabilities {
@@ -275,6 +277,7 @@ impl Capabilities {
         search: true,
         rename: true,
         folders: true,
+        recycle: true,
     };
 
     /// Browse + transfer only.
@@ -286,6 +289,7 @@ impl Capabilities {
         search: true,
         rename: true,
         folders: true,
+        recycle: false,
     };
 }
 
@@ -449,6 +453,45 @@ pub trait DriveProvider: Send + Sync {
     /// Optional quota, shown in the sidebar footer when available.
     async fn quota(&self) -> AppResult<Option<QuotaInfo>> {
         Ok(None)
+    }
+
+    // ----------------------------------------------------------- recycle ---
+    //
+    // What the drives put in the bin, and what they let us do with it, differs
+    // enough that the trait only promises the three calls below. A drive that
+    // cannot answer leaves the default, which reports why.
+
+    /// Lists the recycle bin, newest first. `offset`/`limit` are in rows.
+    async fn recycle_list(&self, _offset: u32, _limit: u32) -> AppResult<Vec<RecycleEntry>> {
+        Err(AppError::new(format!(
+            "{}暂不支持回收站",
+            self.id().display_name()
+        )))
+    }
+
+    /// Puts entries back where they came from. Returns how many were restored.
+    async fn recycle_restore(&self, _entries: &[RecycleEntry]) -> AppResult<u32> {
+        Err(AppError::new(format!(
+            "{}暂不支持从回收站恢复",
+            self.id().display_name()
+        )))
+    }
+
+    /// Deletes entries for good.
+    async fn recycle_purge(&self, _entries: &[RecycleEntry]) -> AppResult<u32> {
+        Err(AppError::new(format!(
+            "{}暂不支持彻底删除回收站文件",
+            self.id().display_name()
+        )))
+    }
+
+    /// Empties the whole bin. Some drives only offer this instead of a
+    /// per-item purge, so the UI keeps a separate button for it.
+    async fn recycle_clear(&self) -> AppResult<()> {
+        Err(AppError::new(format!(
+            "{}暂不支持清空回收站",
+            self.id().display_name()
+        )))
     }
 
     // ------------------------------------------------------------- shares ---
