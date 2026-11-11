@@ -5,7 +5,7 @@ import Icon from "@/components/Icon.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import Segmented from "@/components/Segmented.vue";
 import { api } from "@/lib/backend";
-import { revealPath } from "@/lib/host";
+import { openFile, revealPath } from "@/lib/host";
 import { PROVIDERS, type TransferTask } from "@/lib/types";
 import { formatSize, formatSpeed, formatEta } from "@/lib/format";
 import { app, refreshTransfers, toast } from "@/store/app";
@@ -120,6 +120,11 @@ async function clearFinished() {
 async function reveal(task: TransferTask) {
   const ok = await revealPath(task.localPath);
   if (!ok) toast("无法打开文件管理器", "error");
+}
+
+async function open(task: TransferTask) {
+  const ok = await openFile(task.localPath);
+  if (!ok) toast("无法打开文件", "error");
 }
 
 const anyFinished = computed(() =>
@@ -249,10 +254,18 @@ onActivated(() => {
             <button
               v-if="task.status === 'done' && task.kind === 'download'"
               class="icon-btn"
+              title="打开文件"
+              @click="open(task)"
+            >
+              <Icon name="file" :size="14" />
+            </button>
+            <button
+              v-if="task.status === 'done' && task.kind === 'download'"
+              class="icon-btn"
               title="在文件夹中显示"
               @click="reveal(task)"
             >
-              <Icon name="external" :size="14" />
+              <Icon name="folder" :size="14" />
             </button>
             <button
               v-if="task.kind === 'download' && ['failed', 'canceled', 'paused'].includes(task.status)"

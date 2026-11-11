@@ -1105,62 +1105,109 @@ impl DriveProvider for BaiduProvider {
         Ok(fids.len())
     }
 
+    /// Server-side search through `/api/search`.
+    ///
+    /// The web session has an index after all: `recursion=1` searches the whole
+    /// tree from `dir`, and each row carries `path`, so no folder walking (and
+    /// no 80-folder cap) is needed. `isdir`/`server_mtime` come back as numbers.
     async fn search(&self, dir: &str, keyword: &str, limit: u32) -> AppResult<Vec<SearchHit>> {
-        let needle = keyword.trim().to_lowercase();
+        let needle = keyword.trim();
         if needle.is_empty() {
             return Ok(Vec::new());
         }
-        // The web API has no search endpoint for a plain cookie session, so walk
-        // the tree like the other drives do.
         let mut hits = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<PathNode>)> =
-            std::collections::VecDeque::new();
-        queue.push_back((dir.to_string(), Vec::new()));
-        let mut visited = 0;
-        while let Some((parent, path)) = queue.pop_front() {
-            visited += 1;
-            if visited > 80 || hits.len() >= limit as usize {
+        let mut page = 1u32;
+        while hits.len() < limit as usize && page <= 20 {
+            let url = format!(
+                "{BASE}/api/search?key={}&dir={}&page={page}&num={PAGE_LIMIT}&recursion=1&web=1",
+                urlencode(needle),
+                urlencode(&Self::decode_dir(dir))
+            );
+            let value = self.get_json(&url, "搜索百度网盘").await?;
+            if let Some(errno) = value.get("errno").and_then(|v| v.as_i64()) {
+                if errno != 0 {
+                    return Err(AppError::new(format!(
+                        "百度网盘搜索失败：{}",
+                        value
+                            .get("errmsg")
+                            .or_else(|| value.get("show_msg"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("未知错误")
+                    )));
+                }
+            }
+            let rows = value
+                .get("list")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let count = rows.len();
+            for row in rows {
+                let Some(fid) = row.get("fs_id").and_then(|v| v.as_i64()) else {
+                    continue;
+                };
+                let full = row
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let name = row
+                    .get("server_filename")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let is_dir = row.get("isdir").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+                let size = row.get("size").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64;
+                let updated = super::parse_time(row.get("server_mtime").unwrap_or(&Value::Null));
+                let created = super::parse_time(row.get("server_ctime").unwrap_or(&Value::Null));
+                self.remember(&fid.to_string(), &full).await;
+                // `path` is the full path of the *hit*; the UI renders
+                // `path.slice(0, -1)` as the folder chain, so build it from the
+                // components rather than trusting a cached listing.
+                let mut chain: Vec<PathNode> = Vec::new();
+                let mut walked = String::new();
+                let parts: Vec<&str> = full.trim_matches('/').split('/').collect();
+                for part in parts.iter().take(parts.len().saturating_sub(1)) {
+                    walked.push('/');
+                    walked.push_str(part);
+                    chain.push(PathNode {
+                        fid: qualify(ProviderId::Baidu, &Self::encode_path(&walked)),
+                        name: (*part).to_string(),
+                    });
+                }
+                let entry = EntryDto {
+                    fid: qualify(ProviderId::Baidu, &fid.to_string()),
+                    pdir_fid: qualify(
+                        ProviderId::Baidu,
+                        &Self::encode_path(
+                            &full
+                                .rsplit_once('/')
+                                .map(|(dir, _)| dir.to_string())
+                                .unwrap_or_else(|| "/".to_string()),
+                        ),
+                    ),
+                    ext: EntryDto::ext_of(&name),
+                    name: name.clone(),
+                    size,
+                    is_dir,
+                    format_type: if is_dir { "folder".into() } else { "file".into() },
+                    updated_at: updated,
+                    created_at: created.max(updated),
+                    provider: ProviderId::Baidu.as_str().to_string(),
+                };
+                chain.push(PathNode {
+                    fid: entry.fid.clone(),
+                    name,
+                });
+                hits.push(SearchHit { entry, path: chain });
+                if hits.len() >= limit as usize {
+                    return Ok(hits);
+                }
+            }
+            if count < PAGE_LIMIT as usize {
                 break;
             }
-            // A transient failure on one folder must not abort the whole walk,
-            // but it must not be invisible either — an empty result looks like
-            // "no matches" when it really means "the listing broke".
-            let listing = match self.list(&parent).await {
-                Ok(listing) => listing,
-                Err(err) => {
-                    crate::ylog!("baidu: search skipped {parent}: {err}");
-                    continue;
-                }
-            };
-            for entry in listing.entries {
-                if entry.name.to_lowercase().contains(&needle) {
-                    // The hit is the last node of the chain; the UI renders
-                    // `path.slice(0, -1)` as its folder.
-                    let mut hit_path = path.clone();
-                    hit_path.push(PathNode {
-                        fid: entry.fid.clone(),
-                        name: entry.name.clone(),
-                    });
-                    hits.push(SearchHit {
-                        entry: entry.clone(),
-                        path: hit_path,
-                    });
-                    if hits.len() >= limit as usize {
-                        break;
-                    }
-                }
-                if entry.is_dir && path.len() < 8 {
-                    let mut next = path.clone();
-                    next.push(PathNode {
-                        fid: entry.fid.clone(),
-                        name: entry.name.clone(),
-                    });
-                    match self.path_of(&entry.fid).await {
-                        Ok(child) => queue.push_back((Self::encode_path(&child), next)),
-                        Err(err) => crate::ylog!("baidu: search cannot resolve {}: {err}", entry.fid),
-                    }
-                }
-            }
+            page += 1;
         }
         Ok(hits)
     }

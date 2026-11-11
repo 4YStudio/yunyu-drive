@@ -914,3 +914,46 @@ async fn share_live_pan123_rename_id() {
         Err(e) => println!("rename ERR {e}"),
     }
 }
+
+/// Server-side search on every drive. Pass `SEARCH_TERM=<word>` to change the
+/// keyword; defaults to something that exists on most accounts.
+#[tokio::test]
+#[ignore]
+async fn live_search() {
+    let term = std::env::var("SEARCH_TERM").unwrap_or_else(|_| "a".to_string());
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        let root = match provider {
+            ProviderId::Yun139 | ProviderId::Aliyun => "root",
+            ProviderId::Baidu => "/",
+            _ => "0",
+        };
+        let started = std::time::Instant::now();
+        match drive.search(root, &term, 20).await {
+            Ok(hits) => {
+                println!(
+                    "=== {} ({} hits, {} ms) ===",
+                    provider.as_str(),
+                    hits.len(),
+                    started.elapsed().as_millis()
+                );
+                for hit in hits.iter().take(8) {
+                    let crumb = hit
+                        .path
+                        .iter()
+                        .map(|n| n.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    println!(
+                        "  {} {}  [{}]  via {}",
+                        if hit.entry.is_dir { "DIR " } else { "FILE" },
+                        hit.entry.name,
+                        hit.entry.size,
+                        crumb
+                    );
+                }
+            }
+            Err(err) => println!("=== {} ERR {err} ===", provider.as_str()),
+        }
+    }
+}

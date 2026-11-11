@@ -9,10 +9,10 @@ export type IconName =
   | "rename" | "trash" | "list" | "grid" | "clock" | "alert" | "info"
   | "loader" | "cloud" | "drive" | "external" | "logout" | "sparkles"
   | "copy" | "filter" | "check-circle" | "pause" | "play" | "arrow-up"
-  | "arrow-down" | "keyboard" | "palette" | "database" | "shield"
+  | "arrow-down" | "arrow-up-down" | "keyboard" | "palette" | "database" | "shield"
   | "window-minimize" | "window-maximize" | "window-restore"
   | "window-close" | "grip" | "share" | "link" | "save" | "user-circle"
-  | "move" | "retry" | "bell" | "tray";
+  | "move" | "retry" | "bell" | "tray" | "file";
 
 export const ICON_PATHS: Record<IconName, string> = {
   search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM20 20l-4.2-4.2",
@@ -53,6 +53,10 @@ export const ICON_PATHS: Record<IconName, string> = {
   play: "M7 4.5v15l13-7.5-13-7.5Z",
   "arrow-up": "M12 19V5M6 11l6-6 6 6",
   "arrow-down": "M12 5v14M6 13l6 6 6-6",
+  // A document with a folded corner: "open the finished file".
+  file: "M13.5 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5L13.5 3ZM13.5 3v5.5H19",
+  // Two shafts, one head up and one down: "transfer" in both directions.
+  "arrow-up-down": "M8 19.5V5M4.5 8.5L8 5l3.5 3.5M16 4.5V19M12.5 15.5L16 19l3.5-3.5",
   keyboard: "M3 6h18a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1ZM7 10h.01M11 10h.01M15 10h.01M17 10h.01M7 14h10",
   palette: "M12 21a9 9 0 1 1 0-18c4.5 0 8 3 8 7 0 2.5-2 4-4 4h-1.5a1.8 1.8 0 0 0-1.3 3 1.6 1.6 0 0 1-1.2 2H12ZM7.5 10.5h.01M10.5 7.5h.01M14.5 7.5h.01M17 10.5h.01",
   database: "M12 8c4.4 0 8-1.34 8-3s-3.6-3-8-3-8 1.34-8 3 3.6 3 8 3ZM4 5v14c0 1.66 3.6 3 8 3s8-1.34 8-3V5M4 12c0 1.66 3.6 3 8 3s8-1.34 8-3",

@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onActivated,
+  onBeforeUnmount,
+  onDeactivated,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
 import { onFileDrop, pickFiles } from "@/lib/host";
 
 import Icon from "@/components/Icon.vue";
@@ -60,8 +69,17 @@ const hits = ref<SearchHit[]>([]);
 const selected = ref<Set<string>>(new Set());
 const anchor = ref<string | null>(null);
 
-const sortKey = ref<SortKey>("name");
-const sortAsc = ref(true);
+/** Sort survives restarts: re-picking "name, ascending" on every launch is noise. */
+function initialSort(): { key: SortKey; asc: boolean } {
+  const stored = localStorage.getItem(storageKey("sort"));
+  if (stored === "size" || stored === "updated" || stored === "name") {
+    return { key: stored, asc: localStorage.getItem(storageKey("sortAsc")) !== "0" };
+  }
+  return { key: "name", asc: true };
+}
+const initialSortState = initialSort();
+const sortKey = ref<SortKey>(initialSortState.key);
+const sortAsc = ref(initialSortState.asc);
 function initialDensity(): "comfortable" | "compact" {
   const stored = localStorage.getItem(storageKey("density"));
   return stored === "compact" ? "compact" : "comfortable";
@@ -240,6 +258,37 @@ const rows = computed(() => {
   return list.map((entry) => ({ entry, path: [] as PathNode[] }));
 });
 
+/**
+ * Rendering budget.
+ *
+ * A folder with a few thousand entries used to mount every row at once, which
+ * stalls WebKitGTK for seconds. Only the first `shown` rows are mounted; the
+ * list body grows the window as you scroll near the bottom (see `onBodyScroll`).
+ */
+// `VITE_LIST_CHUNK` only exists so the mock build can exercise the paging
+// behaviour on a 12-row fixture.
+const CHUNK = Number(import.meta.env.VITE_LIST_CHUNK) || 200;
+const shown = ref(CHUNK);
+const bodyRef = ref<HTMLElement | null>(null);
+const visibleRows = computed(() => rows.value.slice(0, shown.value));
+
+function onBodyScroll() {
+  const el = bodyRef.value;
+  if (!el) return;
+  if (shown.value >= rows.value.length) return;
+  if (el.scrollHeight - el.scrollTop - el.clientHeight > 600) return;
+  shown.value = Math.min(rows.value.length, shown.value + CHUNK);
+}
+
+// A new listing (other folder, other drive, other search) starts from the top.
+watch(
+  () => [rows.value.length, currentFid.value, query.value].join("|"),
+  () => {
+    shown.value = CHUNK;
+    if (bodyRef.value) bodyRef.value.scrollTop = 0;
+  },
+);
+
 const selectedEntries = computed(() =>
   rows.value.filter((r) => selected.value.has(r.entry.fid)).map((r) => r.entry),
 );
@@ -256,6 +305,8 @@ function toggleSort(key: SortKey) {
     sortKey.value = key;
     sortAsc.value = key === "name";
   }
+  localStorage.setItem(storageKey("sort"), sortKey.value);
+  localStorage.setItem(storageKey("sortAsc"), sortAsc.value ? "1" : "0");
 }
 
 function setDensity(value: string) {
@@ -306,6 +357,40 @@ function onRowClick(event: MouseEvent, entry: EntryDto) {
 
 function selectAll() {
   selected.value = new Set(rows.value.map((r) => r.entry.fid));
+}
+
+/**
+ * Arrow-key navigation.
+ *
+ * `anchor` is the cursor: it survives Ctrl-click multi-selection, so holding
+ * Shift extends the range from wherever you last landed. The row has to be
+ * scrolled into view by hand because the browser does not know about it.
+ */
+function moveSelection(step: number, extend: boolean) {
+  const list = rows.value;
+  if (!list.length) return;
+  const ids = list.map((r) => r.entry.fid);
+  const from = anchor.value ? ids.indexOf(anchor.value) : -1;
+  const last = [...selected.value].map((id) => ids.indexOf(id)).filter((i) => i >= 0);
+  const base = from >= 0 ? from : last.length ? Math.max(...last) : -1;
+  const next = Math.min(list.length - 1, Math.max(0, base + step));
+  const entry = list[next].entry;
+  if (extend && anchor.value) {
+    const lo = Math.min(base, next);
+    const hi = Math.max(base, next);
+    const set = new Set(selected.value);
+    for (let i = lo; i <= hi; i += 1) set.add(ids[i]);
+    selected.value = set;
+  } else {
+    selected.value = new Set([entry.fid]);
+  }
+  anchor.value = entry.fid;
+  // Paging only mounts the first `shown` rows, so the cursor can outrun it.
+  if (next >= shown.value) shown.value = Math.min(list.length, next + 1);
+  void nextTick(() => {
+    const el = bodyRef.value?.querySelectorAll<HTMLElement>(".row, .card")[next];
+    el?.scrollIntoView({ block: "nearest" });
+  });
 }
 
 // ----------------------------------------------------------------- actions ---
@@ -752,6 +837,9 @@ function onKey(event: KeyboardEvent) {
   } else if (event.key === "Backspace") {
     event.preventDefault();
     void goUp();
+  } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    moveSelection(event.key === "ArrowDown" ? 1 : -1, event.shiftKey);
   } else if (event.key === "Enter" && selectedEntries.value.length === 1) {
     const entry = selectedEntries.value[0];
     if (entry.isDir) void enter(entry);
@@ -914,7 +1002,7 @@ defineExpose({ refresh });
         </button>
       </div>
 
-      <div class="list-body">
+      <div ref="bodyRef" class="list-body" @scroll.passive="onBodyScroll">
         <!-- An unlogged drive must not look like an empty one. -->
         <div v-if="!driveLoggedIn" class="state">
           <EmptyState
@@ -958,7 +1046,7 @@ defineExpose({ refresh });
           class="grid"
         >
           <div
-            v-for="row in rows"
+            v-for="row in visibleRows"
             :key="row.entry.fid"
             class="card"
             :class="{ 'card--selected': isSelected(row.entry.fid) }"
@@ -986,7 +1074,7 @@ defineExpose({ refresh });
 
         <TransitionGroup v-else name="row" tag="div" class="rows">
           <div
-            v-for="row in rows"
+            v-for="row in visibleRows"
             :key="row.entry.fid"
             class="row"
             :class="{
@@ -1043,6 +1131,9 @@ defineExpose({ refresh });
         <span>{{ rows.length - folderCount }} 个文件</span>
         <span class="dot">·</span>
         <span class="mono">{{ formatSize(totalSize) }}</span>
+        <span v-if="visibleRows.length < rows.length" class="foot-more">
+          已显示 {{ visibleRows.length }} / {{ rows.length }}
+        </span>
       </footer>
 
       <Transition name="fade">
@@ -1615,6 +1706,10 @@ defineExpose({ refresh });
 }
 
 /* -------------------------------- footer -------------------------------- */
+.foot-more {
+  margin-left: auto;
+  color: var(--text-3);
+}
 .list-foot {
   display: flex;
   align-items: center;

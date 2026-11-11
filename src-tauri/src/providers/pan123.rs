@@ -288,34 +288,86 @@ impl Pan123Provider {
         for item in &items {
             // A row without an id used to become file 0, i.e. the root: deleting
             // or renaming it then hit the wrong target. Refuse instead.
-            let id = item.get("FileId").and_then(|v| v.as_i64()).ok_or_else(|| {
+            let entry = self.row_entry(item).ok_or_else(|| {
                 AppError::new("123 云盘返回了没有 FileId 的文件条目")
             })?;
-            let name = item
-                .get("FileName")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let is_dir = item.get("Type").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-            let size = item.get("Size").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64;
-            // `UpdateAt`/`CreateAt` are ISO strings ("2026-11-09T15:12:31+08:00"),
-            // not epoch seconds: reading them as integers rendered 1970.
-            let updated = super::parse_time(item.get("UpdateAt").unwrap_or(&Value::Null));
-            let created = super::parse_time(item.get("CreateAt").unwrap_or(&Value::Null));
             entries.push(EntryDto {
-                fid: qualify(ProviderId::Pan123, &id.to_string()),
                 pdir_fid: qualify(ProviderId::Pan123, parent),
-                ext: EntryDto::ext_of(&name),
-                name,
-                size,
-                is_dir,
-                format_type: if is_dir { "folder".into() } else { "file".into() },
-                updated_at: updated,
-                created_at: created.max(updated),
-                provider: ProviderId::Pan123.as_str().to_string(),
+                ..entry
             });
         }
         Ok((entries, total))
+    }
+
+    /// One `/api/file/list/new` row as a UI entry, parent left unset.
+    ///
+    /// Search rows come from a tree-wide query, so the parent is filled in by
+    /// the caller; the listing fills it from the folder it asked for.
+    fn row_entry(&self, item: &Value) -> Option<EntryDto> {
+        let id = item.get("FileId").and_then(|v| v.as_i64())?;
+        let name = item
+            .get("FileName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let is_dir = item.get("Type").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+        let size = item.get("Size").and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u64;
+        // `UpdateAt`/`CreateAt` are ISO strings ("2026-11-09T15:12:31+08:00"),
+        // not epoch seconds: reading them as integers rendered 1970.
+        let updated = super::parse_time(item.get("UpdateAt").unwrap_or(&Value::Null));
+        let created = super::parse_time(item.get("CreateAt").unwrap_or(&Value::Null));
+        let parent = item.get("ParentFileId").and_then(|v| v.as_i64()).unwrap_or(0);
+        Some(EntryDto {
+            fid: qualify(ProviderId::Pan123, &id.to_string()),
+            pdir_fid: qualify(ProviderId::Pan123, &parent.to_string()),
+            ext: EntryDto::ext_of(&name),
+            name,
+            size,
+            is_dir,
+            format_type: if is_dir { "folder".into() } else { "file".into() },
+            updated_at: updated,
+            created_at: created.max(updated),
+            provider: ProviderId::Pan123.as_str().to_string(),
+        })
+    }
+
+    /// Breadcrumb of a folder id, via `/b/api/file/get_path`.
+    ///
+    /// The endpoint answers the *ancestors* of a file (root first) and is a
+    /// POST with a JSON body — the GET variant is not routed.
+    async fn path_of_id(&self, id: i64) -> Vec<PathNode> {
+        if id == 0 {
+            return Vec::new();
+        }
+        let Ok(value) = self
+            .call(
+                "POST",
+                &format!("{BASE}/b/api/file/get_path"),
+                Some(json!({ "fileId": id, "driveId": 0 })),
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        value
+            .get("data")
+            .and_then(|v| v.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        let fid = row.get("FileId").and_then(|v| v.as_i64())?;
+                        Some(PathNode {
+                            fid: qualify(ProviderId::Pan123, &fid.to_string()),
+                            name: row
+                                .get("FileName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Resolves the real byte url for one file.
@@ -830,51 +882,59 @@ impl DriveProvider for Pan123Provider {
         Ok(fids.len())
     }
 
-    async fn search(&self, dir: &str, keyword: &str, limit: u32) -> AppResult<Vec<SearchHit>> {
-        let needle = keyword.trim().to_lowercase();
+    /// Server-side search through `/api/file/list/new` with `SearchData`.
+    ///
+    /// 123 has no dedicated search path (every `/search` variant is 404), but
+    /// the listing endpoint accepts a keyword and returns the whole tree, so
+    /// one request replaces the 80-folder BFS. Rows carry `ParentFileId`,
+    /// which `/b/api/file/get_path` turns into a breadcrumb.
+    async fn search(&self, _dir: &str, keyword: &str, limit: u32) -> AppResult<Vec<SearchHit>> {
+        let needle = keyword.trim();
         if needle.is_empty() {
             return Ok(Vec::new());
         }
         let mut hits = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<PathNode>)> =
-            std::collections::VecDeque::new();
-        queue.push_back((dir.to_string(), Vec::new()));
-        let mut visited = 0;
-        while let Some((parent, path)) = queue.pop_front() {
-            visited += 1;
-            if visited > 80 || hits.len() >= limit as usize {
+        let mut page = 1u32;
+        while hits.len() < limit as usize && page <= 20 {
+            let url = format!(
+                "{BASE}/api/file/list/new?driveId=0&limit={PAGE_LIMIT}&next=0&orderBy=file_id&orderDirection=desc&parentFileId=0&trashed=false&SearchData={}&Page={page}&OnlyLookAbnormalFile=0",
+                enc(needle)
+            );
+            let value = self.call("GET", &url, None).await?;
+            let rows = value
+                .pointer("/data/InfoList")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let count = rows.len();
+            let total = value
+                .pointer("/data/Total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            for row in rows {
+                let Some(entry) = self.row_entry(&row) else {
+                    continue;
+                };
+                let parent = row
+                    .get("ParentFileId")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let mut path = self.path_of_id(parent).await;
+                path.push(PathNode {
+                    fid: entry.fid.clone(),
+                    name: entry.name.clone(),
+                });
+                hits.push(SearchHit { entry, path });
+                if hits.len() >= limit as usize {
+                    break;
+                }
+            }
+            if count < PAGE_LIMIT as usize
+                || (total > 0 && u64::from(page) * u64::from(PAGE_LIMIT) >= total)
+            {
                 break;
             }
-            let Ok(listing) = self.list(&parent).await else {
-                continue;
-            };
-            for entry in listing.entries {
-                let native = super::native_of(&entry.fid);
-                if entry.name.to_lowercase().contains(&needle) {
-                    // The hit is the last node of the chain; the UI renders
-                    // `path.slice(0, -1)` as its folder.
-                    let mut hit_path = path.clone();
-                    hit_path.push(PathNode {
-                        fid: entry.fid.clone(),
-                        name: entry.name.clone(),
-                    });
-                    hits.push(SearchHit {
-                        entry: entry.clone(),
-                        path: hit_path,
-                    });
-                    if hits.len() >= limit as usize {
-                        break;
-                    }
-                }
-                if entry.is_dir && path.len() < 8 {
-                    let mut next = path.clone();
-                    next.push(PathNode {
-                        fid: entry.fid.clone(),
-                        name: entry.name.clone(),
-                    });
-                    queue.push_back((native, next));
-                }
-            }
+            page += 1;
         }
         Ok(hits)
     }
@@ -1528,6 +1588,12 @@ fn numeric_id(fid: &str) -> AppResult<i64> {
     fid.trim()
         .parse::<i64>()
         .map_err(|_| AppError::new(format!("123 云盘的 id 无效：{fid}")))
+}
+
+/// Percent-encodes a query value (`SearchData` is a raw keyword).
+fn enc(raw: &str) -> String {
+    use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+    utf8_percent_encode(raw, NON_ALPHANUMERIC).to_string()
 }
 
 fn text_at(value: &Value, pointer: &str) -> String {

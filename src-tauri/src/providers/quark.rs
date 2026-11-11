@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto,
-    PathNode, ProviderId, QuotaInfo, SearchHit, ShareFile, ShareLink, UploadSink,
+    native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider,
+    EntryDto, PathNode, ProviderId, QuotaInfo, SearchHit, ShareFile, ShareLink, UploadSink,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -137,6 +137,45 @@ impl QuarkProvider {
         )
         .await?;
         envelope(value)
+    }
+
+    /// Breadcrumb from the root down to `fid`, walking `/file/info` upwards.
+    ///
+    /// Search results only report the immediate parent, and Quark has no
+    /// "path of this fid" call, so we climb. Depth is capped because a
+    /// pathological tree would otherwise cost one request per level.
+    async fn path_to(&self, fid: &str) -> Vec<PathNode> {
+        let mut acc = Vec::new();
+        let mut cursor = fid.to_string();
+        for _ in 0..12 {
+            if cursor.is_empty() || cursor == "0" {
+                break;
+            }
+            let value = match get_json(
+                &format!("{QUARK_API}/1/clouddrive/file/info"),
+                &self.cookie,
+                &[
+                    ("pr", "ucpro".to_string()),
+                    ("fr", "pc".to_string()),
+                    ("fid", cursor.clone()),
+                ],
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let Ok(data) = envelope(value) else {
+                break;
+            };
+            acc.push(PathNode {
+                fid: qualify(ProviderId::Quark, &cursor),
+                name: text(&data, "file_name"),
+            });
+            cursor = text(&data, "pdir_fid");
+        }
+        acc.reverse();
+        acc
     }
 }
 
@@ -320,47 +359,53 @@ impl DriveProvider for QuarkProvider {
         Ok(fids.len())
     }
 
-    async fn search(&self, dir: &str, keyword: &str, limit: u32) -> AppResult<Vec<SearchHit>> {
-        let needle = keyword.trim().to_lowercase();
+    /// Server-side search.
+    ///
+    /// Quark has its own index (`/file/search`), so there is no reason to walk
+    /// the tree ourselves — the old BFS stopped after 80 folders and silently
+    /// missed everything deeper. The hit carries `pdir_fid`, which we resolve
+    /// into a breadcrumb so the UI can show where the file lives.
+    async fn search(&self, _dir: &str, keyword: &str, limit: u32) -> AppResult<Vec<SearchHit>> {
+        let needle = keyword.trim();
         if needle.is_empty() {
             return Ok(Vec::new());
         }
-        let limit = limit as usize;
         let mut hits = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<(String, String)>)> =
-            std::collections::VecDeque::new();
-        queue.push_back((dir.to_string(), Vec::new()));
-        let mut visited = 0u32;
-        while let Some((fid, path)) = queue.pop_front() {
-            visited += 1;
-            if visited > 80 || hits.len() >= limit {
+        let mut page = 1u32;
+        while hits.len() < limit as usize && page <= 20 {
+            let value = get_json(
+                &format!("{QUARK_API}/1/clouddrive/file/search"),
+                &self.cookie,
+                &[
+                    ("pr", "ucpro".to_string()),
+                    ("fr", "pc".to_string()),
+                    ("keyword", needle.to_string()),
+                    ("_page", page.to_string()),
+                    ("_size", "100".to_string()),
+                    ("_fetch_total", "1".to_string()),
+                ],
+            )
+            .await?;
+            let data = envelope(value)?;
+            let rows = data
+                .get("list")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let count = rows.len();
+            for row in rows {
+                let entry = entry_of_json(&row);
+                let parent = entry.pdir_fid.clone();
+                let path = self.path_to(&native_of(&parent)).await;
+                hits.push(SearchHit { entry, path });
+                if hits.len() >= limit as usize {
+                    break;
+                }
+            }
+            if count < 100 {
                 break;
             }
-            let entries = match self.list_all(&fid).await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for entry in entries {
-                if entry.file_name.to_lowercase().contains(&needle) {
-                    // The hit is the last element of `path`: the UI renders
-                    // `path.slice(0, -1)` as the containing folder chain.
-                    let mut hit_path: Vec<PathNode> =
-                        path.iter().map(|(f, n)| self.node(f, n)).collect();
-                    hit_path.push(self.node(&entry.fid, &entry.file_name));
-                    hits.push(SearchHit {
-                        entry: self.entry(entry.clone()),
-                        path: hit_path,
-                    });
-                    if hits.len() >= limit {
-                        break;
-                    }
-                }
-                if entry.dir && path.len() < 8 {
-                    let mut next = path.clone();
-                    next.push((entry.fid.clone(), entry.file_name.clone()));
-                    queue.push_back((entry.fid, next));
-                }
-            }
+            page += 1;
         }
         Ok(hits)
     }
@@ -786,6 +831,23 @@ fn text(value: &Value, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+/// One row of a `/file/search` (or `/file/info`) payload as a UI entry.
+fn entry_of_json(row: &Value) -> EntryDto {
+    let name = text(row, "file_name");
+    EntryDto {
+        fid: qualify(ProviderId::Quark, &text(row, "fid")),
+        pdir_fid: qualify(ProviderId::Quark, &text(row, "pdir_fid")),
+        ext: EntryDto::ext_of(&name),
+        name,
+        size: row.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+        is_dir: row.get("dir").and_then(|v| v.as_bool()).unwrap_or(false),
+        format_type: text(row, "format_type"),
+        updated_at: row.get("updated_at").and_then(|v| v.as_u64()).unwrap_or(0),
+        created_at: row.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
+        provider: ProviderId::Quark.as_str().to_string(),
+    }
 }
 
 fn entries_of(data: &Value) -> Vec<ShareEntry> {

@@ -30,7 +30,7 @@ const items = computed<{ view: View; label: string; icon: IconName }[]>(() => {
     list.push({ view: "share", label: "分享链接", icon: "link" });
   }
   list.push(
-    { view: "transfers", label: "传输列表", icon: "arrow-down" },
+    { view: "transfers", label: "传输列表", icon: "arrow-up-down" },
     { view: "settings", label: "设置", icon: "settings" },
   );
   return list;

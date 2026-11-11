@@ -7,7 +7,7 @@
  * a browser session never crashes on `undefined.metadata`.
  */
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
@@ -102,6 +102,17 @@ export async function revealPath(path: string | null | undefined) {
   if (!IS_TAURI || !path) return false;
   try {
     await revealItemInDir(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Hands a finished download to the desktop's default handler. */
+export async function openFile(path: string | null | undefined) {
+  if (!IS_TAURI || !path) return false;
+  try {
+    await openPath(path);
     return true;
   } catch {
     return false;

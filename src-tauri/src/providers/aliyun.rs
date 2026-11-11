@@ -1240,59 +1240,62 @@ impl DriveProvider for AliyunProvider {
         Ok(fids.len())
     }
 
-    async fn search(&self, dir: &str, keyword: &str, limit: u32) -> AppResult<Vec<SearchHit>> {
-        let needle = keyword.trim().to_lowercase();
+    /// Server-side search via `/adrive/v3/file/search`.
+    ///
+    /// The query language is not free text: the server only accepts
+    /// `name match "x"` / `name = "x"` and rejects a bare word with
+    /// `InvalidParameter.Query`. `order_by` is rejected too, so the only
+    /// pagination knob is `next_marker` (echoed back as `next_marker`).
+    async fn search(&self, _dir: &str, keyword: &str, limit: u32) -> AppResult<Vec<SearchHit>> {
+        let needle = keyword.trim();
         if needle.is_empty() {
             return Ok(Vec::new());
         }
-        // The web API has no search endpoint, so walk the tree like the other
-        // adapters do.
-        let limit = limit as usize;
+        let drive = self.drive().await?;
+        let query = format!("name match \"{}\"", needle.replace('"', " "));
         let mut hits = Vec::new();
-        let mut queue: std::collections::VecDeque<(String, Vec<(String, String)>)> =
-            std::collections::VecDeque::new();
-        queue.push_back((api_id(dir).to_string(), Vec::new()));
-        let mut visited = 0u32;
-        while let Some((fid, path)) = queue.pop_front() {
-            visited += 1;
-            if visited > 80 || hits.len() >= limit {
-                break;
+        let mut marker = String::new();
+        for _ in 0..20 {
+            let mut body = json!({
+                "drive_id": drive,
+                "query": query,
+                "limit": 100,
+                "fields": "*",
+            });
+            if !marker.is_empty() {
+                body["next_marker"] = json!(marker);
             }
-            let Ok(entries) = self.list(&fid).await else {
-                continue;
-            };
-            for entry in entries.entries {
-                let name = entry.name.to_lowercase();
-                let is_dir = entry.is_dir;
-                let native = super::native_of(&entry.fid);
-                let entry_name = entry.name.clone();
-                if name.contains(&needle) {
-                    // The hit belongs at the end of the chain: the UI shows
-                    // `path.slice(0, -1)` as the folder it lives in.
-                    let mut hit_path: Vec<PathNode> = path
-                        .iter()
-                        .map(|(f, n)| PathNode {
-                            fid: qualify(ProviderId::Aliyun, f),
-                            name: n.clone(),
-                        })
-                        .collect();
-                    hit_path.push(PathNode {
-                        fid: qualify(ProviderId::Aliyun, &native),
-                        name: entry.name.clone(),
-                    });
-                    hits.push(SearchHit {
-                        entry,
-                        path: hit_path,
-                    });
-                    if hits.len() >= limit {
-                        break;
-                    }
+            let value = self.call("/adrive/v3/file/search", body).await?;
+            let items = value
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let count = items.len();
+            for item in items {
+                let parent = item
+                    .get("parent_file_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let entry = self.entry(&item, &parent);
+                let mut path = self.path_up(&parent, 0).await;
+                path.push(PathNode {
+                    fid: entry.fid.clone(),
+                    name: entry.name.clone(),
+                });
+                hits.push(SearchHit { entry, path });
+                if hits.len() >= limit as usize {
+                    return Ok(hits);
                 }
-                if is_dir && path.len() < 8 {
-                    let mut next = path.clone();
-                    next.push((native.clone(), entry_name));
-                    queue.push_back((native, next));
-                }
+            }
+            marker = value
+                .get("next_marker")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if count < 100 || marker.is_empty() {
+                break;
             }
         }
         Ok(hits)
@@ -1868,6 +1871,46 @@ impl AliyunProvider {
             &[("x-share-token", share_token)],
         )
         .await
+    }
+
+    /// Breadcrumb from the root down to `fid`, climbing `/v2/file/get`.
+    ///
+    /// Search only reports `parent_file_id`; the web API has no
+    /// "path of this file" call, so we walk upwards (bounded, one request per
+    /// level).
+    async fn path_up(&self, fid: &str, _depth: u32) -> Vec<PathNode> {
+        let mut acc = Vec::new();
+        let mut cursor = fid.to_string();
+        for _ in 0..12 {
+            if cursor.is_empty() || cursor == API_ROOT || cursor == ROOT {
+                break;
+            }
+            let Ok(value) = self
+                .call(
+                    "/v2/file/get",
+                    json!({ "drive_id": self.drive().await.unwrap_or_default(), "file_id": cursor }),
+                )
+                .await
+            else {
+                break;
+            };
+            let name = value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            acc.push(PathNode {
+                fid: qualify(ProviderId::Aliyun, &cursor),
+                name,
+            });
+            cursor = value
+                .get("parent_file_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+        }
+        acc.reverse();
+        acc
     }
 
     /// Tree-walk fallback for [`DriveProvider::resolve_path`].
