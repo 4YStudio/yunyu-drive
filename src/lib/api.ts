@@ -16,6 +16,7 @@ import type {
   Settings,
   ShareListing,
   ShareSession,
+  ShareCreated,
   TransferTask,
 } from "@/lib/types";
 
@@ -171,6 +172,30 @@ export const api = {
     }),
   /** A link that launched the app before the UI was listening. */
   deeplinkTake: () => invoke<string | null>("deeplink_take"),
+
+  /**
+   * Creates a share of the given files.
+   *
+   * `days` 0 means permanent; `passcode` may be empty, in which case 百度
+   * invents one and the returned `passcode` carries it.
+   */
+  shareCreate: (
+    provider: string,
+    fids: string[],
+    title?: string,
+    days = 7,
+    passcode?: string,
+  ) =>
+    invoke<ShareCreated>("share_create", {
+      provider,
+      fids,
+      title,
+      days,
+      passcode,
+    }),
+  /** Revokes a share this app created. */
+  shareRevoke: (provider: string, shareId: string, fids: string[]) =>
+    invoke<void>("share_revoke", { provider, shareId, fids }),
 };
 
 export interface WebLoginEvent {

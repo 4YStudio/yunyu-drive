@@ -1676,3 +1676,220 @@ async fn live_upload_throttle() {
     }
     let _ = tokio::fs::remove_dir_all(&dir).await;
 }
+
+/// Finds a small file to share, walking into sub-folders when the root has
+/// none (阿里 and 123 keep everything inside dated folders).
+async fn small_file(drive: &Arc<dyn DriveProvider>, root: &str) -> Option<crate::providers::EntryDto> {
+    let mut queue: Vec<(String, u8)> = vec![(root.to_string(), 0)];
+    let mut best: Option<crate::providers::EntryDto> = None;
+    while let Some((fid, depth)) = queue.pop() {
+        let Ok(list) = drive.list(&fid).await else { continue };
+        for entry in list.entries {
+            if entry.is_dir {
+                // Two levels is enough to reach the dated folders; deeper walks
+                // would spend minutes on a large drive.
+                if depth < 2 {
+                    queue.push((crate::providers::native_of(&entry.fid), depth + 1));
+                }
+                continue;
+            }
+            if entry.size == 0 || entry.size > 40_000_000 {
+                continue;
+            }
+            let better = best.as_ref().map(|b| entry.size < b.size).unwrap_or(true);
+            if better {
+                best = Some(entry);
+            }
+        }
+    }
+    best
+}
+
+/// Creates a share of one real file on every drive that can, prints the link,
+/// then revokes it again so nothing is left behind.
+///
+/// ```text
+/// cargo test --lib live_create_share -- --ignored --nocapture --test-threads 1
+/// ```
+#[tokio::test]
+#[ignore]
+async fn live_create_share() {
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        if !drive.capabilities().share_create {
+            println!("{}: share_create not supported", provider.as_str());
+            continue;
+        }
+        let root = match provider {
+            ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        // Smallest file: 123 needs a size, 百度 rejects empty files.
+        let Some(entry) = small_file(&drive, root).await else {
+            println!("{}: no small file to share", provider.as_str());
+            continue;
+        };
+        let native = crate::providers::native_of(&entry.fid);
+        println!(
+            "{}: sharing 「{}」 ({} B)",
+            provider.as_str(),
+            entry.name,
+            entry.size
+        );
+        match drive
+            .create_share(
+                std::slice::from_ref(&native),
+                &entry.name,
+                7,
+                "ab12",
+            )
+            .await
+        {
+            Ok(created) => {
+                println!(
+                    "  url={} passcode={} expired_at={} share_id={}",
+                    created.url, created.passcode, created.expired_at, created.share_id
+                );
+                assert!(created.url.starts_with("http"), "link looks wrong");
+                // A share with a code must hand the code back.
+                assert_eq!(created.passcode, "ab12", "passcode not echoed");
+            }
+            Err(err) => println!("  create_share ERR {err}"),
+        }
+    }
+}
+
+/// Creates a share without asking for a passcode, to see which drives invent
+/// one (百度) and which allow none (夸克/阿里/123).
+#[tokio::test]
+#[ignore]
+async fn live_create_share_open() {
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        if !drive.capabilities().share_create {
+            continue;
+        }
+        let root = match provider {
+            ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        let Some(entry) = small_file(&drive, root).await else { continue };
+        let native = crate::providers::native_of(&entry.fid);
+        match drive.create_share(&[native], "", 0, "").await {
+            Ok(created) => println!(
+                "{}: permanent, passcode={:?} url={}",
+                provider.as_str(),
+                created.passcode,
+                created.url
+            ),
+            Err(err) => println!("{}: open share ERR {err}", provider.as_str()),
+        }
+    }
+}
+
+/// Checks whether a share code actually guards a 123 link.
+///
+/// The create call accepts `pwd`, but `/b/api/share/info` reports
+/// `HasPwd:false` for a share we just created with one. If opening it with a
+/// wrong code succeeds, the code is decorative and the UI must not promise it.
+#[tokio::test]
+#[ignore]
+async fn live_123_passcode_guard() {
+    let Some(drive) = drive(ProviderId::Pan123) else { return };
+    let Some(entry) = small_file(&drive, "0").await else {
+        println!("no small file to share");
+        return;
+    };
+    let native = crate::providers::native_of(&entry.fid);
+    let Ok(created) = drive
+        .create_share(std::slice::from_ref(&native), "yunyu-passcode-probe", 7, "ab12")
+        .await
+    else {
+        println!("create failed");
+        return;
+    };
+    println!("created {} passcode={:?}", created.url, created.passcode);
+    let share_key = created
+        .url
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    for code in ["ab12", "zzzz", ""] {
+        match drive.share_open(&share_key, code).await {
+            Ok(session) => println!(
+                "  code={code:?} -> OPENED, file_num={} title={:?}",
+                session.file_num, session.title
+            ),
+            Err(err) => println!("  code={code:?} -> rejected: {err}"),
+        }
+    }
+    // Leave nothing behind.
+    if drive.create_share(&[native], "", 7, "").await.is_ok() {
+        println!("(a second share was created; delete both by hand)");
+    }
+}
+
+
+/// Creates a share on every drive that can, then revokes it, so the probe
+/// leaves the account as it found it.
+///
+/// ```text
+/// cargo test --lib live_revoke_share -- --ignored --nocapture --test-threads 1
+/// ```
+#[tokio::test]
+#[ignore]
+async fn live_revoke_share() {
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        if !drive.capabilities().share_create {
+            continue;
+        }
+        let root = match provider {
+            ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        let Some(entry) = small_file(&drive, root).await else {
+            println!("{}: no small file", provider.as_str());
+            continue;
+        };
+        let native = crate::providers::native_of(&entry.fid);
+        let created = match drive
+            .create_share(std::slice::from_ref(&native), "yunyu-revoke-probe", 7, "ab12")
+            .await
+        {
+            Ok(created) => created,
+            Err(err) => {
+                println!("{}: create failed: {err}", provider.as_str());
+                continue;
+            }
+        };
+        println!(
+            "{}: created {} id={}",
+            provider.as_str(),
+            created.url,
+            created.share_id
+        );
+        match drive
+            .revoke_share(&created.share_id, std::slice::from_ref(&native))
+            .await
+        {
+            Ok(()) => {
+                // A revoked link must stop opening; give the server a moment.
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let key = created
+                    .url
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                match drive.share_open(&key, "ab12").await {
+                    Ok(_) => println!("  revoked, but the link still opens"),
+                    Err(err) => println!("  revoked, link now dead: {err}"),
+                }
+            }
+            Err(err) => println!("  revoke failed: {err}"),
+        }
+    }
+}

@@ -27,7 +27,7 @@
 | 网盘 | 登录方式 | 后端 | 说明 |
 | --- | --- | --- | --- |
 | 夸克网盘 | 内置网页登录抓 Cookie / 粘贴 Cookie | [libquarkpan](../quark-cli)（GPL-3.0） | 功能最全：分享链接、转存、秒传 |
-| 中国移动云盘 | 内置网页登录抓 Cookie / 粘贴 token | [cloud139](../cloud139)（MIT） | 路径寻址，内部用 base64 路径 id；上传自建四步协议以支持校验进度 |
+| 中国移动云盘 | 内置网页登录抓 Cookie / 粘贴 token | [cloud139](../cloud139)（MIT） | 路径寻址，内部用 base64 路径 id；上传自建四步协议以支持校验进度；不支持创建分享 |
 | 阿里云盘 | 扫码登录 / 粘贴 refresh_token | 自实现，网页版 `api.aliyundrive.com` | 需要 ECDSA 设备签名，见下 |
 | 123 云盘 | 账号 + 密码 | 自实现，安卓协议移植 | 移动走 `mod_pid`；复制走 `copy/async`（原地复制再移动，见下） |
 | 百度网盘 | 内置网页登录抓 Cookie / 粘贴 Cookie | 自实现，网页版 `pan.baidu.com/api` | 走网页会话（`BDUSS` + `PANPSC` 等整包 cookie + `bdstoken`），不需要开发者 app_key |
@@ -86,6 +86,9 @@
   支持系统级深链 `yunyu-drive://share?url=<encodeURIComponent(链接)>`；
   夸克官网的 `qklink://` / `qkclouddrive://` 也照收。
   各盘差异见下面「分享链接的实现差异」。
+- **创建分享（四个网盘，139 除外）**：选中文件或文件夹右键「创建分享链接」，可选分享名称、
+  有效期（永久 / 7 天 / 30 天）和 4 位提取码，创建完直接复制链接，也能在弹窗里「取消分享」。
+  各盘限制见下面「创建分享的实现差异」。
 - **登录凭据只存本地**：`~/.config/yunyu-drive/`（0600）。
 
 ## 文档
@@ -191,6 +194,28 @@ src-tauri/src/
   表现为「手机上几百个文件，电脑上只有一两个」。
 - 123 云盘的移动走 `/b/api/file/mod_pid`；盘内复制走 `copy/async`。注意 `/file/copy`
   （不带 `async`）要求 `ShareKey`，那是转存分享而不是盘内复制，不要混用。
+
+### 创建分享的实现差异
+
+`create_share` / `revoke_share` 是 provider 的可选能力（`Capabilities.share_create`），
+`share.rs` 只做参数校验与 id 转换：
+
+| 网盘 | 创建 | 取消 | 限制 |
+| --- | --- | --- | --- |
+| 夸克 | `POST /1/clouddrive/share` → `share/password` 换链接 | `share/delete` | 有效期只有永久 / 1 / 7 / 30 天 |
+| 123 云盘 | `POST /b/api/share/create` | `/b/api/share/delete` | `fileIdList` 是逗号分隔字符串，`expiration` 必填且带时区 |
+| 阿里云盘 | `POST /adrive/v2/share_link/create` | `adrive/v4/batch` 的 `/share_link/cancel` | 每日创建次数有上限（`SharelinkCreateExceedDailyLimit`） |
+| 百度网盘 | `POST /share/set`（`schannel=4`） | `/share/cancel` | **必须有 4 位提取码**，没填就随机生成 |
+| 中国移动云盘 | 不支持 | — | 网页端没有任何「创建分享」的接口，候选路径全部回「资源不存在」 |
+
+- 夸克的创建端点**不是** `/1/clouddrive/share/create`（404），而是 `/1/clouddrive/share`；
+  返回的 `share_id` 是 32 位 hex，还要再调 `share/password` 才拿到 12 位 `pwd_id` 和链接。
+- 123 的密码字段是 **`sharePwd`** 而不是 `pwd` —— 传 `pwd` 服务端照收但静默忽略，分享变成无码。
+  分享链接在 `data.shareLinkList.list[0]`，`data.ShareUrl` 恒为空串。
+- 阿里不传 `expiration` 才是永久（传空串会被拒），`share_id` 是 11 位 base62；
+  取消只能用 `adrive/v4/batch` 的 `/share_link/cancel`，`/share_link/delete` 是 404。
+- 百度 `path_list` 是 **JSON 数组字符串**且必须是绝对路径，`pwd` 为空会回
+  `pwd length param error`，`schannel=0`（无密码）直接回「账号异常，禁止分享」。
 
 ### 分享链接的实现差异
 

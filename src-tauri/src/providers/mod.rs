@@ -563,6 +563,38 @@ pub trait DriveProvider: Send + Sync {
 
     /// Drops a temporary copy made by [`Self::share_link`]. Best effort.
     async fn share_cleanup(&self, _fid: &str) {}
+
+    // ------------------------------------------------------- own shares ---
+
+    /// Creates a share out of the user's own files.
+    ///
+    /// `fids` are **native** ids of files or folders, `days` is the lifetime in
+    /// days (`0` = permanent) and `passcode` the 4-character code a visitor
+    /// must type — an empty string asks for a share without one, which not
+    /// every drive allows (百度 always needs four characters).
+    async fn create_share(
+        &self,
+        _fids: &[String],
+        _title: &str,
+        _days: u32,
+        _passcode: &str,
+    ) -> AppResult<crate::share::ShareCreated> {
+        Err(AppError::new(format!(
+            "{}暂不支持创建分享链接",
+            self.id().display_name()
+        )))
+    }
+
+    /// Revokes a share created by [`Self::create_share`].
+    ///
+    /// `share_id` is whatever `ShareCreated::share_id` carried; `fids` are the
+    /// native ids the share was made from, which 百度 needs to address it.
+    async fn revoke_share(&self, _share_id: &str, _fids: &[String]) -> AppResult<()> {
+        Err(AppError::new(format!(
+            "{}暂不支持取消分享",
+            self.id().display_name()
+        )))
+    }
 }
 
 // ------------------------------------------------------------------ registry ---

@@ -25,7 +25,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto,
+    native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto,
     PathNode, ProviderId, RecycleEntry, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
 };
 use crate::error::{AppError, AppResult};
@@ -1527,6 +1527,96 @@ impl DriveProvider for Pan123Provider {
             size: 0,
             cleanup_fid: None,
         })
+    }
+
+    async fn create_share(
+        &self,
+        fids: &[String],
+        title: &str,
+        days: u32,
+        passcode: &str,
+    ) -> AppResult<crate::share::ShareCreated> {
+        if fids.is_empty() {
+            return Err(AppError::new("请先选择要分享的内容"));
+        }
+        // 123 wants a comma-separated string, not an array, and the expiry is
+        // mandatory and must carry a timezone offset — an empty one is rejected
+        // with 「Expiration格式异常」. A century is how the web client says
+        // "permanent".
+        let list = fids
+            .iter()
+            .map(|fid| native_of(fid))
+            .collect::<Vec<_>>()
+            .join(",");
+        let expiration = if days == 0 {
+            "9999-12-31T23:59:59+08:00".to_string()
+        } else {
+            let when = chrono::Local::now() + chrono::Duration::days(i64::from(days));
+            when.format("%Y-%m-%dT%H:%M:%S+08:00").to_string()
+        };
+        let code = if passcode.chars().count() == 4 {
+            passcode.to_string()
+        } else {
+            String::new()
+        };
+        // The field is `sharePwd`; a body with `pwd` is accepted but silently
+        // ignored, leaving a share that anyone can open (probe:
+        // `live_123_passcode_guard`). `sharePwd` really does gate the listing.
+        let body = json!({
+            "driveId": 0,
+            "fileIdList": list,
+            "expiration": expiration,
+            "shareName": if title.is_empty() { "分享" } else { title },
+            "sharePwd": code,
+            "shareType": 1,
+        });
+        let value = self
+            .call("POST", &format!("{SHARE_BASE}/b/api/share/create"), Some(body))
+            .await?;
+        let data = value.get("data").cloned().unwrap_or(Value::Null);
+        // `ShareUrl` is always empty; the real links live in a nested list.
+        let url = data
+            .pointer("/shareLinkList/list/0")
+            .and_then(|v| v.as_str())
+            .filter(|u| !u.is_empty())
+            .or_else(|| {
+                data.pointer("/shareLinkList/standBy")
+                    .and_then(|v| v.as_str())
+                    .filter(|u| !u.is_empty())
+            })
+            .ok_or_else(|| AppError::new("123 云盘没有返回分享链接，请稍后重试"))?;
+        let expired_at = if days == 0 {
+            0
+        } else {
+            chrono::Local::now().timestamp_millis() + i64::from(days) * 86_400_000
+        };
+        Ok(crate::share::ShareCreated {
+            url: url.to_string(),
+            passcode: code,
+            expired_at,
+            share_id: data
+                .get("ShareId")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// `POST /b/api/share/delete` — `shareId` is an integer here.
+    async fn revoke_share(&self, share_id: &str, _fids: &[String]) -> AppResult<()> {
+        let id: i64 = share_id
+            .trim_matches('"')
+            .parse()
+            .map_err(|_| AppError::new(format!("123 云盘的分享 ID 无效：{share_id}")))?;
+        self.call(
+            "POST",
+            &format!("{SHARE_BASE}/b/api/share/delete"),
+            Some(json!({
+                "shareInfoList": [{ "shareId": id }],
+                "driveId": 0,
+            })),
+        )
+        .await
+        .map(|_| ())
     }
 }
 

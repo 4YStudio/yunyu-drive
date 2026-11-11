@@ -22,7 +22,7 @@ import Segmented from "@/components/Segmented.vue";
 
 import { api } from "@/lib/backend";
 import { storageKey } from "@/lib/brand";
-import type { DirListing, EntryDto, PathNode, SearchHit } from "@/lib/types";
+import type { DirListing, EntryDto, PathNode, SearchHit, ShareCreated } from "@/lib/types";
 import { formatDate, formatFullDate, formatSize, fileKind, kindLabel } from "@/lib/format";
 import {
   app,
@@ -499,6 +499,12 @@ const menuItems = computed<MenuItem[]>(() => {
   if (!target.isDir) {
     items.push({ id: "copy-name", label: "复制文件名", icon: "copy" });
   }
+  items.push({
+    id: "share",
+    label: many ? `分享 ${selectedEntries.value.length} 项` : "创建分享链接",
+    icon: "share",
+    disabled: !caps.value.shareCreate,
+  });
   items.push({ id: "delete", label: many ? `删除 ${selectedEntries.value.length} 项` : "删除", icon: "trash", danger: true, separatorBefore: true });
   return items;
 });
@@ -538,6 +544,9 @@ async function onMenuSelect(id: string) {
         await navigator.clipboard.writeText(target.name);
         toast("已复制文件名", "success");
       }
+      break;
+    case "share":
+      openShare();
       break;
     case "delete":
       requestDelete(selectedEntries.value);
@@ -733,6 +742,103 @@ async function downloadSelected() {
 
 function downloadOne(entry: EntryDto) {
   askDownload([{ fid: entry.fid, name: entry.name, size: entry.size, isDir: entry.isDir }]);
+}
+
+// ------------------------------------------------------------- create share ---
+
+/**
+ * Share dialog state.
+ *
+ * `days` is a string because `Segmented` works on strings; `result` stays set
+ * after a successful create so the user can copy the link without the dialog
+ * closing on them.
+ */
+const shareDialog = ref<null | {
+  entries: EntryDto[];
+  title: string;
+  days: string;
+  passcode: string;
+  busy: boolean;
+  result: ShareCreated | null;
+}>(null);
+
+/** 百度 rejects an empty code, so it is the one drive that cannot go open. */
+const shareNeedsCode = computed(() => app.activeProvider === "baidu");
+
+const shareDays = computed(() => Number(shareDialog.value?.days ?? 7));
+
+function openShare() {
+  const entries = selectedEntries.value;
+  if (entries.length === 0) return;
+  shareDialog.value = {
+    entries,
+    title:
+      entries.length === 1
+        ? entries[0].name.replace(/\.[^.]+$/, "")
+        : `${driveName.value}分享 ${entries.length} 项`,
+    days: "7",
+    passcode: "",
+    busy: false,
+    result: null,
+  };
+}
+
+async function submitShare() {
+  const dialog = shareDialog.value;
+  if (!dialog || dialog.busy) return;
+  const code = dialog.passcode.trim();
+  if (code && code.length !== 4) {
+    toast("提取码需要 4 位，留空则由网盘决定", "error");
+    return;
+  }
+  dialog.busy = true;
+  try {
+    dialog.result = await api.shareCreate(
+      app.activeProvider,
+      dialog.entries.map((entry) => entry.fid),
+      dialog.title.trim() || undefined,
+      Number(dialog.days),
+      code || undefined,
+    );
+    toast("已创建分享链接", "success");
+  } catch (err) {
+    toast(String(err), "error");
+  } finally {
+    dialog.busy = false;
+  }
+}
+
+/** The full line people paste into a chat: link plus code when there is one. */
+const shareLine = computed(() => {
+  const result = shareDialog.value?.result;
+  if (!result) return "";
+  return result.passcode ? `${result.url} 提取码：${result.passcode}` : result.url;
+});
+
+async function copyShareLink() {
+  if (!shareLine.value) return;
+  await navigator.clipboard.writeText(shareLine.value);
+  toast("已复制分享链接", "success");
+}
+
+/** Revokes the share the dialog just created. */
+async function revokeShare() {
+  const dialog = shareDialog.value;
+  if (!dialog?.result || dialog.busy) return;
+  dialog.busy = true;
+  try {
+    await api.shareRevoke(
+      app.activeProvider,
+      dialog.result.shareId,
+      dialog.entries.map((entry) => entry.fid),
+    );
+    toast("已取消分享", "success");
+    shareDialog.value = null;
+  } catch (err) {
+    toast(String(err), "error");
+  } finally {
+    if (shareDialog.value) shareDialog.value.busy = false;
+  }
 }
 
 async function pickUpload() {
@@ -1348,6 +1454,90 @@ defineExpose({ refresh });
         <button class="btn btn--solid" :disabled="relocate?.busy" @click="confirmRelocate">
           {{ relocateLabel }}
         </button>
+      </template>
+    </Modal>
+
+    <!-- create share -->
+    <Modal
+      :open="shareDialog !== null"
+      title="创建分享链接"
+      :subtitle="`${driveName} · ${shareDialog?.entries.length ?? 0} 项`"
+      :width="480"
+      @close="shareDialog = null"
+    >
+      <div v-if="shareDialog" class="share-form">
+        <template v-if="!shareDialog.result">
+          <label class="field">
+            <span class="field-label">分享名称</span>
+            <input v-model="shareDialog.title" class="input" placeholder="分享名称" />
+          </label>
+          <div class="field">
+            <span class="field-label">有效期</span>
+            <Segmented
+              v-model="shareDialog.days"
+              :options="[
+                { value: '0', label: '永久' },
+                { value: '7', label: '7 天' },
+                { value: '30', label: '30 天' },
+              ]"
+            />
+          </div>
+          <label class="field">
+            <span class="field-label">提取码</span>
+            <input
+              v-model="shareDialog.passcode"
+              class="input mono"
+              maxlength="4"
+              :placeholder="shareNeedsCode ? '必填，4 位' : '留空则不需要提取码'"
+            />
+            <span class="field-hint">
+              {{ shareNeedsCode
+                ? `${driveName}必须设置 4 位提取码`
+                : "留空则生成不需要提取码的链接" }}
+            </span>
+          </label>
+          <p class="share-note">
+            创建的分享会出现在网盘自己的分享列表里，也可以在这里随时取消。
+          </p>
+        </template>
+        <template v-else>
+          <div class="share-result">
+            <div class="share-link-row">
+              <input class="input mono" readonly :value="shareDialog.result.url" />
+              <button class="btn" @click="copyShareLink">
+                <Icon name="copy" :size="14" />
+                复制
+              </button>
+            </div>
+            <p v-if="shareDialog.result.passcode" class="share-code">
+              提取码 <span class="mono">{{ shareDialog.result.passcode }}</span>
+            </p>
+            <p class="field-hint">
+              {{ shareDialog.result.expiredAt > 0
+                ? `有效期至 ${formatFullDate(shareDialog.result.expiredAt)}`
+                : "永久有效" }}
+            </p>
+          </div>
+        </template>
+      </div>
+      <template #footer>
+        <template v-if="shareDialog?.result">
+          <button class="btn" :disabled="shareDialog?.busy" @click="revokeShare">
+            取消分享
+          </button>
+          <button class="btn" @click="shareDialog = null">关闭</button>
+          <button class="btn btn--solid" @click="copyShareLink">复制链接</button>
+        </template>
+        <template v-else>
+          <button class="btn" @click="shareDialog = null">取消</button>
+          <button
+            class="btn btn--solid"
+            :disabled="shareDialog?.busy || (shareNeedsCode && shareDialog?.passcode.trim().length !== 4)"
+            @click="submitShare"
+          >
+            {{ shareDialog?.busy ? "创建中…" : "创建链接" }}
+          </button>
+        </template>
       </template>
     </Modal>
 
@@ -1996,6 +2186,65 @@ defineExpose({ refresh });
   font-size: 11.5px;
   line-height: 1.6;
   color: var(--text-3);
+}
+
+/* --------------------------- create-share dialog --------------------------- */
+.share-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.share-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 0;
+}
+.field-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.field-hint {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+.share-form .input {
+  width: 100%;
+}
+.share-note {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-3);
+}
+.share-result {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.share-link-row {
+  display: flex;
+  gap: 8px;
+}
+.share-link-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.share-code {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.share-code .mono {
+  padding: 2px 7px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-sunken);
+  color: var(--text);
+  letter-spacing: 0.08em;
 }
 
 /* ------------------------------ row motion ------------------------------ */

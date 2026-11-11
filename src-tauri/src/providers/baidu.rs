@@ -37,8 +37,8 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto, PathNode,
-    ProviderId, QuotaInfo, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
+    native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto,
+    PathNode, ProviderId, QuotaInfo, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -892,7 +892,7 @@ impl DriveProvider for BaiduProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             share_open: true,
-            share_create: false,
+            share_create: true,
             move_files: true,
             copy: true,
             search: true,
@@ -1806,6 +1806,79 @@ impl DriveProvider for BaiduProvider {
             size,
             cleanup_fid: None,
         })
+    }
+
+    async fn create_share(
+        &self,
+        fids: &[String],
+        title: &str,
+        days: u32,
+        passcode: &str,
+    ) -> AppResult<crate::share::ShareCreated> {
+        if fids.is_empty() {
+            return Err(AppError::new("请先选择要分享的内容"));
+        }
+        // 百度 always demands a four-character code: an empty one is answered
+        // with 「pwd length param error」. Generate one when the caller has none.
+        let code = if passcode.chars().count() == 4 {
+            passcode.to_string()
+        } else {
+            crate::share::random_code(4)
+        };
+        let token = self.bdstoken().await?;
+        // `path_list` is a JSON array *string* of absolute paths.
+        let mut paths = Vec::with_capacity(fids.len());
+        for fid in fids {
+            paths.push(self.path_of(&native_of(fid)).await?);
+        }
+        let list = serde_json::to_string(&paths).unwrap_or_else(|_| "[]".to_string());
+        let period = if days == 0 { 0 } else { days };
+        let url = format!(
+            "{BASE}/share/set?channel=chunlei&web=1&app_id=250528&bdstoken={token}&clienttype=0"
+        );
+        let form = [
+            ("schannel", "4".to_string()),
+            ("channel", "chunlei".to_string()),
+            ("pwd", code.clone()),
+            ("period", period.to_string()),
+            ("path_list", list),
+        ];
+        let value = self.post_form(&url, &form, "创建分享").await?;
+        let link = value
+            .get("link")
+            .and_then(|v| v.as_str())
+            .filter(|u| !u.is_empty())
+            .or_else(|| value.get("shorturl").and_then(|v| v.as_str()))
+            .ok_or_else(|| AppError::new("百度网盘没有返回分享链接，请稍后重试"))?;
+        let _ = title;
+        Ok(crate::share::ShareCreated {
+            url: link.to_string(),
+            passcode: code,
+            expired_at: value
+                .get("expiretime")
+                .and_then(|v| v.as_i64())
+                .map(|v| v * 1000)
+                .unwrap_or(0),
+            share_id: value
+                .get("shareid")
+                .map(|v| v.to_string().trim_matches('"').to_string())
+                .unwrap_or_default(),
+        })
+    }
+
+    /// `POST /share/cancel` with a JSON array string of numeric share ids.
+    async fn revoke_share(&self, share_id: &str, _fids: &[String]) -> AppResult<()> {
+        let id: i64 = share_id
+            .parse()
+            .map_err(|_| AppError::new(format!("百度网盘的分享 ID 无效：{share_id}")))?;
+        let token = self.bdstoken().await?;
+        let url = format!(
+            "{BASE}/share/cancel?channel=chunlei&web=1&app_id=250528&bdstoken={token}&clienttype=0"
+        );
+        // `shareid_list` is a JSON array *string*, not repeated form fields.
+        let form = [("shareid_list", format!("[{id}]"))];
+        // `post_form` already maps a non-zero `errno` to an error.
+        self.post_form(&url, &form, "取消分享").await.map(|_| ())
     }
 }
 

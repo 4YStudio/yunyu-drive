@@ -215,3 +215,13 @@ export interface ShareListing {
   entries: ShareEntry[];
   total: number;
 }
+
+/** The result of creating a share out of one's own files. */
+export interface ShareCreated {
+  url: string;
+  /** Empty when the drive allows a link without a code. */
+  passcode: string;
+  /** ms since the epoch; 0 when permanent or unknown. */
+  expiredAt: number;
+  shareId: string;
+}

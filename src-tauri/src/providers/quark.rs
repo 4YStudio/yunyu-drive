@@ -843,6 +843,99 @@ impl DriveProvider for QuarkProvider {
         envelope(value)?;
         Ok(entries.len() as u32)
     }
+
+    // ---------------------------------------------------- own shares ---
+
+    async fn create_share(
+        &self,
+        fids: &[String],
+        title: &str,
+        days: u32,
+        passcode: &str,
+    ) -> AppResult<crate::share::ShareCreated> {
+        if fids.is_empty() {
+            return Err(AppError::new("请先选择要分享的内容"));
+        }
+        // 1 = no code, 2 = 4-character code. A half-typed code is treated as
+        // "no code" rather than being sent and rejected.
+        let url_type = if passcode.chars().count() == 4 { 2 } else { 1 };
+        let expired_type = match days {
+            0 => 1,
+            1 => 2,
+            7 => 3,
+            30 => 4,
+            other => {
+                return Err(AppError::new(format!(
+                    "夸克网盘只支持永久 / 1 天 / 7 天 / 30 天，收到 {other} 天"
+                )))
+            }
+        };
+        let mut body = json!({
+            "fid_list": fids,
+            "title": if title.is_empty() { "分享" } else { title },
+            "url_type": url_type,
+            "expired_type": expired_type,
+        });
+        if url_type == 2 {
+            body["passcode"] = json!(passcode);
+        }
+        // Note the path: `/share`, not `/share/create` (that one is a 404).
+        let value = post_json(
+            &format!("{QUARK_API}/1/clouddrive/share?pr=ucpro&fr=pc"),
+            &self.cookie,
+            &body,
+        )
+        .await?;
+        let data = envelope(value)?;
+        let share_id = data
+            .pointer("/task_resp/data/share_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if share_id.is_empty() {
+            // Async shares report a task instead; poll it like a save task.
+            if let Some(task) = data.get("task_id").and_then(|v| v.as_str()) {
+                poll_task(&self.cookie, task).await?;
+            }
+            return Err(AppError::new("夸克网盘没有返回分享 ID，请稍后重试"));
+        }
+        // The share id is 32 hex; the public link needs the shorter pwd_id that
+        // only `/share/password` hands out.
+        let value = post_json(
+            &format!("{QUARK_API}/1/clouddrive/share/password?pr=ucpro&fr=pc"),
+            &self.cookie,
+            &json!({ "share_id": share_id }),
+        )
+        .await?;
+        let info = envelope(value)?;
+        let url = text(&info, "share_url");
+        if url.is_empty() {
+            return Err(AppError::new("夸克网盘没有返回分享链接，请稍后重试"));
+        }
+        Ok(crate::share::ShareCreated {
+            url,
+            passcode: text(&info, "passcode"),
+            expired_at: info
+                .get("expired_at")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            share_id,
+        })
+    }
+
+    /// `POST /1/clouddrive/share/delete` with the 32-hex share id.
+    async fn revoke_share(&self, share_id: &str, _fids: &[String]) -> AppResult<()> {
+        if share_id.is_empty() {
+            return Err(AppError::new("缺少分享 ID"));
+        }
+        let value = post_json(
+            &format!("{QUARK_API}/1/clouddrive/share/delete?pr=ucpro&fr=pc&uc_param_str="),
+            &self.cookie,
+            &json!({ "share_ids": [share_id] }),
+        )
+        .await?;
+        envelope(value).map(|_| ())
+    }
 }
 
 /// Quota lives on the same host libquarkpan is pointed at, but we do not have

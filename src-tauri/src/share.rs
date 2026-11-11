@@ -175,6 +175,41 @@ pub struct AccountInfo {
     pub avatar: Option<String>,
 }
 
+/// A random share passcode.
+///
+/// 夸克 and 阿里 take 4 characters of their own choosing, 百度 insists on
+/// exactly four and rejects an empty one, so the caller can always hand out a
+/// code even when the user did not type one. Lowercase + digits only: these
+/// end up in a url that people retype by hand.
+///
+/// Bytes come from `/dev/urandom`; when that fails we fall back to hashing the
+/// clock, which is still good enough for a share code.
+pub fn random_code(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijkmnpqrstuvwxyz23456789";
+    let mut raw = vec![0u8; len];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut raw))
+        .is_ok();
+    if !filled {
+        use sha2::Digest as _;
+        let seed = format!(
+            "{}-{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default(),
+            std::process::id()
+        );
+        let digest = sha2::Sha256::digest(seed.as_bytes());
+        for (slot, byte) in raw.iter_mut().zip(digest.iter()) {
+            *slot = *byte;
+        }
+    }
+    raw.iter()
+        .map(|byte| CHARSET[usize::from(*byte) % CHARSET.len()] as char)
+        .collect()
+}
+
 /// One row inside a share.
 ///
 /// `token` is free-form: each drive stores whatever it needs to address the
@@ -224,6 +259,25 @@ pub struct ShareListing {
     pub pdir_fid: String,
     pub entries: Vec<ShareEntry>,
     pub total: u64,
+}
+
+/// A share the user just created out of their own files.
+///
+/// The drives answer with wildly different shapes (夸克 mints a 32-hex share id
+/// first and only then a link, 123 puts the link in a nested list, 百度 hands
+/// back a numeric share id and a short url), so the provider normalises them
+/// into this.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareCreated {
+    /// Browser address of the new share.
+    pub url: String,
+    /// The code a visitor has to type, empty when the drive allows none.
+    pub passcode: String,
+    /// Expiry in ms since the epoch; 0 when permanent or unknown.
+    pub expired_at: i64,
+    /// Drive-side id, so a caller could revoke it later.
+    pub share_id: String,
 }
 
 /// A parsed share link.
@@ -609,6 +663,65 @@ pub async fn share_save(
         })
         .collect();
     drive.share_save(&share, &entries, to_pdir_fid.as_deref()).await
+}
+
+/// Creates a share out of the user's own files.
+///
+/// `fids` are qualified entry ids from the current listing; they must all
+/// belong to `provider`. `days` is 0 for permanent, `passcode` may be empty
+/// (百度 then picks one and reports it back).
+#[tauri::command]
+pub async fn share_create(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+    fids: Vec<String>,
+    title: Option<String>,
+    days: Option<u32>,
+    passcode: Option<String>,
+) -> AppResult<ShareCreated> {
+    if fids.is_empty() {
+        return Err(AppError::new("请先选择要分享的内容"));
+    }
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    if !drive.capabilities().share_create {
+        return Err(AppError::new(format!(
+            "{}暂不支持创建分享链接",
+            id.display_name()
+        )));
+    }
+    let natives: Vec<String> = fids.iter().map(|fid| crate::providers::native_of(fid)).collect();
+    drive
+        .create_share(
+            &natives,
+            title.as_deref().unwrap_or_default(),
+            days.unwrap_or(7),
+            passcode.as_deref().unwrap_or_default(),
+        )
+        .await
+}
+
+/// Revokes a share this app created.
+///
+/// `share_id` is whatever [`ShareCreated`] returned; `fids` are the qualified
+/// ids it was made from, which 百度 needs to address the share.
+#[tauri::command]
+pub async fn share_revoke(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+    share_id: String,
+    fids: Option<Vec<String>>,
+) -> AppResult<()> {
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    let natives: Vec<String> = fids
+        .unwrap_or_default()
+        .iter()
+        .map(|fid| crate::providers::native_of(fid))
+        .collect();
+    drive.revoke_share(&share_id, &natives).await
 }
 
 /// Downloads share entries: expands folders into their files and queues one

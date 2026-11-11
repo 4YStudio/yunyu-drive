@@ -610,9 +610,10 @@ impl DriveProvider for Yun139Provider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             share_open: true,
-            // 139 does have a "save to my drive" endpoint for shares, so the
-            // button is offered; it runs as a server-side batch task.
-            share_create: true,
+            // Reading a share works (and 139 can save one into the drive), but
+            // no client-visible endpoint creates a share: every candidate path
+            // answers 「资源不存在」. See `docs/provider-login.md`.
+            share_create: false,
             move_files: true,
             copy: true,
             search: true,

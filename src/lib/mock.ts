@@ -23,6 +23,7 @@ import type {
   ShareEntry,
   ShareListing,
   ShareSession,
+  ShareCreated,
   TransferTask,
 } from "@/lib/types";
 
@@ -323,7 +324,8 @@ function mockStates(): ProviderAuthState[] {
       avatar: loggedIn.has(provider) && provider !== "pan123" ? AVATAR : null,
       capabilities: {
         shareOpen: true,
-        shareCreate: false,
+        // 139 is the only drive with no create-share endpoint.
+        shareCreate: provider !== "yun139",
         // 123 can move (`mod_pid`); its copy goes through copy/async + a move.
         move: true,
         copy: provider !== "pan123",
@@ -624,6 +626,29 @@ export const mockApi = {
     items: { fid: string; name: string; size: number; isDir?: boolean; token?: string }[],
     dir?: string,
   ): Promise<TransferTask[]> => mockApi.downloadEntries(items, dir),
+
+  shareCreate: async (
+    provider: string,
+    fids: string[],
+    title?: string,
+    days = 7,
+    passcode?: string,
+  ): Promise<ShareCreated> => {
+    await sleep(500);
+    // 百度 always invents a code when none is given; the others accept an open
+    // link. Mirroring that keeps the UI branch visible in mock builds.
+    const code = passcode?.trim() || (provider === "baidu" ? "p4y6" : "");
+    return {
+      url: `https://pan.mock/s/${Math.random().toString(36).slice(2, 10)}`,
+      passcode: code,
+      expiredAt: days === 0 ? 0 : Date.now() + days * 86_400_000,
+      shareId: `${fids.length}-${title ?? "分享"}`,
+    };
+  },
+
+  shareRevoke: async (_provider: string, _shareId: string, _fids: string[]): Promise<void> => {
+    await sleep(300);
+  },
 
   deeplinkTake: async (): Promise<string | null> => null,
 

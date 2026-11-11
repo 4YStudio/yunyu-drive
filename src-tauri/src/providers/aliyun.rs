@@ -32,8 +32,9 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto, PathNode,
-    ProviderId, QuotaInfo, RecycleEntry, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
+    native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto,
+    PathNode, ProviderId, QuotaInfo, RecycleEntry, SearchHit, ShareFile, ShareLink, UploadSink,
+    RANGE_IGNORED,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -982,9 +983,10 @@ impl DriveProvider for AliyunProvider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             // Share links are read through the anonymous share endpoints and
-            // saved via `/adrive/v2/batch`; creating a share is not implemented.
+            // saved via `/adrive/v2/batch`; creating a share is
+            // `/adrive/v2/share_link/create`.
             share_open: true,
-            share_create: false,
+            share_create: true,
             recycle: true,
             ..Capabilities::BASIC
         }
@@ -1913,6 +1915,99 @@ impl DriveProvider for AliyunProvider {
         if let Err(err) = self.call("/v2/file/delete", body).await {
             crate::ylog!("aliyun: share copy {fid} not deleted: {err}");
         }
+    }
+
+    async fn create_share(
+        &self,
+        fids: &[String],
+        title: &str,
+        days: u32,
+        passcode: &str,
+    ) -> AppResult<crate::share::ShareCreated> {
+        if fids.is_empty() {
+            return Err(AppError::new("请先选择要分享的内容"));
+        }
+        let drive = self.drive().await?;
+        let list: Vec<String> = fids.iter().map(|fid| native_of(fid)).collect();
+        let mut body = json!({
+            "drive_id": drive,
+            "file_id_list": list,
+            "share_name": if title.is_empty() { "分享" } else { title },
+        });
+        if passcode.chars().count() == 4 {
+            body["share_pwd"] = json!(passcode);
+        }
+        // Omitting `expiration` entirely is what makes a share permanent; an
+        // empty string is rejected.
+        if days > 0 {
+            let when = chrono::Utc::now() + chrono::Duration::days(i64::from(days));
+            body["expiration"] = json!(when.format("%Y-%m-%dT%H:%M:%S.000Z").to_string());
+        }
+        let token = self.token().await?;
+        let value = self
+            .raw_post_as(
+                API,
+                "/adrive/v2/share_link/create",
+                &body,
+                &token,
+                None,
+                Some(CANARY_ANDROID),
+                &[],
+            )
+            .await?;
+        let url = value
+            .get("share_url")
+            .and_then(|v| v.as_str())
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| AppError::new("阿里云盘没有返回分享链接，请稍后重试"))?;
+        Ok(crate::share::ShareCreated {
+            url: url.to_string(),
+            passcode: value
+                .get("share_pwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            expired_at: value
+                .get("expiration")
+                .and_then(|v| v.as_str())
+                .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+                .map(|d| d.timestamp_millis())
+                .unwrap_or(0),
+            share_id: value
+                .get("share_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+    }
+
+    /// Cancels a share through `/adrive/v4/batch` — there is no delete
+    /// endpoint; `/adrive/v2/share_link/delete` answers 404.
+    async fn revoke_share(&self, share_id: &str, _fids: &[String]) -> AppResult<()> {
+        if share_id.is_empty() {
+            return Err(AppError::new("缺少分享 ID"));
+        }
+        let body = json!({
+            "requests": [{
+                "id": share_id,
+                "method": "POST",
+                "url": "/share_link/cancel",
+                "headers": { "Content-Type": "application/json" },
+                "body": { "share_id": share_id },
+            }],
+            "resource": "file",
+        });
+        let value = self.call("/adrive/v4/batch", body).await?;
+        let status = value
+            .pointer("/responses/0/status")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        // 204 is the success code; 200 also shows up for an already-cancelled
+        // share, which is not an error worth surfacing.
+        if status == 204 || status == 200 {
+            return Ok(());
+        }
+        Err(AppError::new(format!("取消分享失败（status={status}）")))
     }
 }
 
