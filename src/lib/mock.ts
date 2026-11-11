@@ -188,7 +188,7 @@ function emit(task: TransferTask) {
   for (const cb of transferListeners) cb({ ...task });
 }
 
-function makeTransfer(partial: Partial<TransferTask> & { name: string; kind: "download" | "upload" }): TransferTask {
+function makeTransfer(partial: Partial<TransferTask> & { name: string; kind: TransferTask["kind"] }): TransferTask {
   const task: TransferTask = {
     id: `t_${++seq}`,
     fid: null,
@@ -204,6 +204,7 @@ function makeTransfer(partial: Partial<TransferTask> & { name: string; kind: "do
     rapid: false,
     partPath: null,
     share: null,
+    cross: null,
     provider: "quark",
     ...partial,
   };
@@ -475,6 +476,40 @@ export const mockApi = {
 
   transferEntries: async (fids: string[], toPdirFid: string, copy: boolean) => {
     await sleep(320);
+    const target = providerOf(toPdirFid);
+    const sources = new Set(fids.map(providerOf));
+    // Crossing drives is a transfer job in the real app; mirror that here so the
+    // list shows a "跨盘" row instead of pretending the move happened.
+    if (sources.size > 0 && (sources.size > 1 || !sources.has(target))) {
+      const from = [...sources][0];
+      const picked = fids
+        .map((fid) => nodes.get(stripPrefix(fid)))
+        .filter((node): node is NonNullable<typeof node> => !!node);
+      // Folders carry no size in the fixture; give the row something to show.
+      const total = picked.reduce((sum, node) => sum + node.size, 0) || 24_000_000;
+      const task = makeTransfer({
+        kind: copy ? "copy" : "move",
+        name: picked.length === 1 ? picked[0].name : `${picked.length} 个文件`,
+        size: total,
+        transferred: 0,
+        status: "running",
+        provider: from as ProviderId,
+        cross: {
+          fromProvider: from as ProviderId,
+          toProvider: target as ProviderId,
+          toPdirFid,
+          copy,
+          files: picked.map((node) => ({
+            fid: `x:${node.name}`,
+            name: node.name,
+            size: node.size,
+            toParent: stripPrefix(toPdirFid),
+          })),
+        },
+      });
+      emit(task);
+      return picked.length;
+    }
     for (const fid of fids) {
       const node = nodes.get(stripPrefix(fid));
       if (!node) continue;

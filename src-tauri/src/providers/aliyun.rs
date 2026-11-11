@@ -1370,23 +1370,31 @@ impl DriveProvider for AliyunProvider {
         let drive = self.drive().await?;
         // 1. Create the upload slot; a known hash makes rapid-upload possible.
         let part_info: Vec<Value> = (1..=parts).map(|n| json!({ "part_number": n })).collect();
-        let created = self
-            .call(
-                "/adrive/v2/file/createWithFolders",
-                json!({
-                    "drive_id": drive,
-                    "parent_file_id": api_id(parent),
-                    "name": name,
-                    "type": "file",
-                    "size": size,
-                    "check_name_mode": "auto_rename",
-                    "part_info_list": part_info,
-                    "content_hash_name": "sha1",
-                    "content_hash": sha1,
-                    "proof_version": "v1",
-                }),
-            )
-            .await?;
+        // The hash buys a rapid upload (the file already exists server-side), but
+        // the server only accepts it together with a proof it can verify. Without
+        // the proof it answers `RapidProofNeed` and the upload dies before a byte
+        // is sent, so fall back to an ordinary upload when that happens.
+        let base = json!({
+            "drive_id": drive,
+            "parent_file_id": api_id(parent),
+            "name": name,
+            "type": "file",
+            "size": size,
+            "check_name_mode": "auto_rename",
+            "part_info_list": part_info,
+        });
+        let mut hashed = base.clone();
+        hashed["content_hash_name"] = json!("sha1");
+        hashed["content_hash"] = json!(sha1);
+        let created = match self.call("/adrive/v2/file/createWithFolders", hashed).await {
+            Ok(value) => value,
+            Err(err) if err.to_string().contains("RapidProofNeed") => {
+                let mut plain = base;
+                plain["content_hash_name"] = json!("none");
+                self.call("/adrive/v2/file/createWithFolders", plain).await?
+            }
+            Err(err) => return Err(err),
+        };
         let file_id = created
             .get("file_id")
             .and_then(|v| v.as_str())

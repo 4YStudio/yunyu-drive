@@ -1323,3 +1323,214 @@ async fn live_yun139_thumb_styles() {
     };
     println!("{} thumb len {}", entry.name, entry.thumb.as_deref().unwrap_or("").len());
 }
+
+/// End-to-end cross-drive copy: make a tiny file on the source drive, copy it
+/// to the target, compare the bytes and clean both sides up.
+///
+/// ```text
+/// CROSS_FROM=quark CROSS_TO=aliyun cargo test --lib live_cross -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn live_cross() {
+    let from_id = std::env::var("CROSS_FROM")
+        .ok()
+        .and_then(|v| ProviderId::parse(&v))
+        .unwrap_or(ProviderId::Quark);
+    let to_id = std::env::var("CROSS_TO")
+        .ok()
+        .and_then(|v| ProviderId::parse(&v))
+        .unwrap_or(ProviderId::Aliyun);
+    println!("=== cross {} -> {} ===", from_id.as_str(), to_id.as_str());
+    let (Some(from), Some(to)) = (drive(from_id), drive(to_id)) else {
+        return;
+    };
+    let root = |p: ProviderId| match p {
+        ProviderId::Aliyun => "root",
+        _ => "0",
+    };
+
+    // 1. a source file with recognisable bytes
+    let body = b"yunyu cross-drive probe\n".repeat(64);
+    let temp = std::env::temp_dir().join(format!("yunyu-cross-{}.txt", std::process::id()));
+    tokio::fs::write(&temp, &body).await.unwrap();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("yunyu-cross-{stamp}.txt");
+    let sink: Arc<dyn crate::providers::UploadSink> =
+        Arc::new(crate::providers::CounterSink::new(Arc::new(std::sync::atomic::AtomicU64::new(0))));
+    let token = tokio_util::sync::CancellationToken::new();
+    let uploaded = match from.upload(&temp, root(from_id), &name, sink, token).await {
+        Ok(fid) => fid,
+        Err(err) => {
+            println!("  upload to source failed: {err}");
+            let _ = tokio::fs::remove_file(&temp).await;
+            return;
+        }
+    };
+    println!("  source file: {uploaded:?}");
+
+    // 2. the cross job itself
+    let job = crate::transfer::CrossJob {
+        files: vec![crate::transfer::CrossFile {
+            fid: uploaded.clone().unwrap_or_default(),
+            name: name.clone(),
+            size: body.len() as u64,
+            to_parent: root(to_id).to_string(),
+        }],
+        to_pdir_fid: root(to_id).to_string(),
+        copy: true,
+        name: name.clone(),
+    };
+    let temp_root = std::env::temp_dir().join(format!("yunyu-cross-{}", std::process::id()));
+    if let Err(err) =
+        crate::transfer::run_cross_direct(from.clone(), to.clone(), temp_root, job).await
+    {
+        println!("  cross failed: {err}");
+        let _ = tokio::fs::remove_file(&temp).await;
+        panic!("cross-drive transfer failed");
+    }
+
+    // 3. read the target back
+    let listing = to.list(root(to_id)).await.expect("list target");
+    if listing.entries.iter().all(|e| e.name != name) {
+        println!(
+            "  target root has: {:?}",
+            listing
+                .entries
+                .iter()
+                .filter(|e| e.name.starts_with("yunyu-cross"))
+                .map(|e| (e.name.clone(), e.size))
+                .collect::<Vec<_>>()
+        );
+    }
+    let landed = listing.entries.iter().find(|e| e.name == name);
+    println!("  target copy: {:?}", landed.as_ref().map(|e| e.size));
+    assert!(landed.is_some(), "copy missing on the target drive");
+    assert_eq!(landed.unwrap().size, body.len() as u64);
+
+    // 4. clean up both sides (the source is a copy job, so it is still there)
+    let _ = to
+        .delete(&[crate::providers::native_of(&landed.unwrap().fid)])
+        .await;
+    if let Some(fid) = uploaded {
+        let _ = from.delete(&[fid]).await;
+    }
+    let _ = tokio::fs::remove_file(&temp).await;
+}
+
+/// Prints the md5 the drive publishes for a freshly uploaded file next to the
+/// md5 of the bytes actually served, to explain a校验失败.
+#[tokio::test]
+#[ignore]
+async fn live_md5_probe() {
+    let provider = std::env::var("PROBE_PROVIDER")
+        .ok()
+        .and_then(|v| ProviderId::parse(&v))
+        .unwrap_or(ProviderId::Quark);
+    let Some(drive) = drive(provider) else { return };
+    let root = match provider {
+        ProviderId::Aliyun => "root",
+        _ => "0",
+    };
+    let body = b"yunyu md5 probe\n".repeat(64);
+    let temp = std::env::temp_dir().join(format!("yunyu-md5-{}.txt", std::process::id()));
+    tokio::fs::write(&temp, &body).await.unwrap();
+    let name = format!("yunyu-md5-{}.txt", std::process::id());
+    let sink: Arc<dyn crate::providers::UploadSink> = Arc::new(
+        crate::providers::CounterSink::new(Arc::new(std::sync::atomic::AtomicU64::new(0))),
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    let Ok(Some(fid)) = drive.upload(&temp, root, &name, sink, token).await else {
+        println!("upload failed");
+        return;
+    };
+    let native = crate::providers::native_of(&fid);
+    use futures_util::StreamExt;
+    let handle = drive.open_download(&native, 0).await.expect("open");
+    println!("published md5: {:?} size {}", handle.md5, handle.size);
+    let mut buf = Vec::new();
+    let mut stream = handle.stream;
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk.unwrap());
+    }
+    use md5::Digest as _;
+    println!("served {} bytes md5 {:x}", buf.len(), md5::Md5::digest(&buf));
+    println!("local  {} bytes md5 {:x}", body.len(), md5::Md5::digest(&body));
+    let _ = drive.delete(&[native]).await;
+    let _ = tokio::fs::remove_file(&temp).await;
+}
+
+/// Downloads the first file in the root and compares the published md5 with the
+/// bytes actually served — tells us whether md5 verification is safe per drive.
+#[tokio::test]
+#[ignore]
+async fn live_md5_real() {
+    let provider = std::env::var("PROBE_PROVIDER")
+        .ok()
+        .and_then(|v| ProviderId::parse(&v))
+        .unwrap_or(ProviderId::Quark);
+    let Some(drive) = drive(provider) else { return };
+    let root = match provider {
+        ProviderId::Aliyun => "root",
+        _ => "0",
+    };
+    let Ok(list) = drive.list(root).await else { return };
+    use futures_util::StreamExt;
+    use md5::Digest as _;
+    for entry in list.entries.iter().filter(|e| !e.is_dir && e.size > 0).take(4) {
+        println!("file {} size {}", entry.name, entry.size);
+        let native = crate::providers::native_of(&entry.fid);
+        let Ok(handle) = drive.open_download(&native, 0).await else { continue };
+        let published = handle.md5.clone();
+        let mut buf = Vec::new();
+        let mut stream = handle.stream;
+        while let Some(Ok(chunk)) = stream.next().await {
+            buf.extend_from_slice(&chunk);
+            if buf.len() > 8_000_000 {
+                break;
+            }
+        }
+        println!(
+            "  published {:?} served {} bytes md5 {:x}",
+            published,
+            buf.len(),
+            md5::Md5::digest(&buf)
+        );
+    }
+}
+
+/// Removes the files and folders the probes left behind. Only names with our own
+/// `yunyu-` prefix are touched, and always by exact id.
+#[tokio::test]
+#[ignore]
+async fn live_probe_cleanup() {
+    for provider in ProviderId::all() {
+        let Some(drive) = drive(provider) else { continue };
+        let root = match provider {
+            ProviderId::Aliyun => "root",
+            _ => "0",
+        };
+        let Ok(list) = drive.list(root).await else { continue };
+        let ids: Vec<String> = list
+            .entries
+            .iter()
+            .filter(|e| {
+                e.name.starts_with("yunyu-cross-")
+                    || e.name.starts_with("yunyu-recycle-probe-")
+                    || e.name.starts_with("yunyu-md5-")
+            })
+            .map(|e| crate::providers::native_of(&e.fid))
+            .collect();
+        if ids.is_empty() {
+            println!("{}: clean", provider.as_str());
+            continue;
+        }
+        match drive.delete(&ids).await {
+            Ok(()) => println!("{}: removed {} probe item(s)", provider.as_str(), ids.len()),
+            Err(err) => println!("{}: cleanup failed: {err}", provider.as_str()),
+        }
+    }
+}

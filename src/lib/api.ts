@@ -79,7 +79,12 @@ export const api = {
   renameEntry: (fid: string, name: string) =>
     invoke<void>("rename_entry", { fid, name }),
   deleteEntries: (fids: string[]) => invoke<void>("delete_entries", { fids }),
-  /** Moves (`copy: false`) or copies entries into `toPdirFid`. */
+  /**
+   * Moves (`copy: false`) or copies entries into `toPdirFid`.
+   *
+   * Returns the number of entries handled. A target on another drive turns the
+   * call into a transfer task (download → upload) and returns the file count.
+   */
   transferEntries: (fids: string[], toPdirFid: string, copy: boolean) =>
     invoke<number>("transfer_entries", { fids, toPdirFid, copy }),
 

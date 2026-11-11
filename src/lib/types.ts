@@ -112,7 +112,8 @@ export interface AuthStatus {
 
 export interface TransferTask {
   id: string;
-  kind: "download" | "upload";
+  /** `copy`/`move` are cross-drive jobs: stream down, then upload. */
+  kind: "download" | "upload" | "copy" | "move";
   name: string;
   fid: string | null;
   localPath: string;
@@ -138,6 +139,14 @@ export interface TransferTask {
   share?: { fidToken: string; pwdId: string; stoken: string } | null;
   /** Which drive this task belongs to, for the badge in the list. */
   provider?: ProviderId | "";
+  /** Present for cross-drive moves/copies; `files` shrinks as they land. */
+  cross?: {
+    fromProvider: ProviderId | "";
+    toProvider: ProviderId | "";
+    toPdirFid: string;
+    copy: boolean;
+    files: { fid: string; name: string; size: number; toParent: string }[];
+  } | null;
 }
 
 export interface Settings {

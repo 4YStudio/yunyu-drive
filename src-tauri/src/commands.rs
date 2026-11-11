@@ -442,9 +442,15 @@ pub async fn rename_entry(
 }
 
 /// Moves or copies entries into `to_pdir_fid` (both qualified).
+///
+/// Same drive: one call, the drive does the work server-side. Different drive:
+/// there is no server-side primitive, so the files are streamed down to a temp
+/// directory and uploaded one by one — that runs as a transfer task because it
+/// takes as long as a normal download plus an upload.
 #[tauri::command]
 pub async fn transfer_entries(
     state: State<'_, Arc<AppState>>,
+    app: AppHandle,
     fids: Vec<String>,
     to_pdir_fid: String,
     copy: bool,
@@ -455,20 +461,132 @@ pub async fn transfer_entries(
     let target = crate::providers::EntryId::parse(&to_pdir_fid)?;
     let mut native_fids = Vec::with_capacity(fids.len());
     let mut drive: Option<Arc<dyn DriveProvider>> = None;
+    let mut foreign = false;
     for raw in &fids {
         let id = crate::providers::EntryId::parse(raw)?;
-        // Cross-drive move/copy is a separate feature; refuse loudly instead of
-        // silently dropping half the selection on the wrong drive.
         if id.provider != target.provider {
-            return Err(AppError::new("暂不支持跨网盘移动或复制"));
+            foreign = true;
         }
         drive = Some(state.drive_of(id.provider).await?);
         native_fids.push(id.native);
     }
     let drive = drive.ok_or_else(|| AppError::new("未选择任何文件"))?;
-    drive
-        .transfer_entries(&native_fids, &target.native, copy)
-        .await
+    if !foreign {
+        return drive
+            .transfer_entries(&native_fids, &target.native, copy)
+            .await;
+    }
+    // A mixed selection keeps the per-file drive: `start_cross_drive` resolves
+    // each source itself, so the loop above only needed the first one.
+    start_cross_drive(&state, &app, &fids, &target, copy).await
+}
+
+/// Expands the selection, recreates the folder tree on the target drive and
+/// hands the whole batch to one transfer task.
+async fn start_cross_drive(
+    state: &Arc<AppState>,
+    app: &AppHandle,
+    fids: &[String],
+    target: &crate::providers::EntryId,
+    copy: bool,
+) -> AppResult<usize> {
+    let to = state.drive_of(target.provider).await?;
+    let mut files: Vec<crate::transfer::CrossFile> = Vec::new();
+    let mut dirs: HashMap<(String, String), String> = HashMap::new();
+    let mut first_name = String::new();
+    for raw in fids {
+        let id = crate::providers::EntryId::parse(raw)?;
+        let from = state.drive_of(id.provider).await?;
+        let listing = from.list(&id.native).await?;
+        let entry = listing
+            .entries
+            .into_iter()
+            .find(|e| native_of(&e.fid) == id.native)
+            .ok_or_else(|| AppError::new("找不到要传输的文件"))?;
+        if first_name.is_empty() {
+            first_name = entry.name.clone();
+        }
+        if !entry.is_dir {
+            files.push(crate::transfer::CrossFile {
+                fid: id.native.clone(),
+                name: crate::paths::safe_component(&entry.name),
+                size: entry.size,
+                to_parent: target.native.clone(),
+            });
+            continue;
+        }
+        // Folders: rebuild the tree below the target and remember each folder
+        // id so siblings do not list the same parent over and over.
+        let root = cross_dir(&to, &mut dirs, &target.native, &entry.name).await?;
+        let walked = collect_remote_files(&from, &id.native).await?;
+        for file in walked {
+            let mut parent = root.clone();
+            if let Some(dir) = file.relative.parent().filter(|p| !p.as_os_str().is_empty()) {
+                for part in dir.components() {
+                    let name = part.as_os_str().to_string_lossy().to_string();
+                    parent = cross_dir(&to, &mut dirs, &parent, &name).await?;
+                }
+            }
+            files.push(crate::transfer::CrossFile {
+                fid: file.fid,
+                name: file.name,
+                size: file.size,
+                to_parent: parent,
+            });
+        }
+    }
+    if files.is_empty() {
+        return Err(AppError::new("选中的内容里没有可传输的文件"));
+    }
+    let count = files.len();
+    let total: u64 = files.iter().map(|f| f.size).sum();
+    let job = crate::transfer::CrossJob {
+        files,
+        to_pdir_fid: target.native.clone(),
+        copy,
+        name: first_name,
+    };
+    let temp = state.paths.cache_dir.join("cross");
+    let from = state.drive_of(
+        crate::providers::EntryId::parse(&fids[0])?.provider,
+    )
+    .await?;
+    let task = state
+        .transfers
+        .start_cross(app.clone(), from, to, temp, job, total)
+        .await?;
+    crate::ylog!(
+        "cross {} {} file(s) -> {} ({})",
+        if copy { "copy" } else { "move" },
+        count,
+        target.provider.as_str(),
+        task.id
+    );
+    Ok(count)
+}
+
+/// Finds or creates `name` below `parent` on the target drive.
+async fn cross_dir(
+    to: &Arc<dyn DriveProvider>,
+    seen: &mut HashMap<(String, String), String>,
+    parent: &str,
+    name: &str,
+) -> AppResult<String> {
+    if let Some(hit) = seen.get(&(parent.to_string(), name.to_string())) {
+        return Ok(hit.clone());
+    }
+    let listing = to.list(parent).await?;
+    let found = listing
+        .entries
+        .into_iter()
+        .find(|e| e.is_dir && e.name == name)
+        .map(|e| native_of(&e.fid));
+    let native = match found {
+        Some(native) => native,
+        None => native_of(&to.make_dir(parent, name).await?),
+    };
+    seen.insert((parent.to_string(), name.to_string()), native.clone());
+    Ok(native)
 }
 
 #[tauri::command]
@@ -887,6 +1005,27 @@ pub async fn transfer_retry(
             .find(|t| t.id == id)
             .ok_or_else(|| AppError::new("任务不存在"))?
     };
+    if task.kind == "copy" || task.kind == "move" {
+        // Cross-drive jobs remember which files are still missing, so a retry
+        // only re-runs those.
+        let cross = task
+            .cross
+            .clone()
+            .ok_or_else(|| AppError::new("任务缺少传输信息"))?;
+        let from = state
+            .drive_of(
+                ProviderId::parse(&cross.from_provider)
+                    .ok_or_else(|| AppError::new(format!("未知的网盘：{}", cross.from_provider)))?,
+            )
+            .await?;
+        let to = state
+            .drive_of(
+                ProviderId::parse(&cross.to_provider)
+                    .ok_or_else(|| AppError::new(format!("未知的网盘：{}", cross.to_provider)))?,
+            )
+            .await?;
+        return state.transfers.retry_cross(app, from, to, &id).await;
+    }
     if task.kind != "download" {
         return Err(AppError::new("上传任务无法续传，请重新上传"));
     }

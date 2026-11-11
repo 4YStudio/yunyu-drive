@@ -34,7 +34,7 @@ import {
   saveSettings,
   toast,
 } from "@/store/app";
-import { PROVIDERS } from "@/lib/types";
+import { PROVIDERS, type ProviderId } from "@/lib/types";
 import DriveLoader from "@/components/DriveLoader.vue";
 
 type SortKey = "name" | "size" | "updated";
@@ -114,7 +114,35 @@ const relocate = ref<null | {
   dirs: EntryDto[];
   loading: boolean;
   busy: boolean;
+  /** Drive the picker is browsing; starts on the active one. */
+  provider: ProviderId;
 }>(null);
+
+/** Drives the picker can switch to: logged in, and not the source drive. */
+const relocateTargets = computed(() =>
+  app.providers.filter((state) => state.authenticated),
+);
+
+/** True when the picker sits on a drive other than the files' own. */
+const relocateForeign = computed(
+  () => relocate.value !== null && relocate.value.provider !== app.activeProvider,
+);
+
+function relocateRoot(provider: ProviderId): string {
+  return `${provider}:0`;
+}
+
+/** Switches the picker to another drive and starts at its root. */
+async function pickDrive(provider: ProviderId) {
+  const state = relocate.value;
+  if (!state || state.provider === provider) return;
+  const node: PathNode = {
+    fid: relocateRoot(provider),
+    name: PROVIDERS.find((p) => p.id === provider)?.name ?? "全部文件",
+  };
+  state.provider = provider;
+  await loadRelocate(node.fid, [node]);
+}
 
 // ---------------------------------------------------------------- loading ---
 
@@ -529,6 +557,7 @@ async function openRelocate(mode: "move" | "copy") {
     dirs: [],
     loading: true,
     busy: false,
+    provider: app.activeProvider,
   };
   await loadRelocate(rootFid.value, [rootNode()]);
 }
@@ -563,12 +592,23 @@ async function relocateUp() {
   await loadRelocate(parent.fid, state.path.slice(0, -1));
 }
 
+/** Label for the confirm button, including the cross-drive case. */
+const relocateLabel = computed(() => {
+  const state = relocate.value;
+  if (!state) return "";
+  if (state.provider !== app.activeProvider) {
+    return state.mode === "move" ? "移动到这里（跨网盘）" : "复制到这里（跨网盘）";
+  }
+  return state.mode === "move" ? "移动到这里" : "复制到这里";
+});
+
 async function confirmRelocate() {
   const state = relocate.value;
   if (!state) return;
   // Moving entries into the folder they already live in does nothing; the
   // source folder is the current one, so compare against it.
-  if (state.mode === "move" && state.fid === currentFid.value) {
+  const foreign = state.provider !== app.activeProvider;
+  if (!foreign && state.mode === "move" && state.fid === currentFid.value) {
     toast("已经是当前文件夹", "info");
     return;
   }
@@ -579,7 +619,13 @@ async function confirmRelocate() {
       state.fid,
       state.mode === "copy",
     );
-    toast(state.mode === "move" ? `已移动 ${count} 项` : `已复制 ${count} 项`, "success");
+    if (foreign) {
+      // The drive cannot do this server-side: the app streams every file down
+      // and back up, which shows up in the transfer list.
+      toast(`已加入传输列表：${count} 个文件将下载后再上传`, "success");
+    } else {
+      toast(state.mode === "move" ? `已移动 ${count} 项` : `已复制 ${count} 项`, "success");
+    }
     relocate.value = null;
     await load(currentFid.value);
   } catch (err) {
@@ -1245,6 +1291,28 @@ defineExpose({ refresh });
       @close="relocate = null"
     >
       <div class="picker">
+        <div v-if="relocateTargets.length > 1" class="picker-drives">
+          <button
+            v-for="state in relocateTargets"
+            :key="state.provider"
+            class="picker-drive"
+            :class="{ 'picker-drive--on': relocate?.provider === state.provider }"
+            @click="pickDrive(state.provider)"
+          >
+            <img
+              v-if="PROVIDERS.find((p) => p.id === state.provider)?.logo"
+              class="picker-drive-logo"
+              :src="PROVIDERS.find((p) => p.id === state.provider)?.logo"
+              alt=""
+            />
+            <span class="truncate">
+              {{ PROVIDERS.find((p) => p.id === state.provider)?.short ?? state.provider }}
+            </span>
+          </button>
+        </div>
+        <p v-if="relocateForeign" class="picker-hint">
+          目标在另一个网盘：会先下载到本地，再上传过去，任务可以在传输列表里查看。
+        </p>
         <div class="picker-bar">
           <button
             class="icon-btn"
@@ -1278,7 +1346,7 @@ defineExpose({ refresh });
       <template #footer>
         <button class="btn" @click="relocate = null">取消</button>
         <button class="btn btn--solid" :disabled="relocate?.busy" @click="confirmRelocate">
-          {{ relocate?.mode === "move" ? "移动到这里" : "复制到这里" }}
+          {{ relocateLabel }}
         </button>
       </template>
     </Modal>
@@ -1788,6 +1856,51 @@ defineExpose({ refresh });
   min-width: 0;
   font-size: 12.2px;
   color: var(--text-2);
+}
+.picker-drives {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+}
+.picker-drive {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 26px;
+  padding: 0 10px 0 6px;
+  border-radius: var(--radius-pill, 999px);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font-size: 12.2px;
+  color: var(--text-2);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+.picker-drive:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.picker-drive--on {
+  background: var(--bg-active);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--line-strong);
+}
+.picker-drive-logo {
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  object-fit: contain;
+}
+.picker-hint {
+  margin: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11.8px;
+  line-height: 1.5;
+  color: var(--text-3);
 }
 .picker-list {
   max-height: 300px;

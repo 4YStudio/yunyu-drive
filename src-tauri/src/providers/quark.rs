@@ -426,11 +426,17 @@ impl DriveProvider for QuarkProvider {
         // importantly, refreshes the `__puus` cookie the CDN wants. The size we
         // report is 0 here because the transfer job already knows it from the
         // listing, and libquarkpan's DownloadInfo does not carry one.
-        let info = request.info().await?;
+        //
+        // The md5 from that same call is *not* the md5 of the bytes: measured on
+        // a 1536-byte upload, a 666 KiB pdf and an 11 MB apk, the published hash
+        // never matched what the CDN served (each file downloaded completely).
+        // Passing it on made every Quark download end in "文件校验失败", so it
+        // stays unset — the size check in the engine is the guard here.
+        let _ = request.info().await?;
         let stream = request.stream().await?;
         Ok(DownloadHandle {
             size: 0,
-            md5: info.md5.clone(),
+            md5: None,
             stream: Box::new(stream.map(|item| item.map_err(AppError::from))),
         })
     }

@@ -49,6 +49,45 @@ pub struct TransferTask {
     /// in the transfer list and for rebuilding the context on retry.
     #[serde(default)]
     pub provider: String,
+    /// Set for a cross-drive move/copy. Holds both drives, the files still to
+    /// go and how far the job got, so a retry can pick up where it stopped.
+    #[serde(default)]
+    pub cross: Option<CrossRef>,
+}
+
+/// One file of a cross-drive job, already expanded out of its folder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossFile {
+    /// Native id on the source drive.
+    pub fid: String,
+    /// Name to give the file on the target drive.
+    pub name: String,
+    pub size: u64,
+    /// Native id of the folder on the target drive that receives it.
+    pub to_parent: String,
+}
+
+/// Everything a cross-drive job needs, persisted with the task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossRef {
+    pub from_provider: String,
+    pub to_provider: String,
+    pub to_pdir_fid: String,
+    /// `true` keeps the source file, `false` deletes it once the copy landed.
+    pub copy: bool,
+    /// Files not finished yet; finished ones are dropped as the job advances.
+    pub files: Vec<CrossFile>,
+}
+
+/// Parameters for starting a cross-drive move/copy.
+#[derive(Debug, Clone)]
+pub struct CrossJob {
+    pub files: Vec<CrossFile>,
+    pub to_pdir_fid: String,
+    pub copy: bool,
+    pub name: String,
 }
 
 impl TransferTask {
@@ -439,6 +478,7 @@ impl TransferManager {
             part_path: Some(part_path.to_string_lossy().to_string()),
             share: job.share.clone(),
             provider: job.provider.clone(),
+            cross: None,
         };
         let task = self.insert(task).await;
         task.emit(&app);
@@ -593,6 +633,7 @@ impl TransferManager {
                             size,
                             done.clone(),
                             token.clone(),
+                            0,
                         )
                         .await
                     }
@@ -710,6 +751,7 @@ impl TransferManager {
             part_path: None,
             share: None,
             provider: drive.id().as_str().to_string(),
+            cross: None,
         };
         let task = self.insert(task).await;
         task.emit(&app);
@@ -742,9 +784,6 @@ impl TransferManager {
                 Arc::new(AtomicU64::new(0)),
             );
 
-            // The drive hashes and uploads in whatever way it needs (rapid
-            // upload, chunks, presigned urls) and reports through the sink; the
-            // manager only translates `phase` into the task status.
             let sink = Arc::new(crate::providers::CounterSink::new(done.clone()));
             let sink_trait: Arc<dyn UploadSink> = sink.clone();
             let native_parent = crate::providers::native_of(&job.pdir_fid);
@@ -785,6 +824,314 @@ impl TransferManager {
         });
 
         Ok(task)
+    }
+
+    /// Re-runs the files still listed on a cross-drive task. Files that already
+    /// landed are not in `task.cross` any more, so nothing is copied twice.
+    pub async fn retry_cross(
+        self: &Arc<Self>,
+        app: AppHandle,
+        from: Arc<dyn DriveProvider>,
+        to: Arc<dyn DriveProvider>,
+        id: &str,
+    ) -> AppResult<TransferTask> {
+        let task = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .get(id)
+                .cloned()
+                .ok_or_else(|| AppError::new("任务不存在"))?
+        };
+        let Some(cross) = task.cross.clone() else {
+            return Err(AppError::new("该任务不是跨网盘传输"));
+        };
+        if cross.files.is_empty() {
+            return Err(AppError::new("这个任务的文件都已经传完了"));
+        }
+        let remaining: u64 = cross.files.iter().map(|f| f.size).sum();
+        self.patch(id, &app, |t| {
+            t.status = "queued".to_string();
+            t.error = None;
+            t.speed = 0.0;
+            t.transferred = t.size.saturating_sub(remaining);
+        })
+        .await;
+        let job = CrossJob {
+            files: cross.files.clone(),
+            to_pdir_fid: cross.to_pdir_fid.clone(),
+            copy: cross.copy,
+            name: task.name.clone(),
+        };
+        let temp_root = PathBuf::from(&task.local_path);
+        self.spawn_cross(app, from, to, id.to_string(), temp_root, job, task.size);
+        Ok(task)
+    }
+
+    /// Copies (or moves) files between two drives by streaming them through a
+    /// temporary folder: download from the source, upload to the target, then
+    /// delete the source when this is a move.
+    ///
+    /// Nothing about the drives is assumed beyond `open_download` and `upload`,
+    /// so this works for every pair without per-drive code. One task covers the
+    /// whole selection: progress is the sum of the files, and the files already
+    /// done are dropped from `task.cross` so a retry does not copy them twice.
+    pub async fn start_cross(
+        self: &Arc<Self>,
+        app: AppHandle,
+        from: Arc<dyn DriveProvider>,
+        to: Arc<dyn DriveProvider>,
+        temp_root: PathBuf,
+        job: CrossJob,
+        total: u64,
+    ) -> AppResult<TransferTask> {
+        if job.files.is_empty() {
+            return Err(AppError::new("没有可传输的文件"));
+        }
+        let id = self.next_id().await;
+        let cross = CrossRef {
+            from_provider: from.id().as_str().to_string(),
+            to_provider: to.id().as_str().to_string(),
+            to_pdir_fid: job.to_pdir_fid.clone(),
+            copy: job.copy,
+            files: job.files.clone(),
+        };
+        let task = TransferTask {
+            id: id.clone(),
+            kind: if job.copy { "copy" } else { "move" }.to_string(),
+            name: job.name.clone(),
+            fid: None,
+            local_path: temp_root.to_string_lossy().to_string(),
+            remote_dir_fid: Some(job.to_pdir_fid.clone()),
+            size: total,
+            transferred: 0,
+            speed: 0.0,
+            status: "queued".to_string(),
+            error: None,
+            created_at: now_millis(),
+            updated_at: now_millis(),
+            rapid: false,
+            part_path: None,
+            share: None,
+            provider: from.id().as_str().to_string(),
+            cross: Some(cross),
+        };
+        let task = self.insert(task).await;
+        task.emit(&app);
+        self.spawn_cross(app, from, to, id, temp_root, job, total);
+        Ok(task)
+    }
+
+    /// The shared tail of `start_cross` and `retry_cross`: registers the cancel
+    /// token and drives the files one by one on a background task.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_cross(
+        self: &Arc<Self>,
+        app: AppHandle,
+        from: Arc<dyn DriveProvider>,
+        to: Arc<dyn DriveProvider>,
+        id: String,
+        temp_root: PathBuf,
+        job: CrossJob,
+        total: u64,
+    ) {
+        let manager = Arc::clone(self);
+        let handle = app.clone();
+        tokio::spawn(async move {
+            let token = CancellationToken::new();
+            manager.cancels.lock().await.insert(id.clone(), token.clone());
+            let Some(_slot) = manager.acquire(&token).await else {
+                manager.cancels.lock().await.remove(&id);
+                return;
+            };
+            manager
+                .patch(&id, &handle, |t| {
+                    if t.status == "queued" {
+                        t.status = "running".to_string();
+                    }
+                })
+                .await;
+
+            let done = Arc::new(AtomicU64::new(0));
+            let ticker = spawn_ticker(
+                handle.clone(),
+                manager.clone(),
+                id.clone(),
+                done.clone(),
+                total,
+                Arc::new(AtomicU64::new(0)),
+            );
+
+            let mut base = 0u64;
+            let mut result: AppResult<()> = Ok(());
+            for file in job.files.iter() {
+                if token.is_cancelled() {
+                    result = Err(AppError::new("已取消"));
+                    break;
+                }
+                let attempt = run_cross_file(
+                    &from,
+                    &to,
+                    &temp_root,
+                    file,
+                    base,
+                    done.clone(),
+                    token.clone(),
+                )
+                .await;
+                match attempt {
+                    Ok(()) => {
+                        base += file.size;
+                        // The file is on the target now: dropping it from the
+                        // persisted list is what makes a retry resume.
+                        manager
+                            .patch(&id, &handle, |t| {
+                                if let Some(cross) = t.cross.as_mut() {
+                                    cross.files.retain(|f| f.fid != file.fid);
+                                }
+                            })
+                            .await;
+                        manager.persist().await;
+                    }
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                }
+            }
+
+            ticker.abort();
+            manager.cancels.lock().await.remove(&id);
+            let _ = tokio::fs::remove_dir_all(&temp_root).await;
+
+            match result {
+                Ok(()) => {
+                    manager
+                        .patch(&id, &handle, |t| {
+                            t.status = "done".to_string();
+                            t.transferred = t.size;
+                            t.speed = 0.0;
+                            t.error = None;
+                        })
+                        .await;
+                    // A move only becomes a move once every byte is on the
+                    // target: deleting as we go would lose files if the job
+                    // died halfway.
+                    if !job.copy {
+                        let natives: Vec<String> =
+                            job.files.iter().map(|f| f.fid.clone()).collect();
+                        if let Err(err) = from.delete(&natives).await {
+                            crate::ylog!("cross move: deleting source failed: {err}");
+                        }
+                    }
+                    let verb = if job.copy { "复制" } else { "移动" };
+                    crate::tray::notify(
+                        &handle,
+                        &format!("{verb}完成"),
+                        &format!("{} 已{verb}到{}", job.name, to.id().display_name()),
+                    );
+                }
+                Err(err) => {
+                    let canceled = token.is_cancelled();
+                    let msg = err.to_string();
+                    manager
+                        .patch(&id, &handle, move |t| {
+                            if t.status == "paused" || t.status == "canceled" {
+                                t.speed = 0.0;
+                                return;
+                            }
+                            t.status = if canceled { "canceled".into() } else { "failed".into() };
+                            t.error = if canceled { None } else { Some(msg) };
+                            t.speed = 0.0;
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// Test hook: runs a cross-drive batch without a Tauri app handle so the live
+/// probes can exercise the real streaming path end to end.
+#[cfg(test)]
+pub async fn run_cross_direct(
+    from: Arc<dyn DriveProvider>,
+    to: Arc<dyn DriveProvider>,
+    temp_root: PathBuf,
+    job: CrossJob,
+) -> AppResult<()> {
+    let done = Arc::new(AtomicU64::new(0));
+    let token = CancellationToken::new();
+    let mut base = 0u64;
+    for file in job.files.iter() {
+        run_cross_file(&from, &to, &temp_root, file, base, done.clone(), token.clone()).await?;
+        base += file.size;
+    }
+    if !job.copy {
+        let natives: Vec<String> = job.files.iter().map(|f| f.fid.clone()).collect();
+        from.delete(&natives).await?;
+    }
+    let _ = tokio::fs::remove_dir_all(&temp_root).await;
+    Ok(())
+}
+
+/// Streams one file from the source drive to the target drive.
+///
+/// The bytes land in a temp file first because every drive's uploader wants a
+/// local path; the file is removed as soon as it is up so a long selection does
+/// not pile up on disk. Progress is reported in the selection's coordinate
+/// system (`base` is the bytes of the files already finished).
+#[allow(clippy::too_many_arguments)]
+async fn run_cross_file(
+    from: &Arc<dyn DriveProvider>,
+    to: &Arc<dyn DriveProvider>,
+    temp_root: &Path,
+    file: &CrossFile,
+    base: u64,
+    done: Arc<AtomicU64>,
+    token: CancellationToken,
+) -> AppResult<()> {
+    tokio::fs::create_dir_all(temp_root).await?;
+    let name = crate::paths::safe_component(&file.name);
+    let temp = temp_root.join(&name);
+    let part = with_suffix(&temp, ".part");
+
+    run_provider_download(
+        from,
+        &file.fid,
+        &part,
+        &temp,
+        file.size,
+        Arc::clone(&done),
+        token.clone(),
+        base,
+    )
+    .await
+    .map_err(|err| AppError::new(format!("{}：{err}", file.name)))?;
+
+    let sink = Arc::new(OffsetSink {
+        base,
+        inner: Arc::clone(&done),
+    });
+    let uploaded = to
+        .upload(&temp, &file.to_parent, &file.name, sink, token.clone())
+        .await
+        .map_err(|err| AppError::new(format!("{}：{err}", file.name)));
+    let _ = tokio::fs::remove_file(&temp).await;
+    uploaded?;
+    Ok(())
+}
+
+/// Reports `base + bytes` to the task counter.
+struct OffsetSink {
+    base: u64,
+    inner: Arc<AtomicU64>,
+}
+
+impl UploadSink for OffsetSink {
+    fn phase(&self, _phase: &str) {}
+
+    fn progress(&self, bytes: u64) {
+        self.inner.store(self.base + bytes, Ordering::Relaxed);
     }
 }
 
@@ -919,6 +1266,7 @@ async fn run_provider_download(
     size: u64,
     done: Arc<AtomicU64>,
     token: CancellationToken,
+    base: u64,
 ) -> AppResult<()> {
     let mut start = 0u64;
     if let Ok(meta) = tokio::fs::metadata(part_path).await {
@@ -927,7 +1275,7 @@ async fn run_provider_download(
     if size > 0 && start == size && start > 0 {
         // The partial already holds the whole file — finish it.
         tokio::fs::rename(part_path, final_path).await?;
-        done.store(size, Ordering::Relaxed);
+        done.store(base + size, Ordering::Relaxed);
         return Ok(());
     }
     if size > 0 && start > size {
@@ -936,13 +1284,13 @@ async fn run_provider_download(
         // shrank upstream). Truncating to `size` would keep the wrong bytes.
         let _ = tokio::fs::remove_file(part_path).await;
         start = 0;
-        done.store(0, Ordering::Relaxed);
+        done.store(base, Ordering::Relaxed);
     }
 
     // The provider expects a native id; the qualified form is what the transfer
     // record carries, so strip it here.
     let native = crate::providers::native_of(fid);
-    done.store(start, Ordering::Relaxed);
+    done.store(base + start, Ordering::Relaxed);
 
     // A drive that refuses the Range means the byte offset cannot be trusted:
     // drop the partial and fetch the whole file rather than appending garbage.
@@ -958,14 +1306,14 @@ async fn run_provider_download(
         Err(err) if start > 0 && err.to_string() == RANGE_IGNORED => {
             let _ = tokio::fs::remove_file(part_path).await;
             start = 0;
-            done.store(0, Ordering::Relaxed);
+            done.store(base, Ordering::Relaxed);
             drive.open_download(&native, 0).await?
         }
         Err(err) => return Err(err),
     };
     let total = if size > 0 { size } else { reported };
 
-    write_stream(stream, part_path, start, total, done.clone(), &token).await?;
+    write_stream(stream, part_path, start, total, done.clone(), base, &token).await?;
 
     let written = tokio::fs::metadata(part_path).await.map(|m| m.len()).unwrap_or(0);
     if total > 0 && written != total {
@@ -983,17 +1331,19 @@ async fn run_provider_download(
         }
     }
     tokio::fs::rename(part_path, final_path).await?;
-    done.store(written, Ordering::Relaxed);
+    done.store(base + written, Ordering::Relaxed);
     Ok(())
 }
 
 /// Drains `stream` into `part_path`, appending at `start` and reporting progress.
+/// `base` shifts the reported counter so a batch of files can share one number.
 async fn write_stream(
     mut stream: BoxStream,
     part_path: &Path,
     start: u64,
     total: u64,
     done: Arc<AtomicU64>,
+    base: u64,
     token: &CancellationToken,
 ) -> AppResult<()> {
     use futures_util::StreamExt;
@@ -1018,7 +1368,7 @@ async fn write_stream(
             Some(Ok(bytes)) => {
                 file.write_all(&bytes).await?;
                 written += bytes.len() as u64;
-                done.store(written, Ordering::Relaxed);
+                done.store(base + written, Ordering::Relaxed);
             }
             Some(Err(err)) => return Err(err),
             None => break,
@@ -1169,6 +1519,7 @@ mod tests {
             part_path: part.map(|p| p.to_string()),
             share: None,
             provider: "quark".to_string(),
+            cross: None,
         }
     }
 
