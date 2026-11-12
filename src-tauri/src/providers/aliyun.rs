@@ -662,8 +662,17 @@ impl AliyunProvider {
             .await
             .map_err(|e| AppError::new(format!("读取响应失败：{e}")))?;
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            // 403 is what an expired/blocked bearer looks like on some gateways.
-            crate::ylog!("aliyun: POST {path} HTTP {status} → 登录已过期");
+            // 403 is not only an expired bearer: the API answers 403 for policy
+            // refusals too (`SharelinkCreateExceedDailyLimit` was reported to
+            // users as 「登录已过期」, which sent them off to scan the QR code
+            // again for nothing). Name the real reason when the body has one.
+            crate::ylog!(
+                "aliyun: POST {path} HTTP {status} body={}",
+                &text.chars().take(300).collect::<String>()
+            );
+            if let Some(message) = policy_refusal(&text) {
+                return Err(AppError::new(message));
+            }
             return Err(AppError::new("阿里云盘登录已过期，请重新扫码登录"));
         }
         if !status.is_success() {
@@ -920,6 +929,31 @@ fn is_stale_signature(message: &str) -> bool {
     message.contains("DeviceSessionSignatureInvalid")
         || message.contains("签名过期")
         || message.contains("DeviceSessionSignature")
+}
+
+/// Turns a 403 body that is a policy refusal (not an auth failure) into a
+/// message the user can act on.
+///
+/// 阿里 uses 403 for both, so treating every 403 as "expired" told users to
+/// re-scan a QR code that was perfectly valid.
+fn policy_refusal(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    let code = value.get("code").and_then(|v| v.as_str())?;
+    let message = value
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    match code {
+        "SharelinkCreateExceedDailyLimit" => Some(
+            "阿里云盘今天的分享次数已用完，请明天再试".to_string(),
+        ),
+        "InvalidParameter.FileIdList" if message.contains("count limit") => Some(
+            "阿里云盘一个分享只能包含有限个文件，请减少选择后重试".to_string(),
+        ),
+        "TooManyRequests" => Some("阿里云盘请求过于频繁，请稍后重试".to_string()),
+        // Everything else on 403 really is an auth problem.
+        _ => None,
+    }
 }
 
 fn parse_rfc3339(raw: &str) -> u64 {

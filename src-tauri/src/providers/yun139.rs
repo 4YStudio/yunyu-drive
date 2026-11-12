@@ -31,7 +31,7 @@ use super::{
     PathNode, ProviderId, QuotaInfo, SearchHit, ShareFile, ShareLink, UploadSink, RANGE_IGNORED,
 };
 use crate::error::{AppError, AppResult};
-use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
+use crate::share::{AccountInfo, ShareCreated, ShareEntry, ShareListing, ShareRecord, ShareSession};
 
 /// Marker id for the root folder.
 const ROOT: &str = "0";
@@ -56,6 +56,10 @@ pub struct Yun139Provider {
     profile: RwLock<Option<AccountInfo>>,
     /// Set once a fetch ran, so a failure is not retried on every render.
     profile_tried: std::sync::atomic::AtomicBool,
+    /// Numeric `userDomainId` from `user/getUser`. The share endpoints refuse
+    /// every request without it (`200000401`), and `cloud139`'s config does not
+    /// carry it, so it is fetched alongside the profile and cached here.
+    domain_id: RwLock<Option<String>>,
 }
 
 impl Yun139Provider {
@@ -67,6 +71,7 @@ impl Yun139Provider {
             config_path,
             profile: RwLock::new(None),
             profile_tried: std::sync::atomic::AtomicBool::new(false),
+            domain_id: RwLock::new(None),
         }
     }
 
@@ -385,6 +390,34 @@ impl Yun139Provider {
         self.config().await.account
     }
 
+    /// `(name, fileId)` for every child of `dir`, for probes.
+    ///
+    /// The adapter addresses 139 by path, but the share API wants the opaque
+    /// `fileId`/`catalogID`, so a probe needs this to reach it at all.
+    #[cfg(test)]
+    pub async fn debug_children(&self, dir: &str) -> Vec<(String, String)> {
+        let config = self.config().await;
+        let path = self.path_of(dir).await;
+        let Ok(file_id) = resolve_file_id(&config, &path).await else {
+            return Vec::new();
+        };
+        match c139::list_personal_files(&config, &file_id).await {
+            Ok(items) => items
+                .into_iter()
+                .map(|i| {
+                    (
+                        i.name.unwrap_or_default(),
+                        i.file_id.unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            Err(err) => {
+                println!("list failed: {err}");
+                Vec::new()
+            }
+        }
+    }
+
     /// Nickname + avatar from `user-njs` (the host the web app's
     /// `getUserAvatar` calls).
     ///
@@ -434,6 +467,18 @@ impl Yun139Provider {
             .pointer("/data/userProfileInfo")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        // Same response carries the numeric domain id the share host insists on;
+        // stash it so `create_share` does not need a second round trip.
+        let domain = value
+            .pointer("/data/userDomainId")
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .filter(|v| !v.is_empty() && v != "null");
+        if let Some(domain) = domain {
+            *self.domain_id.write().await = Some(domain);
+        }
         // `auditNickName` is the nickname that passed review (the one the web app
         // and the phone show); `userName` is the masked phone number.
         let nickname = text_of(&info, "auditNickName");
@@ -457,6 +502,68 @@ impl Yun139Provider {
             return Err(AppError::new("139 资料接口没有返回昵称"));
         }
         Ok(AccountInfo { nickname, avatar })
+    }
+
+    /// The numeric `userDomainId` the share host requires.
+    ///
+    /// Every `share-kd-njs` call answers `200000401 IP鉴权失败、用户账号鉴权失败`
+    /// without it, and no header or `commonAccountInfo` substitute works: the
+    /// value belongs inside the request body as a plain number. It arrives with
+    /// the profile response, so this piggybacks on `fetch_profile`.
+    async fn user_domain_id(&self) -> AppResult<String> {
+        if let Some(cached) = self.domain_id.read().await.clone() {
+            return Ok(cached);
+        }
+        // A failed fetch leaves the cache empty; the caller gets the error and
+        // the next attempt retries, which is what we want after a re-login.
+        self.fetch_profile().await?;
+        self.domain_id
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| AppError::new("139 没有返回账号标识，请重新登录"))
+    }
+
+    /// Splits a selection into the opaque ids `getOutLink` wants.
+    ///
+    /// 139 keeps files and folders in separate lists (`coIDLst` / `caIDLst`),
+    /// and the ids are neither paths nor our encoded paths — they are the
+    /// server's own `fileId`, so each one is resolved from its parent listing.
+    async fn share_targets(&self, fids: &[String]) -> AppResult<(Vec<String>, Vec<String>)> {
+        let config = self.config().await;
+        let mut files = Vec::new();
+        let mut folders = Vec::new();
+        for fid in fids {
+            let path = self.path_of(fid).await;
+            let file_id = resolve_file_id(&config, &path).await?;
+            if file_id.is_empty() || file_id == "/" {
+                return Err(AppError::new("139 不能直接分享根目录"));
+            }
+            let name = title_of(&path);
+            let parent = match path.trim_end_matches('/').rsplit_once('/') {
+                Some((head, _)) if !head.is_empty() => head.to_string(),
+                _ => "/".to_string(),
+            };
+            let parent_id = resolve_file_id(&config, &parent).await?;
+            let parent_id = if parent_id.is_empty() { "/".to_string() } else { parent_id };
+            let items = c139::list_personal_files(&config, &parent_id)
+                .await
+                .map_err(map_err)?;
+            let is_dir = items
+                .iter()
+                .find(|item| item.name.as_deref() == Some(name.as_str()))
+                .map(|item| {
+                    matches!(item.file_type.as_deref(), Some("folder") | Some("dir"))
+                        || item.file_type.as_deref() == Some("1")
+                })
+                .unwrap_or(false);
+            if is_dir {
+                folders.push(file_id);
+            } else {
+                files.push(file_id);
+            }
+        }
+        Ok((files, folders))
     }
 
     /// `getOutLinkInfoV6` — the listing *and* the share metadata.
@@ -522,6 +629,23 @@ fn text_of(value: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+/// Last path segment, which is the file name for a 139 id.
+fn title_of(path: &str) -> String {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `ctTime`/`expireTime` are `%Y%m%d%H%M%S` local-time strings; an empty one
+/// means "never", which the UI renders as 永久.
+fn stamp(raw: &str) -> i64 {
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y%m%d%H%M%S")
+        .map(|dt| dt.and_utc().timestamp_millis())
+        .unwrap_or(0)
+}
+
 /// `udTime`/`ctTime` are `%Y%m%d%H%M%S` local-time strings.
 fn ud_time(item: &serde_json::Value) -> i64 {
     for key in ["udTime", "ctTime"] {
@@ -568,6 +692,10 @@ fn yun_headers(authorization: &str) -> reqwest::header::HeaderMap {
     put("hcy-cool-flag", "1");
     put("CMS-DEVICE", "default");
     put("x-m4c-caller", "PC");
+    // The share host wants this on every call. It is not a flag we control: the
+    // literal string `enabled` tells 139 to look the account up from the body's
+    // `userDomainId`, and omitting it fails with `200000401`.
+    put("x-yun-userDomainId", "enabled");
     put("X-Yun-Api-Version", "v1");
     put("Origin", "https://yun.139.com");
     put("Referer", "https://yun.139.com/");
@@ -610,10 +738,11 @@ impl DriveProvider for Yun139Provider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             share_open: true,
-            // Reading a share works (and 139 can save one into the drive), but
-            // no client-visible endpoint creates a share: every candidate path
-            // answers 「资源不存在」. See `docs/provider-login.md`.
-            share_create: false,
+            // `IOutLink/getOutLink` on the share host. It needs a header
+            // (`x-yun-userDomainId: enabled`) and a numeric `userDomainId` in the
+            // body; without either it answers `200000401`, which looks exactly
+            // like an expired login. See `docs/provider-login.md`.
+            share_create: true,
             move_files: true,
             copy: true,
             search: true,
@@ -1365,6 +1494,142 @@ impl DriveProvider for Yun139Provider {
             size: 0,
             cleanup_fid: None,
         })
+    }
+
+    /// `getOutLink` — 139's create-a-share call.
+    ///
+    /// Three things are load-bearing and none are discoverable from the
+    /// response: the `x-yun-userDomainId: enabled` header, a numeric
+    /// `userDomainId` inside the request body, and splitting the selection into
+    /// `coIDLst` (files) and `caIDLst` (folders) by opaque id. Missing any one
+    /// answers `200000401`, which reads like an expired login.
+    async fn create_share(
+        &self,
+        fids: &[String],
+        title: &str,
+        days: u32,
+        passcode: &str,
+    ) -> AppResult<ShareCreated> {
+        if fids.is_empty() {
+            return Err(AppError::new("请先选择要分享的内容"));
+        }
+        let (files, folders) = self.share_targets(fids).await?;
+        if files.len() + folders.len() > 50 {
+            return Err(AppError::new("139 单次分享最多 50 个文件或文件夹"));
+        }
+        let domain = self.user_domain_id().await?;
+        // `encrypt: 1` makes the service mint a 4-character passcode; `0`
+        // publishes the link without one. 139 has no way to set our own code.
+        let encrypted = passcode.chars().count() == 4;
+        let name = if title.is_empty() {
+            title_of(&self.path_of(&fids[0]).await)
+        } else {
+            title.to_string()
+        };
+        let mut req = serde_json::json!({
+            "linkType": 0,
+            "subLinkType": 0,
+            "encrypt": if encrypted { 1 } else { 0 },
+            "coIDLst": { "item": files },
+            "caIDLst": { "item": folders },
+            "pubType": 1,
+            "dedicatedName": name,
+            "periodUnit": 1,
+            "viewerLst": {},
+            "userDomainId": domain,
+            "extInfo": { "isWatermark": 0, "shareChannel": "3001" },
+        });
+        // Omitting `period` is how 139 says "never expires"; `0` is rejected.
+        if days > 0 {
+            req["period"] = serde_json::json!(days);
+        }
+        let value = self
+            .share_post("/IOutLink/getOutLink", &serde_json::json!({ "getOutLinkReq": req }))
+            .await?;
+        let first = value
+            .pointer("/getOutLinkResSet/0")
+            .cloned()
+            .ok_or_else(|| AppError::new("139 没有返回分享链接，请稍后重试"))?;
+        let url = text_of(&first, "linkUrl");
+        if url.is_empty() {
+            return Err(AppError::new("139 没有返回分享链接，请稍后重试"));
+        }
+        let expired_at = if days == 0 {
+            0
+        } else {
+            chrono::Local::now().timestamp_millis() + i64::from(days) * 86_400_000
+        };
+        Ok(ShareCreated {
+            url,
+            passcode: text_of(&first, "passwd"),
+            expired_at,
+            share_id: text_of(&first, "linkID"),
+        })
+    }
+
+    /// `getOutLinkLst` — the shares this account owns.
+    async fn share_records(&self) -> AppResult<Vec<ShareRecord>> {
+        let domain = self.user_domain_id().await?;
+        let body = serde_json::json!({
+            "getOutLinkLstReq": {
+                "needSetAccount": true,
+                "srt": 1,
+                "srtDr": 0,
+                "bNum": 1,
+                "eNum": 200,
+                "qryType": 1,
+                "userDomainId": domain,
+            }
+        });
+        let value = self.share_post("/IOutLink/getOutLinkLst", &body).await?;
+        let rows = value
+            .get("outLinks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let now = chrono::Utc::now().timestamp_millis();
+        Ok(rows
+            .iter()
+            .map(|row| {
+                // `expireTime` is empty for a share that never expires.
+                let expired_at = stamp(&text_of(row, "expireTime"));
+                ShareRecord {
+                    share_id: text_of(row, "linkID"),
+                    url: text_of(row, "url"),
+                    title: text_of(row, "lkName"),
+                    passcode: text_of(row, "passwd"),
+                    expired_at,
+                    created_at: stamp(&text_of(row, "ctTime")),
+                    // The list reports a size for single files only, and no
+                    // count at all, so 1 is the honest number here.
+                    file_num: 1,
+                    size: row.get("tolSize").and_then(|v| v.as_i64()).unwrap_or(0),
+                    visit_count: row.get("brwTimes").and_then(|v| v.as_i64()).unwrap_or(0),
+                    save_count: row.get("svTimes").and_then(|v| v.as_i64()).unwrap_or(0),
+                    download_count: row.get("dlTimes").and_then(|v| v.as_i64()).unwrap_or(0),
+                    expired: row.get("isOutLinkInvalid").and_then(|v| v.as_i64()) == Some(1)
+                        || (expired_at > 0 && expired_at < now),
+                    fids: Vec::new(),
+                }
+            })
+            .collect())
+    }
+
+    /// `delOutLink` — revoking goes by `linkID`; the file ids are not needed.
+    async fn revoke_share(&self, share_id: &str, _fids: &[String]) -> AppResult<()> {
+        if share_id.is_empty() {
+            return Err(AppError::new("缺少分享 ID"));
+        }
+        let domain = self.user_domain_id().await?;
+        // `linkIDs` must be `{"item": [...]}`; a plain array answers
+        // `9530 功能参数值非法`.
+        let body = serde_json::json!({
+            "delOutLinkReq": {
+                "linkIDs": { "item": [share_id] },
+                "userDomainId": domain,
+            }
+        });
+        self.share_post("/IOutLink/delOutLink", &body).await.map(|_| ())
     }
 }
 

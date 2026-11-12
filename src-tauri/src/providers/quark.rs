@@ -887,17 +887,28 @@ impl DriveProvider for QuarkProvider {
         )
         .await?;
         let data = envelope(value)?;
-        let share_id = data
+        let mut share_id = data
             .pointer("/task_resp/data/share_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
         if share_id.is_empty() {
-            // Async shares report a task instead; poll it like a save task.
-            if let Some(task) = data.get("task_id").and_then(|v| v.as_str()) {
-                poll_task(&self.cookie, task).await?;
+            // A folder (or any big selection) comes back as a task with
+            // `task_sync: false` and no `task_resp` at all. The share already
+            // exists by then, so poll the task and read the id from it —
+            // reporting "no share id" here left a live share behind that the
+            // user could see on the site but not in the app.
+            let task = text(&data, "task_id");
+            if task.is_empty() {
+                return Err(AppError::new("夸克网盘没有返回分享任务，请稍后重试"));
             }
-            return Err(AppError::new("夸克网盘没有返回分享 ID，请稍后重试"));
+            let done = poll_task(&self.cookie, &task).await?;
+            share_id = text(&done, "share_id");
+            if share_id.is_empty() {
+                return Err(AppError::new(
+                    "夸克网盘已创建分享，但没有返回分享 ID；请到「我的分享」里查看",
+                ));
+            }
         }
         // The share id is 32 hex; the public link needs the shorter pwd_id that
         // only `/share/password` hands out.
@@ -1124,8 +1135,11 @@ fn entries_of(data: &Value) -> Vec<ShareEntry> {
         .unwrap_or_default()
 }
 
-/// Polls a share-save task until it reports success.
-async fn poll_task(cookie: &str, task_id: &str) -> AppResult<()> {
+/// Polls a share-save (or share-create) task until it reports success.
+///
+/// Returns the finished task payload: a create task carries the `share_id`
+/// the caller needs, and a save task carries nothing useful.
+async fn poll_task(cookie: &str, task_id: &str) -> AppResult<Value> {
     for _ in 0..80 {
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         let url = format!(
@@ -1138,7 +1152,7 @@ async fn poll_task(cookie: &str, task_id: &str) -> AppResult<()> {
             continue;
         };
         match data.get("status").and_then(|v| v.as_i64()) {
-            Some(2) => return Ok(()),
+            Some(2) => return Ok(data),
             Some(3) => {
                 let message = text(&data, "message");
                 return Err(AppError::new(if message.is_empty() {
@@ -1150,7 +1164,7 @@ async fn poll_task(cookie: &str, task_id: &str) -> AppResult<()> {
             _ => {}
         }
     }
-    Err(AppError::new("转存超时，请稍后在「我的文件」中查看"))
+    Err(AppError::new("任务超时，请稍后在「我的文件」中查看"))
 }
 
 /// Hashes a file, reporting bytes hashed through `sink`.

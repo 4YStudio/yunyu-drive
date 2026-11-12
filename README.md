@@ -91,7 +91,7 @@
   各盘限制见下面「创建分享的实现差异」。
 - **我的分享**：侧栏「我的分享」列出当前网盘里已经创建的分享——标题、链接、提取码、
   到期时间、浏览 / 转存 / 下载次数，可以复制链接或直接取消；已过期的收在折叠区里。
-  四个能建分享的网盘都能列，139 没有接口所以连入口都不显示。
+  五个网盘都能列。
 - **登录凭据只存本地**：`~/.config/yunyu-drive/`（0600）。
 
 ## 文档
@@ -209,7 +209,7 @@ src-tauri/src/
 | 123 云盘 | `POST /b/api/share/create` | `/b/api/share/delete` | `fileIdList` 是逗号分隔字符串，`expiration` 必填且带时区 |
 | 阿里云盘 | `POST /adrive/v2/share_link/create` | `adrive/v4/batch` 的 `/share_link/cancel` | 每日创建次数有上限（`SharelinkCreateExceedDailyLimit`） |
 | 百度网盘 | `POST /share/set`（`schannel=4`） | `/share/cancel` | **必须有 4 位提取码**，没填就随机生成 |
-| 中国移动云盘 | 不支持 | — | 网页端没有任何「创建分享」的接口，候选路径全部回「资源不存在」 |
+| 中国移动云盘 | `POST /richlifeApp/devapp/IOutLink/getOutLink`（share 主机） | 同主机的 `IOutLink/delOutLink` | 提取码由服务端生成，不能自定义；有效期只有永久 / 1 / 7 / 30 天 |
 
 对应的列表接口（`share_records`，供「我的分享」页用）：
 
@@ -219,6 +219,7 @@ src-tauri/src/
 | 123 云盘 | `GET /b/api/share/list` | `ShareName`（自己建的时候填的） | `SharePwd`（只有这里会回显） |
 | 阿里云盘 | `POST /adrive/v3/share_link/list`（**要设备签名，裸 token 回 403**） | `share_name` | `share_pwd` |
 | 百度网盘 | `GET /share/record` | `typicalPath` 的最后一段（`name` 恒为 `"0"`） | **恒空** |
+| 中国移动云盘 | `POST /IOutLink/getOutLinkLst`（share 主机） | `lkName` | `passwd` |
 
 - 夸克和 123 把「永久」记成 `4102416000000` / `9999-12-31T23:59:59+08:00`，
   归一化时按 2100 年截断回 0，否则界面会显示「9999 年到期」。
@@ -233,6 +234,12 @@ src-tauri/src/
   取消只能用 `adrive/v4/batch` 的 `/share_link/cancel`，`/share_link/delete` 是 404。
 - 百度 `path_list` 是 **JSON 数组字符串**且必须是绝对路径，`pwd` 为空会回
   `pwd length param error`，`schannel=0`（无密码）直接回「账号异常，禁止分享」。
+- 139 的分享接口在 **`share-kd-njs.yun.139.com/yun-share`**，不在 `personal-kd-njs`
+  上（后者整体 503）。三个端点都要 `x-yun-userDomainId: enabled` 请求头 **且**
+  请求体里带数字 `userDomainId`（从 `user-njs` 的 `user/getUser` 取）——少任何一个都回
+  `200000401 IP鉴权失败、用户账号鉴权失败`，看起来和「登录过期」一模一样。
+  文件进 `coIDLst.item`、文件夹进 `caIDLst.item`，两者都是服务端自己的 `fileId`；
+  `delOutLink` 的 `linkIDs` 必须是 `{"item": [...]}` 而不是数组。
 
 ### 分享链接的实现差异
 

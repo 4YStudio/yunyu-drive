@@ -766,6 +766,15 @@ const shareDialog = ref<null | {
 /** 百度 rejects an empty code, so it is the one drive that cannot go open. */
 const shareNeedsCode = computed(() => app.activeProvider === "baidu");
 
+/** 139 accepts the field but mints its own code; the value typed here is not used. */
+const shareCodeAuto = computed(() => app.activeProvider === "yun139");
+
+const shareCodeHint = computed(() => {
+  if (shareNeedsCode.value) return `${driveName.value}必须设置 4 位提取码`;
+  if (shareCodeAuto.value) return "填 4 位则由 139 生成提取码（不能自定义），留空则无提取码";
+  return "留空则生成不需要提取码的链接";
+});
+
 const shareDays = computed(() => Number(shareDialog.value?.days ?? 7));
 
 function openShare() {
@@ -1491,11 +1500,7 @@ defineExpose({ refresh });
               maxlength="4"
               :placeholder="shareNeedsCode ? '必填，4 位' : '留空则不需要提取码'"
             />
-            <span class="field-hint">
-              {{ shareNeedsCode
-                ? `${driveName}必须设置 4 位提取码`
-                : "留空则生成不需要提取码的链接" }}
-            </span>
+            <span class="field-hint">{{ shareCodeHint }}</span>
           </label>
           <p class="share-note">
             创建的分享会出现在网盘自己的分享列表里，也可以在这里随时取消。

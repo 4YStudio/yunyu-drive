@@ -325,8 +325,7 @@ function mockStates(): ProviderAuthState[] {
       avatar: loggedIn.has(provider) && provider !== "pan123" ? AVATAR : null,
       capabilities: {
         shareOpen: true,
-        // 139 is the only drive with no create-share endpoint.
-        shareCreate: provider !== "yun139",
+        shareCreate: true,
         // 123 can move (`mod_pid`); its copy goes through copy/async + a move.
         move: true,
         copy: provider !== "pan123",
