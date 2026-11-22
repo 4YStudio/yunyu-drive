@@ -1,10 +1,15 @@
 [package]
 name = "yunyu-drive"
-version = "0.1.0"
+# 版本号故意不写在这里。唯一来源是仓库根目录的 package.json：
+#   - 打包产物（deb/rpm/NSIS/dmg）的版本来自 tauri.conf.json 的
+#     `"version": "../package.json"`；
+#   - Rust 代码里的版本来自 build.rs 注入的 env!("YUNYU_VERSION")。
+# Cargo 允许省略 version（缺省 0.0.0），因此升版本不需要动这个文件，
+# 也就不会牵动 Cargo.lock。
 description = "云语聚合网盘 —— 夸克 / 移动云盘 / 阿里云盘 / 123 云盘 / 百度网盘 聚合客户端"
 license = "GPL-3.0-or-later"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 
 [lib]
 name = "yunyu_drive_lib"
@@ -16,6 +21,8 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# build.rs 要读 package.json 取版本号，再以 rustc-env 注入。
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
@@ -31,14 +38,15 @@ md-5 = "0.10"
 sha1 = "0.10"
 directories = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-libquarkpan = { path = "../../quark-cli/libquarkpan", default-features = false, features = ["rustls"] }
+libquarkpan = { path = "../vendor/libquarkpan", default-features = false, features = ["rustls"] }
 tauri-plugin-single-instance = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "query", "cookies", "form", "multipart"] }
 base64 = "0.22"
 tauri-plugin-notification = "2"
 async-trait = "0.1"
 # 中国移动云盘 (139): MIT-licensed Rust client, used as a library.
-cloud139 = { path = "../../cloud139" }
+# 两个依赖都 vendored 进本仓库（见 vendor/README.md），以便在 CI 中独立构建。
+cloud139 = { path = "../vendor/cloud139" }
 # Hex encoding for the 139 token / 123 云盘 signatures.
 toml = "0.9"
 hex = "0.4"

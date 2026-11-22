@@ -47,24 +47,28 @@ impl Default for Settings {
 }
 
 fn default_download_dir() -> String {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
     // `xdg-user-dir` honours localised folder names (e.g. ~/下载 on zh_CN),
     // so ask it first and only then fall back to the conventional names.
+    // Linux only: the binary does not exist on Windows / macOS.
+    #[cfg(target_os = "linux")]
     if let Ok(out) = std::process::Command::new("xdg-user-dir").arg("DOWNLOAD").output() {
         if out.status.success() {
+            let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
             let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if dir != home.to_string_lossy() && Path::new(&dir).is_dir() {
                 return dir;
             }
         }
     }
-    for name in ["Downloads", "下载", "Téléchargements", "Загрузки"] {
-        let candidate = home.join(name);
-        if candidate.is_dir() {
-            return candidate.to_string_lossy().to_string();
+    // Windows / macOS (and the Linux fallback): let the `directories` crate
+    // resolve the OS-specific known folder, so we do not depend on $HOME.
+    if let Some(dirs) = directories::UserDirs::new() {
+        if let Some(downloads) = dirs.download_dir() {
+            return downloads.to_string_lossy().to_string();
         }
+        return dirs.home_dir().to_string_lossy().to_string();
     }
-    home.to_string_lossy().to_string()
+    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -143,13 +147,16 @@ pub fn clear_cookie(paths: &AppPaths) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 /// Same as the internal helper, exposed for adapters that write their own
 /// credential files (139's token, 123 云盘's session).
+///
+/// No-op on Windows: `chmod` does not exist there, and the per-user profile
+/// directory (`%APPDATA%`) is already ACL-restricted to that user.
 pub fn restrict_permissions_pub(path: &Path) {
     restrict_permissions(path)
 }
 
+#[cfg(unix)]
 fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));

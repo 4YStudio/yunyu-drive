@@ -67,8 +67,20 @@ function providerName(task: TransferTask): string {
 }
 
 function percent(task: TransferTask) {
+  // While the file is being read (hashing) the upload itself has not moved any
+  // bytes yet, so `transferred` is still 0 and the bar used to sit at full with
+  // an indeterminate shimmer. Show what has actually been read instead.
+  const prepared = task.prepared ?? 0;
+  if (task.status === "hashing" && prepared > 0 && task.size > 0) {
+    return Math.min(100, Math.round((prepared / task.size) * 100));
+  }
   if (!task.size) return task.status === "done" ? 100 : 0;
   return Math.min(100, Math.round((task.transferred / task.size) * 100));
+}
+
+/** Bytes read so far while the file is still being prepared. */
+function preparedSize(task: TransferTask) {
+  return task.status === "hashing" ? (task.prepared ?? 0) : 0;
 }
 
 function statusLabel(task: TransferTask) {
@@ -78,7 +90,10 @@ function statusLabel(task: TransferTask) {
     case "paused":
       return "已暂停";
     case "hashing":
-      return "校验中";
+      // Baidu hashes the whole file before the first byte goes up, which can
+      // take as long as the upload itself on a big file. "校验中" made that
+      // look like the transfer was stuck checking integrity.
+      return task.kind === "download" ? "校验中" : "预处理中";
     case "running":
       if (isCross(task)) return task.kind === "copy" ? "复制中" : "移动中";
       return task.kind === "download" ? "下载中" : "上传中";
@@ -231,13 +246,16 @@ onActivated(() => {
             <div class="task-bar">
               <div
                 class="task-bar-fill"
-                :class="{ 'task-bar-fill--indeterminate': task.status === 'hashing' }"
-                :style="{ width: task.status === 'hashing' ? '100%' : `${percent(task)}%` }"
+                :class="{ 'task-bar-fill--prep': task.status === 'hashing' }"
+                :style="{ width: `${percent(task)}%` }"
               />
             </div>
 
             <div class="task-meta">
-              <span class="mono">{{ formatSize(task.transferred) }} / {{ formatSize(task.size) }}</span>
+              <span class="mono">
+                {{ formatSize(task.transferred + preparedSize(task)) }} /
+                {{ formatSize(task.size) }}
+              </span>
               <template v-if="task.status === 'running' || task.status === 'paused'">
                 <span class="dot">·</span>
                 <template v-if="task.status === 'running'">
@@ -432,25 +450,11 @@ onActivated(() => {
   background: var(--fill);
   transition: width var(--dur-3) var(--ease-out);
 }
-.task-bar-fill--indeterminate {
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    var(--fill) 40%,
-    var(--fill) 60%,
-    transparent 100%
-  );
-  background-size: 40% 100%;
-  background-repeat: no-repeat;
-  animation: indeterminate 1.4s var(--ease-in-out) infinite;
-}
-@keyframes indeterminate {
-  from {
-    background-position: -45% 0;
-  }
-  to {
-    background-position: 145% 0;
-  }
+/* Reading the file (hashing) is a separate stage: the bar refills from 0 once
+   bytes really go up, so the dimmer fill makes that restart read as a new phase
+   instead of a glitch. */
+.task-bar-fill--prep {
+  opacity: 0.55;
 }
 .task-meta {
   display: flex;

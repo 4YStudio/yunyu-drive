@@ -1175,7 +1175,7 @@ pub fn quit_app(app: AppHandle) {
 pub async fn app_info(state: State<'_, Arc<AppState>>) -> AppResult<AppInfo> {
     let settings = state.settings().await;
     Ok(AppInfo {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::version::VERSION.to_string(),
         config_dir: state.paths.config_dir.to_string_lossy().to_string(),
         cookie_path: state.paths.cookie_file().to_string_lossy().to_string(),
         download_dir: settings.download_dir,

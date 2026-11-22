@@ -1,8 +1,9 @@
 # 云语聚合网盘 (Yunyu Drive)
 
-一个 Linux 桌面客户端，把 **夸克网盘 / 中国移动云盘 / 阿里云盘 / 123 云盘 / 百度网盘** 装进同一个窗口：
+一个把 **夸克网盘 / 中国移动云盘 / 阿里云盘 / 123 云盘 / 百度网盘** 装进同一个窗口的桌面客户端：
 一套文件浏览、一套上传下载队列、一套传输列表。使用 **Tauri 2 + Vue 3** 构建，
-面向 Debian 13 / KDE 6 / Wayland 调优。
+可打包为 Linux（deb / rpm）、Windows（NSIS exe）与 macOS（universal dmg），
+主开发环境是 Debian 13 / KDE 6 / Wayland。
 
 仓库目录名、包名、可执行文件名统一为 `yunyu-drive`（deb 包名 `Yunyu Drive_<版本>_<架构>.deb`，
 因为 deb 的 `Package` 字段只允许 ASCII，显示名「云语聚合网盘」在桌面模板里）。
@@ -26,8 +27,8 @@
 
 | 网盘 | 登录方式 | 后端 | 说明 |
 | --- | --- | --- | --- |
-| 夸克网盘 | 内置网页登录抓 Cookie / 粘贴 Cookie | [libquarkpan](../quark-cli)（GPL-3.0） | 功能最全：分享链接、转存、秒传 |
-| 中国移动云盘 | 内置网页登录抓 Cookie / 粘贴 token | [cloud139](../cloud139)（MIT） | 路径寻址，内部用 base64 路径 id；上传自建四步协议以支持校验进度；不支持创建分享 |
+| 夸克网盘 | 内置网页登录抓 Cookie / 粘贴 Cookie | [libquarkpan](vendor/libquarkpan)（GPL-3.0-only） | 功能最全：分享链接、转存、秒传 |
+| 中国移动云盘 | 内置网页登录抓 Cookie / 粘贴 token | [cloud139](vendor/cloud139)（MIT） | 路径寻址，内部用 base64 路径 id；上传自建四步协议以支持校验进度；不支持创建分享 |
 | 阿里云盘 | 扫码登录 / 粘贴 refresh_token | 自实现，网页版 `api.aliyundrive.com` | 需要 ECDSA 设备签名，见下 |
 | 123 云盘 | 账号 + 密码 | 自实现，安卓协议移植 | 移动走 `mod_pid`；复制走 `copy/async`（原地复制再移动，见下） |
 | 百度网盘 | 内置网页登录抓 Cookie / 粘贴 Cookie | 自实现，网页版 `pan.baidu.com/api` | 走网页会话（`BDUSS` + `PANPSC` 等整包 cookie + `bdstoken`），不需要开发者 app_key |
@@ -101,11 +102,19 @@
 
 ## 构建
 
-依赖：Rust 1.8x、Node 20+、`libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`libsoup-3.0-dev`。
+依赖：Rust 1.88+、Node 20+、`libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`libsoup-3.0-dev`。
 
 ```bash
 pnpm install                # 仓库只留 pnpm-lock.yaml（npm 也能装，但没有锁文件）
-pnpm tauri build            # 产物：src-tauri/target/release/bundle/deb/*.deb
+pnpm build:linux            # deb + rpm：src-tauri/target/release/bundle/{deb,rpm}/*
+pnpm tauri build            # 按 tauri.conf.json 里的 targets 打（当前是 deb + rpm）
+```
+
+其它平台的打包命令只在对应系统上有效（Tauri 不支持交叉编译）：
+
+```bash
+pnpm build:windows          # Windows：NSIS 安装器 .exe
+pnpm build:mac              # macOS：通用二进制（Intel + Apple Silicon）.dmg
 ```
 
 开发模式下 `pnpm dev` 起 Vite（5183），`pnpm tauri dev` 起桌面窗口。
@@ -114,6 +123,40 @@ pnpm tauri build            # 产物：src-tauri/target/release/bundle/deb/*.deb
 
 `.gitignore` 已覆盖 `node_modules/`、`dist/`、`src-tauri/target/`（后者单打独斗就 20+ GB）、
 `src-tauri/gen/schemas/`（tauri-build 每次重写）与各类包产物，可以直接 `git init`。
+
+### 自动发布三平台安装包
+
+`.github/workflows/release.yml` 会在以下两种情况打包：
+
+| 触发 | 行为 |
+| --- | --- |
+| 推 `v*` 标签（`git tag v0.2.0 && git push origin v0.2.0`） | 三平台构建 → 发 GitHub Release 并上传安装包 |
+| Actions 页面手动 Run workflow | 默认只构建；填版本号 + 勾选 `publish` 才会发 Release |
+
+产物：Linux `deb` + `rpm`、Windows `NSIS .exe`、macOS `universal .dmg`。
+日常 push 不会触发。发版前先改版本号：
+
+```bash
+pnpm version:set 0.2.0      # 只改 package.json 一处
+```
+
+### 版本号只写在一个地方
+
+唯一真源是 `package.json` 的 `version`，其余全部自动跟随：
+
+| 用途 | 怎么拿到版本 |
+| --- | --- |
+| 安装包文件名与元数据（deb / rpm / NSIS / dmg） | `src-tauri/tauri.conf.json` 写的是 `"version": "../package.json"` |
+| 应用内「关于」页、启动日志、夸克网页桥接 | `src-tauri/build.rs` 注入 `YUNYU_VERSION`，代码里读 `crate::version::VERSION` |
+| `src-tauri/Cargo.toml` | 故意不写 `version`（缺省 0.0.0），所以升版本不会牵动 `Cargo.lock` |
+
+所以发版只需要 `pnpm version:set 0.2.0`，再 `git tag v0.2.0 && git push origin v0.2.0`。
+注意**不要**用 `env!("CARGO_PKG_VERSION")` 取版本，那样会得到 `0.0.0`。
+
+macOS 包默认用 ad-hoc 签名（`APPLE_SIGNING_IDENTITY=-`），未公证，
+首次打开需右键 →「打开」。要正式分发，在仓库 Secrets 里配
+`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、
+`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`，并删掉 workflow 里那一步。
 
 ### 使用 mock 后端预览界面
 
@@ -129,7 +172,7 @@ VITE_MOCK=1 pnpm dev        # http://localhost:5183/?view=files&theme=dark
 
 ## 系统集成
 
-`.deb` 安装后注册 `x-scheme-handler/yunyu-drive`，因此以下两种方式都会唤起客户端：
+`.deb` / `.rpm` 安装后注册 `x-scheme-handler/yunyu-drive`，因此以下两种方式都会唤起客户端：
 
 ```bash
 xdg-open "yunyu-drive://share?url=https%3A%2F%2Fpan.quark.cn%2Fs%2Faf886c338574%3Fpwd%3D6M1m"
@@ -140,17 +183,22 @@ yunyu-drive "yunyu-drive://share?url=..."
 
 ```
 yunyu-drive/             ← 本仓库（前端 + Tauri 壳）
+  .github/workflows/      release.yml：tag / 手动触发的三平台打包
   .gitignore             前端 / Rust / 包产物
   pnpm-lock.yaml         唯一锁文件（pnpm 12）
   pnpm-workspace.yaml    allowBuilds: esbuild
+  scripts/               tauri.mjs（CLI 包装）、set-version.mjs（改 package.json 里的版本号）
   src/                   前端（见下）
   src-tauri/             Rust 侧与打包配置
+  vendor/                依赖的两个 crate（见 vendor/README.md）
   docs/                  截图与排查笔记
 ```
 
-`src-tauri/Cargo.toml` 用相对路径链接了同级的两个本地 crate：
-`../../quark-cli/libquarkpan`（夸克，GPL-3.0）与 `../../cloud139`（中国移动云盘，MIT）。
-如果要把仓库单独拷走，记得一并带上这两个目录，或把它们改成 git 依赖。
+`src-tauri/Cargo.toml` 依赖的 `libquarkpan`（夸克，GPL-3.0-only）与
+`cloud139`（中国移动云盘，MIT）以源码形式放在本仓库的 `vendor/` 下，
+因此单独拷走本仓库就能编译，不再需要同级的 `../quark-cli` 与 `../cloud139`。
+两个 crate 里带有本地补丁（`copy_to`/`move_to`、大文件下载超时、139 目录分页），
+来源与改动明细见 [vendor/README.md](vendor/README.md)。
 
 ```
 src/

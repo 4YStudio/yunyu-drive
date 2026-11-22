@@ -980,11 +980,26 @@ fn random_device_id() -> String {
 }
 
 fn hostname() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
+    // Linux keeps the host name in a file; Windows and macOS expose it through
+    // the environment instead. The value only labels the login device on
+    // 阿里云盘, so any non-empty fallback is fine.
+    #[cfg(target_os = "linux")]
+    if let Some(name) = std::fs::read_to_string("/etc/hostname")
         .ok()
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "Linux".to_string())
+    {
+        return name;
+    }
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Some(name) = std::env::var_os(key) {
+            let name = name.to_string_lossy().trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    "Desktop".to_string()
 }
 
 /// Maps the app's root id onto 阿里云盘's, leaving real ids alone.

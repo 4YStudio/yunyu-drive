@@ -120,6 +120,12 @@ export interface TransferTask {
   remoteDirFid: string | null;
   size: number;
   transferred: number;
+  /**
+   * Bytes the drive has read while preparing the upload (hashing, slice list,
+   * precreate). Non-zero only while `status === "hashing"`; the upload itself
+   * reports through `transferred`.
+   */
+  prepared?: number;
   speed: number;
   status:
     | "queued"

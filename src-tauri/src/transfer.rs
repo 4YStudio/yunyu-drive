@@ -36,6 +36,13 @@ pub struct TransferTask {
     pub created_at: i64,
     pub updated_at: i64,
     pub rapid: bool,
+    /// Bytes the provider has read while preparing the upload (hashing the file,
+    /// building the slice list, precreating the remote entry). Non-zero only
+    /// while `status == "hashing"`; the upload itself reports through
+    /// `transferred`. Lets the list show real progress instead of a bar stuck at
+    /// full while Baidu hashes a large file.
+    #[serde(default)]
+    pub prepared: u64,
     /// Partial file a download writes into. Kept across a failure so the next
     /// attempt resumes with a Range request instead of starting over, and
     /// removed together with the task so no orphaned `.part` is left behind.
@@ -503,6 +510,7 @@ impl TransferManager {
             created_at: now_millis(),
             updated_at: now_millis(),
             rapid: false,
+            prepared: 0,
             part_path: Some(part_path.to_string_lossy().to_string()),
             share: job.share.clone(),
             provider: job.provider.clone(),
@@ -607,6 +615,7 @@ impl TransferManager {
                 done.clone(),
                 size,
                 epoch.clone(),
+                None,
             );
 
             // A dropped connection or a stalled CDN endpoint is normal on a long
@@ -776,6 +785,7 @@ impl TransferManager {
             created_at: now_millis(),
             updated_at: now_millis(),
             rapid: false,
+            prepared: 0,
             part_path: None,
             share: None,
             provider: drive.id().as_str().to_string(),
@@ -803,6 +813,7 @@ impl TransferManager {
                 .await;
 
             let done = Arc::new(AtomicU64::new(0));
+            let sink = Arc::new(crate::providers::CounterSink::new(done.clone()));
             let ticker = spawn_ticker(
                 handle.clone(),
                 manager.clone(),
@@ -810,19 +821,55 @@ impl TransferManager {
                 done.clone(),
                 meta.len(),
                 Arc::new(AtomicU64::new(0)),
+                Some(sink.prepared_counter()),
             );
 
-            let sink = Arc::new(crate::providers::CounterSink::new(done.clone()));
             let sink_trait: Arc<dyn UploadSink> = Arc::new(ThrottledSink {
                 inner: sink.clone(),
                 started: Instant::now(),
             });
+            // Providers report `"uploading"` once the local file is prepared and
+            // bytes start moving. Without this the task stayed on `"hashing"`
+            // for the whole transfer, so the list said 校验中 while the file was
+            // already going up. The phase itself is left alone: `rapid` below
+            // still needs to tell a 秒传 from a real upload.
+            let phase_watch = {
+                let manager = Arc::clone(&manager);
+                let handle = handle.clone();
+                let id = id.clone();
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    // `CounterSink` starts out on "uploading", so wait until the
+                    // provider really entered the preparation phase first —
+                    // otherwise a provider that is slow to open the file would
+                    // be flipped to "running" before it hashed anything.
+                    let mut hashing = false;
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        match sink.current_phase().as_str() {
+                            "hashing" => hashing = true,
+                            "uploading" if hashing => {
+                                manager
+                                    .patch(&id, &handle, |t| {
+                                        if t.status == "hashing" {
+                                            t.status = "running".to_string();
+                                        }
+                                    })
+                                    .await;
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+            };
             let native_parent = crate::providers::native_of(&job.pdir_fid);
             let result = drive
                 .upload(&path, &native_parent, &file_name, sink_trait, token.clone())
                 .await;
 
             ticker.abort();
+            phase_watch.abort();
             manager.cancels.lock().await.remove(&id);
 
             match result {
@@ -832,6 +879,7 @@ impl TransferManager {
                         .patch(&id, &handle, move |t| {
                             t.status = "done".to_string();
                             t.transferred = t.size;
+                            t.prepared = 0;
                             t.fid = fid;
                             t.rapid = rapid;
                             t.speed = 0.0;
@@ -941,6 +989,7 @@ impl TransferManager {
             created_at: now_millis(),
             updated_at: now_millis(),
             rapid: false,
+            prepared: 0,
             part_path: None,
             share: None,
             provider: from.id().as_str().to_string(),
@@ -990,6 +1039,7 @@ impl TransferManager {
                 done.clone(),
                 total,
                 Arc::new(AtomicU64::new(0)),
+                None,
             );
 
             let mut base = 0u64;
@@ -1268,6 +1318,7 @@ fn spawn_ticker(
     done: Arc<AtomicU64>,
     total: u64,
     epoch: Arc<AtomicU64>,
+    prepared: Option<Arc<AtomicU64>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Speed is measured over a ~1.2s sliding window and then smoothed, so
@@ -1330,6 +1381,9 @@ fn spawn_ticker(
                     }
                     t.transferred = if t.size > 0 { current.min(t.size) } else { current };
                     t.speed = smoothed;
+                    if let Some(prepared) = prepared.as_ref() {
+                        t.prepared = prepared.load(Ordering::Relaxed);
+                    }
                 })
                 .await;
         }
@@ -1619,6 +1673,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             rapid: false,
+            prepared: 0,
             part_path: part.map(|p| p.to_string()),
             share: None,
             provider: "quark".to_string(),

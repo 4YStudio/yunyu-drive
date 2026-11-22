@@ -14,6 +14,7 @@ mod state;
 mod theme;
 mod transfer;
 mod tray;
+mod version;
 
 use std::sync::Arc;
 
@@ -82,7 +83,7 @@ pub fn run() {
             // File logging: several provider flows fail in ways only the wire
             // trace explains, and a GUI app has no stderr to read.
             logging::init(&paths.log_dir);
-            ylog!("app start, version {}", env!("CARGO_PKG_VERSION"));
+            ylog!("app start, version {}", crate::version::VERSION);
             // The cloud139 crate writes its config to `./cloud139rc.toml` by
             // default (it caches the resolved personal-cloud host after the
             // first listing). Under `tauri dev` that file lives inside

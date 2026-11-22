@@ -367,9 +367,14 @@ pub struct ShareFile {
 /// uniform across drives.
 pub trait UploadSink: Send + Sync {
     /// `"hashing"` while the local file is being prepared, `"uploading"` once
-    /// bytes are moving. The manager maps this onto the task status.
+    /// bytes are moving. The manager flips the task from `"hashing"` to
+    /// `"running"` when this changes (see `phase_watch` in `transfer.rs`), so a
+    /// drive that hashes a large file no longer looks stuck on 校验中.
     fn phase(&self, phase: &str);
     /// Absolute number of bytes hashed / uploaded so far.
+    ///
+    /// While the phase is `"hashing"` the manager counts these separately (see
+    /// [`CounterSink::prepared`]) and does not treat them as uploaded bytes.
     ///
     /// Sync on purpose: providers call it from stream closures that cannot
     /// await. A speed cap therefore waits with `block_in_place` (see
@@ -651,6 +656,12 @@ impl Providers {
 pub struct CounterSink {
     pub done: Arc<AtomicU64>,
     pub phase: std::sync::Mutex<String>,
+    /// Bytes the provider has only *read* so far, while it is still preparing
+    /// the file (hashing, slicing, precreate). Kept apart from [`Self::done`] so
+    /// the progress bar does not jump to 100% before a single byte is uploaded:
+    /// Baidu in particular hashes the whole file up front, which used to look
+    /// like the transfer had stalled at "校验中".
+    pub prepared: Arc<AtomicU64>,
 }
 
 impl CounterSink {
@@ -658,6 +669,7 @@ impl CounterSink {
         Self {
             done,
             phase: std::sync::Mutex::new("uploading".to_string()),
+            prepared: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -669,6 +681,12 @@ impl CounterSink {
             .map(|p| p.clone())
             .unwrap_or_else(|e| e.into_inner().clone())
     }
+
+    /// The prepared counter itself, so the ticker can poll it without going
+    /// through the sink.
+    pub fn prepared_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.prepared)
+    }
 }
 
 impl UploadSink for CounterSink {
@@ -676,10 +694,21 @@ impl UploadSink for CounterSink {
         if let Ok(mut guard) = self.phase.lock() {
             *guard = phase.to_string();
         }
+        if phase != "hashing" {
+            self.prepared.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn progress(&self, bytes: u64) {
-        self.done.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        // While the file is still being read the bytes are *not* uploaded yet:
+        // reporting them as `done` would fill the bar and then make it jump back
+        // to zero once the first real byte goes out.
+        if self.current_phase() == "hashing" {
+            self.prepared
+                .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.done.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -790,5 +819,32 @@ mod tests {
         sort_entries(&mut entries);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["alpha", "Zeta", "alpha.txt", "beta.txt"]);
+    }
+
+    /// Baidu hashes the whole file before the first byte goes up. Those bytes are
+    /// *not* uploaded, so they must not be reported as `done` — the bar used to
+    /// jump to 100% during 校验中 and then fall back to 0.
+    #[test]
+    fn hashing_bytes_do_not_count_as_uploaded() {
+        let done = Arc::new(AtomicU64::new(0));
+        let sink = CounterSink::new(done.clone());
+        sink.phase("hashing");
+        sink.progress(1024);
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            sink.prepared_counter()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1024
+        );
+        // Once the upload starts the counter belongs to the transfer again, and
+        // the prepared bytes are cleared so they are not counted twice.
+        sink.phase("uploading");
+        assert_eq!(
+            sink.prepared_counter()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        sink.progress(512);
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 512);
     }
 }

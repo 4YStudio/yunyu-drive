@@ -94,9 +94,15 @@ async fn handle(
             "code": 0,
             "msg": "",
             "data": {
-                "version": env!("CARGO_PKG_VERSION"),
+                "version": crate::version::VERSION,
                 "isLogin": is_logged_in(&app).await,
-                "os": "linux",
+                // The Quark web page only distinguishes desktop OSes; report the
+                // real one so the handshake does not claim Linux on Windows/macOS.
+                "os": match std::env::consts::OS {
+                    "windows" => "windows",
+                    "macos" => "macos",
+                    other => other,
+                },
                 "platform": "clouddrive",
             }
         }),

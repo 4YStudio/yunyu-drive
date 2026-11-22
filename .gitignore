@@ -23,6 +23,9 @@ src-tauri/gen/apple/build/
 *.snap
 *.msi
 *.dmg
+*.exe
+# vendor/ 里的 crate 单独构建时产生的中间目录
+vendor/*/target/
 
 # --- 运行时产物 ---
 # cloud139 曾经把配置丢在这里（现已改到 ~/.config/yunyu-drive/）

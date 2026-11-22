@@ -38,8 +38,14 @@ const ROOT: &str = "0";
 
 /// Where the sibling `cloud139` CLI keeps its config:
 /// `~/.config/cloud139/cloud139rc.toml`.
+///
+/// This is only a fallback for users who already ran `cloud139 login` on
+/// Linux/macOS; on Windows `$HOME` is unset, so it simply resolves to a path
+/// that does not exist and the app's own config is used instead.
 fn cli_config_path() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
     home.unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".config")
         .join("cloud139")
