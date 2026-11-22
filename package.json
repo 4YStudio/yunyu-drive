@@ -1,7 +1,7 @@
 {
   "name": "yunyu-drive",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,11 @@
     "tauri:build": "tauri build",
     "tauri:build:deb": "tauri build --bundles deb",
     "build:deb": "tauri build --bundles deb",
+    "build:rpm": "tauri build --bundles rpm",
+    "build:linux": "tauri build --bundles deb,rpm",
+    "build:windows": "tauri build --bundles nsis",
+    "build:mac": "tauri build --bundles app,dmg --target universal-apple-darwin",
+    "version:set": "node scripts/set-version.mjs",
     "typecheck": "vue-tsc --noEmit"
   },
   "dependencies": {

@@ -1,0 +1,296 @@
+name: Release
+
+# 什么时候打包：
+#   1. 推一个 v* 标签   →  git tag v0.2.0 && git push origin v0.2.0
+#                          三平台各自构建，然后发一个 GitHub Release 并上传安装包
+#   2. 手动触发（Actions 页面 → Release → Run workflow）
+#                          可以只构建、不发布；也可以填版本号并勾选发布
+#
+# 日常 push 不触发，避免浪费 Actions 额度。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不含前导 v，例如 0.2.0）。留空则用仓库当前版本。"
+        required: false
+        default: ""
+      publish:
+        description: "构建完成后创建/更新 GitHub Release 并上传安装包"
+        type: boolean
+        default: false
+
+# 同一版本重复触发时取消旧的那次。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------- 准备阶段
+  # 算出这次要打的版本号，以及是否要发布 Release。
+  prepare:
+    name: 准备
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 确定版本号
+        id: v
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "push" ]; then
+            # 标签触发：v0.2.0 -> 0.2.0
+            version="${REF_NAME#v}"
+            publish=true
+          else
+            # 手动触发：用输入的版本号，没填就沿用仓库里的版本
+            version="${INPUT_VERSION#v}"
+            if [ -z "$version" ]; then
+              version="$(node -p "require('./package.json').version")"
+            fi
+            publish="${INPUT_PUBLISH:-false}"
+          fi
+
+          # 版本号的唯一来源是 package.json（tauri.conf.json 与 Rust 都从它派生），
+          # 这里先校验它是不是合法 semver，避免打包到一半才报错。
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::版本号 '$version' 不是合法 semver（应形如 0.2.0 或 v0.2.0）"
+            exit 1
+          fi
+
+          declared="$(node -p "require('./package.json').version")"
+          if [ "$declared" != "$version" ]; then
+            echo "::notice::仓库里的版本是 $declared，本次构建用 $version（只改工作区，不提交）"
+          fi
+
+          # 1.0.0-beta.1 这类带后缀的按预发布处理
+          case "$version" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
+
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "本次版本 $version，发布 $publish，预发布 $prerelease"
+
+  # ---------------------------------------------------------------- 构建阶段
+  build:
+    name: 构建 ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台失败不影响其它平台，能拿到多少产物算多少
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (deb + rpm)
+            os: ubuntu-22.04
+            bundles: deb,rpm
+            # 留空 = 本机默认目标 x86_64-unknown-linux-gnu
+            target: ""
+            artifact: linux-x86_64
+
+          - name: Windows (NSIS exe)
+            os: windows-latest
+            bundles: nsis
+            target: ""
+            artifact: windows-x64
+
+          - name: macOS (universal dmg)
+            os: macos-latest
+            # dmg 才是要发布的安装包，app 是它的原料
+            bundles: app,dmg
+            # 同时编 ARM64 与 Intel，由 bundler 用 lipo 合成通用二进制
+            target: universal-apple-darwin
+            artifact: macos-universal
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          # 与开发机保持一致（pnpm-workspace.yaml 里的 allowBuilds 是 pnpm 12 的写法）
+          version: 12.14.0
+          # 依赖单独一步装，方便看清失败点
+          run_install: false
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # 只有 macOS 通用包需要额外目标；空字符串不会传任何 --target
+          targets: ${{ matrix.target == 'universal-apple-darwin' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: 缓存 Rust 构建产物
+        uses: swatinem/rust-cache@v2
+        with:
+          # src-tauri 是独立的 crate 目录，target/ 也在那里
+          workspaces: src-tauri -> target
+          key: ${{ matrix.artifact }}
+
+      - name: 安装 Linux 系统依赖
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          # libwebkit2gtk-4.1-dev : Tauri 2 的 WebView
+          # libayatana-appindicator3-dev : 托盘图标
+          # librsvg2-dev : 图标渲染
+          # patchelf : bundler 修正二进制 rpath
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            patchelf
+
+      - name: 安装前端依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 同步版本号
+        shell: bash
+        run: node scripts/set-version.mjs "${{ needs.prepare.outputs.version }}"
+
+      - name: macOS 使用临时签名
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        # 没有 Apple 开发者证书时用 ad-hoc 签名（identity 为 "-"）。
+        # 不做这一步，Apple Silicon 上未签名的 .app 会被系统直接拒绝启动。
+        # 想正式分发（用户双击不报"已损坏"），需要在仓库 Secrets 里配好
+        # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+        # 以及 APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID，然后删掉这个步骤。
+        run: echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+
+      - name: 构建安装包
+        shell: bash
+        env:
+          TAURI_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cmd=(build --bundles "${{ matrix.bundles }}")
+          if [ -n "${TAURI_TARGET:-}" ]; then
+            cmd+=(--target "$TAURI_TARGET")
+          fi
+          echo "运行：pnpm tauri ${cmd[*]}"
+          pnpm tauri "${cmd[@]}"
+
+      - name: 收集安装包
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 产物在 src-tauri/target/release/bundle/** 或
+          # src-tauri/target/<target>/release/bundle/**（指定了 --target 时）。
+          # 只看 bundle/ 子目录，避免把裸可执行文件（如 target/release/*.exe）也收进来。
+          mkdir -p dist-release
+          found=0
+          while IFS= read -r -d '' dir; do
+            while IFS= read -r -d '' f; do
+              cp "$f" dist-release/
+              found=$((found + 1))
+            done < <(find "$dir" -type f \
+                       \( -name '*.deb' -o -name '*.rpm' -o -name '*.exe' -o -name '*.dmg' \) \
+                       -print0)
+          done < <(find src-tauri/target -type d -name bundle -print0)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::没有找到任何安装包，检查 --bundles 是否拼错"
+            exit 1
+          fi
+          ls -lh dist-release
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist-release/*
+          if-no-files-found: error
+          # 安装包已经是压缩格式，再压一遍纯属浪费
+          compression-level: 0
+
+  # ---------------------------------------------------------------- 发布阶段
+  # 只有标签推送，或手动触发时勾选了 publish，才会跑。
+  release:
+    name: 发布 Release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 下载全部安装包
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: 整理文件名
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # 安装包原名带空格（productName 是 "Yunyu Drive"），
+          # Release 下载链接里会变成 %20，统一换成连字符。
+          while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            cp "$f" "release/${base// /-}"
+          done < <(find artifacts -type f -print0)
+          ls -lh release
+
+      - name: 创建 / 更新 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # 已有 Release：只补传/覆盖安装包，不动已写好的说明
+            echo "Release $tag 已存在，补充上传安装包"
+            gh release upload "$tag" release/* --clobber
+          else
+            flags=(--title "云语聚合网盘 $tag" --generate-notes)
+            if [ "$PRERELEASE" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+              # 标签已存在（标签触发的情况）：直接用它
+              gh release create "$tag" release/* "${flags[@]}"
+            else
+              # 手动触发且标签还不存在：顺手在本次提交上建出来
+              gh release create "$tag" release/* --target "$GITHUB_SHA" "${flags[@]}"
+            fi
+          fi
+
+          {
+            echo "### 发布完成：$tag"
+            gh release view "$tag" --json url -q '.url'
+          } >> "$GITHUB_STEP_SUMMARY"
