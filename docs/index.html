@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>云语聚合网盘 — 把五个网盘装进同一个窗口</title>
+    <meta
+      name="description"
+      content="云语聚合网盘（Yunyu Drive）：把夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘装进同一个窗口的桌面客户端。一套文件浏览、一套上传下载队列、一套传输列表。Tauri 2 + Vue 3，支持 Windows / Linux / macOS。"
+    />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0a0a0b" media="(prefers-color-scheme: dark)" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="云语聚合网盘 — 把五个网盘装进同一个窗口" />
+    <meta
+      property="og:description"
+      content="夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘，一套界面搞定。Tauri 2 + Vue 3，Windows / Linux / macOS。"
+    />
+    <meta property="og:image" content="./assets/logo.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <link rel="icon" href="./assets/logo.png" />
+    <link rel="apple-touch-icon" href="./assets/logo.png" />
+    <link rel="stylesheet" href="./assets/site.css" />
+
+    <script>
+      // 在首帧之前定好主题，避免白闪。顺序：上次手动选择 > 系统偏好。
+      (function () {
+        try {
+          var saved = localStorage.getItem("yunyu.site.theme");
+          var dark = saved
+            ? saved === "dark"
+            : window.matchMedia("(prefers-color-scheme: dark)").matches;
+          document.documentElement.dataset.theme = dark ? "dark" : "light";
+        } catch (e) {
+          /* 隐私模式下 localStorage 会抛，忽略即可 */
+        }
+      })();
+    </script>
+  </head>
+
+  <body>
+    <!-- ============================================================ 顶栏 -->
+    <header class="topbar" id="topbar">
+      <div class="wrap topbar-inner">
+        <a class="brand" href="#top">
+          <img src="./assets/mark-ink.png" alt="" class="brand-mark" />
+          <span>云语聚合网盘</span>
+          <span class="brand-sub">Yunyu Drive</span>
+        </a>
+
+        <nav class="topnav">
+          <a href="#features">功能</a>
+          <a href="#cross">跨盘传输</a>
+          <a href="#download">下载</a>
+          <a href="#build">源码</a>
+        </nav>
+
+        <div class="topbar-right">
+          <button
+            class="icon-btn"
+            id="theme-toggle"
+            type="button"
+            title="切换深色 / 浅色"
+            aria-label="切换深色 / 浅色"
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="4.2" />
+              <path d="M12 2.4v2.2M12 19.4v2.2M4.2 12H2M22 12h-2.2M6.5 6.5 5 5M19 19l-1.5-1.5M17.5 6.5 19 5M5 19l1.5-1.5" />
+            </svg>
+          </button>
+          <a
+            class="btn btn--solid btn--sm"
+            href="https://github.com/4YStudio/yunyu-drive/releases/latest"
+            target="_blank"
+            rel="noopener"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3.5v11M12 14.5 7.6 10M12 14.5 16.4 10M4.5 19.5h15" />
+            </svg>
+            下载
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main id="top">
+      <!-- ========================================================== hero -->
+      <section class="hero">
+        <div class="wrap">
+          <img class="hero-mark" src="./assets/logo.png" alt="云语聚合网盘图标" width="96" height="96" />
+          <h1>把五个网盘<br />装进同一个窗口</h1>
+          <span class="hero-latin">Yunyu Drive</span>
+          <p class="hero-lead">
+            夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘——
+            <strong>一套文件浏览、一套上传下载队列、一套传输列表</strong>，
+            还能在网盘之间直接搬运文件。基于 Tauri 2 + Vue 3，安装包只有几 MB。
+          </p>
+
+          <div class="hero-actions">
+            <a
+              class="btn btn--solid"
+              href="https://github.com/4YStudio/yunyu-drive/releases/latest"
+              target="_blank"
+              rel="noopener"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3.5v11M12 14.5 7.6 10M12 14.5 16.4 10M4.5 19.5h15" />
+              </svg>
+              下载最新版
+            </a>
+            <a
+              class="btn btn--ghost"
+              href="https://github.com/4YStudio/yunyu-drive"
+              target="_blank"
+              rel="noopener"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 2C6.48 2 2 6.58 2 12.23c0 4.52 2.87 8.35 6.84 9.7.5.1.68-.22.68-.49l-.01-1.72c-2.78.62-3.37-1.37-3.37-1.37-.45-1.18-1.11-1.5-1.11-1.5-.91-.63.07-.62.07-.62 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.92.86.09-.67.35-1.12.63-1.38-2.22-.26-4.55-1.14-4.55-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.7 0 0 .84-.28 2.75 1.05a9.3 9.3 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.4.2 2.44.1 2.7.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.8-4.57 5.05.36.32.68.94.68 1.9l-.01 2.82c0 .27.18.6.69.49A10.06 10.06 0 0 0 22 12.23C22 6.58 17.52 2 12 2Z" />
+              </svg>
+              查看源码
+            </a>
+          </div>
+
+          <div class="hero-meta">
+            <span class="chip">GPL-3.0-or-later</span>
+            <span class="chip">Windows · Linux · macOS</span>
+            <span class="chip">数据只存本机</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================================================== 网盘列表 -->
+      <section class="providers">
+        <div class="wrap">
+          <p class="providers-label">已支持</p>
+          <div class="providers-row">
+            <div class="provider"><img src="./assets/netdisk-quark.png" alt="" />夸克网盘</div>
+            <div class="provider"><img src="./assets/netdisk-yun139.png" alt="" />中国移动云盘</div>
+            <div class="provider"><img src="./assets/netdisk-aliyun.png" alt="" />阿里云盘</div>
+            <div class="provider"><img src="./assets/netdisk-pan123.png" alt="" />123 云盘</div>
+            <div class="provider"><img src="./assets/netdisk-baidu.png" alt="" />百度网盘</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================================================= 截图 -->
+      <section class="shots">
+        <div class="wrap">
+          <div class="shots-head">
+            <h2>界面</h2>
+            <div class="segmented" id="view-switch" role="group" aria-label="切换界面截图">
+              <button type="button" data-view="files" aria-pressed="true">文件</button>
+              <button type="button" data-view="transfers" aria-pressed="false">传输</button>
+              <button type="button" data-view="share" aria-pressed="false">分享</button>
+              <button type="button" data-view="settings" aria-pressed="false">设置</button>
+            </div>
+            <span class="spacer"></span>
+            <div class="segmented" id="shot-theme" role="group" aria-label="切换截图配色">
+              <button type="button" data-shot-theme="light" aria-pressed="true">浅色</button>
+              <button type="button" data-shot-theme="dark" aria-pressed="false">深色</button>
+            </div>
+          </div>
+
+          <div class="shot-frame">
+            <img
+              id="shot"
+              src="./files-light.png"
+              width="1220"
+              height="800"
+              alt="文件列表界面"
+            />
+          </div>
+          <p class="shot-caption" id="shot-caption">
+            <b>文件列表</b>
+            <span>多级目录、全盘搜索、网格 / 紧凑两种密度、右键菜单与多选。</span>
+          </p>
+        </div>
+      </section>
+
+      <!-- ========================================================= 功能 -->
+      <section class="features" id="features">
+        <div class="wrap">
+          <div class="section-head reveal">
+            <h2>一个客户端，五套协议</h2>
+            <p>
+              每个网盘的登录方式、接口形状、能力边界都不一样。
+              这里做的事是把它们抹平成同一套交互——不一致的地方就诚实地灰掉。
+            </p>
+          </div>
+
+          <div class="grid">
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.2l2 2.4h7.8A2.5 2.5 0 0 1 21 9.9v7.6a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5Z" />
+                </svg>
+              </span>
+              <h3>五盘合一</h3>
+              <p>
+                侧边栏切换网盘，登录状态、容量条、文件列表互相独立。
+                每个盘有独立的头像与昵称，左下角账号区跟着当前网盘走。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="8.5" />
+                  <path d="M12 3.5a8.5 8.5 0 0 0 0 17Z" fill="currentColor" stroke="none" />
+                </svg>
+              </span>
+              <h3>纯黑白双主题</h3>
+              <p>
+                浅色 / 深色两套设计令牌，可跟随系统自动切换，原生窗口装饰也同步换色。
+                跟随系统不靠 <code>prefers-color-scheme</code>——WebKitGTK 在 KDE / Wayland
+                下常把它解析成浅色，所以由 Rust 侧直接读桌面配色。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="11" cy="11" r="6.5" />
+                  <path d="m16 16 4.5 4.5" />
+                </svg>
+              </span>
+              <h3>搜索走服务端索引</h3>
+              <p>
+                不逐目录爬树，因此深层目录也能搜到。命中项显示所在文件夹，可直接定位。
+                各盘分别走自己的 <code>/search</code> 接口。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 6h9M4 12h9M4 18h9" />
+                  <path d="m17 8.5 2.5 2.5L17 13.5" />
+                </svg>
+              </span>
+              <h3>完整的文件管理</h3>
+              <p>
+                面包屑、排序（记忆上次选择）、网格 / 紧凑、多选（Shift / Ctrl / Ctrl+A / ↑↓）、
+                右键菜单、新建文件夹、重命名、删除、移动、复制。
+                当前网盘不具备的操作会提前灰掉，而不是选完目标目录才报错。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 20.5V9M12 9 7.5 13.5M12 9l4.5 4.5" />
+                  <path d="M4.5 5.5h15" />
+                </svg>
+              </span>
+              <h3>上传下载</h3>
+              <p>
+                拖拽上传、整个文件夹递归上传 / 下载、同名自动追加序号或跳过、秒传识别、
+                并发数可调、取消 / 重试 / 清理、断点续传，以及上传下载共享的全局速度上限。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M9.5 14.5 14.5 9.5" />
+                  <path d="M13 6.8l1.6-1.6a3.9 3.9 0 0 1 5.5 5.5l-1.6 1.6" />
+                  <path d="M11 17.2l-1.6 1.6a3.9 3.9 0 0 1-5.5-5.5l1.6-1.6" />
+                </svg>
+              </span>
+              <h3>分享链接</h3>
+              <p>
+                五个盘都支持：粘贴链接即可预览、逐级浏览子目录、批量转存到自己网盘或下载到本地。
+                还支持系统深链 <code>yunyu-drive://share?url=…</code>。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="17.5" cy="6" r="2.5" />
+                  <circle cx="6.5" cy="12" r="2.5" />
+                  <circle cx="17.5" cy="18" r="2.5" />
+                  <path d="m8.8 10.8 6.4-3.5M8.8 13.2l6.4 3.5" />
+                </svg>
+              </span>
+              <h3>创建分享 · 我的分享</h3>
+              <p>
+                四个盘可建可撤（139 除外），可选名称、有效期与 4 位提取码。
+                「我的分享」列出已建分享的链接、提取码、到期时间与浏览 / 转存 / 下载次数。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4.5 7.5h15M4.5 12h15M4.5 16.5h9" />
+                </svg>
+              </span>
+              <h3>大目录不会卡死</h3>
+              <p>
+                列表只挂载前 200 行，滚到底部再续 200，状态栏显示「已显示 N / M」。
+                网格模式对图片与视频显示真实缩略图，由后端带 Referer 下载后内联。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="4.5" y="10" width="15" height="10" rx="2.4" />
+                  <path d="M8 10V7.5a4 4 0 0 1 8 0V10" />
+                </svg>
+              </span>
+              <h3>凭据只存本机</h3>
+              <p>
+                登录凭据写在 <code>~/.config/yunyu-drive/</code>，权限 <code>0600</code>，
+                不经过任何中转服务器。头像也缓存在本地，第二次启动不再联网。
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===================================================== 跨盘传输 -->
+      <section class="cross" id="cross">
+        <div class="wrap">
+          <div class="cross-inner reveal">
+            <div>
+              <h2>夸克的文件，直接搬进百度</h2>
+              <p>
+                目标盘可以和源盘不同——弹窗顶部就能切换目标网盘。
+                服务端没有跨盘原语，所以任务会先把文件下载到本机缓存，再上传到目标盘；
+                整批选择合成一个任务，在传输列表里显示为「跨盘复制 / 跨盘移动」。
+              </p>
+              <ul>
+                <li>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4.5 12.5 4.5 4.5L19.5 6.5" /></svg>
+                  可暂停、重试（只重跑剩下的文件）、取消
+                </li>
+                <li>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4.5 12.5 4.5 4.5L19.5 6.5" /></svg>
+                  移动只有在全部文件都落地后才删除源文件
+                </li>
+                <li>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4.5 12.5 4.5 4.5L19.5 6.5" /></svg>
+                  中途失败不会丢数据，缓存目录可随时清理
+                </li>
+              </ul>
+            </div>
+
+            <div class="flow" aria-hidden="true">
+              <div class="flow-node">
+                <img src="./assets/netdisk-quark.png" alt="" />
+                <span>夸克网盘</span>
+              </div>
+              <div class="flow-arrow">
+                <svg width="34" height="12" viewBox="0 0 34 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M0 6h30M26 2l4 4-4 4" />
+                </svg>
+                <span>下载</span>
+              </div>
+              <div class="flow-node">
+                <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-2)">
+                  <rect x="3.5" y="4.5" width="17" height="12" rx="1.8" />
+                  <path d="M8 20h8M12 16.5V20" />
+                </svg>
+                <span>本机缓存</span>
+              </div>
+              <div class="flow-arrow">
+                <svg width="34" height="12" viewBox="0 0 34 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M0 6h30M26 2l4 4-4 4" />
+                </svg>
+                <span>上传</span>
+              </div>
+              <div class="flow-node">
+                <img src="./assets/netdisk-baidu.png" alt="" />
+                <span>百度网盘</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ========================================================= 下载 -->
+      <section class="download" id="download">
+        <div class="wrap">
+          <div class="section-head reveal">
+            <h2>下载</h2>
+            <p>
+              三平台安装包由 GitHub Actions 从同一个提交构建，
+              版本号一致。安装包只有几 MB——Tauri 复用系统的 WebView，不额外打包浏览器内核。
+            </p>
+          </div>
+
+          <div class="dl-table reveal">
+            <div class="dl-row">
+              <div class="dl-os">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M3 5.2l7.4-1v7.1H3Zm8.6-1.2L21 2.6v8.7h-9.4ZM3 12.4h7.4v7.1L3 18.4Zm8.6 0H21v8.8l-9.4-1.3Z" />
+                </svg>
+                Windows 10 / 11
+              </div>
+              <div class="dl-file">Yunyu-Drive_&lt;版本&gt;_x64-setup.exe</div>
+              <a
+                class="btn btn--ghost btn--sm"
+                href="https://github.com/4YStudio/yunyu-drive/releases/latest"
+                target="_blank"
+                rel="noopener"
+                >下载</a
+              >
+            </div>
+
+            <div class="dl-row">
+              <div class="dl-os">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 3c-4.7 0-8.5 3.6-8.5 8.1 0 3.6 2.4 6.6 5.7 7.7.4.1.6-.2.6-.4v-1.5c-2.4.5-2.9-1.1-2.9-1.1-.4-1-.9-1.2-.9-1.2-.8-.5.1-.5.1-.5.8.1 1.3.9 1.3.9.7 1.3 2 1 2.5.7.1-.5.3-.9.5-1.1-1.9-.2-3.9-1-3.9-4.3 0-1 .3-1.7.9-2.3-.1-.2-.4-1.1.1-2.3 0 0 .7-.2 2.3.9a7.7 7.7 0 0 1 4.2 0c1.6-1.1 2.3-.9 2.3-.9.5 1.2.2 2.1.1 2.3.6.6.9 1.4.9 2.3 0 3.3-2 4.1-3.9 4.3.3.3.6.8.6 1.6v2.4c0 .2.2.5.6.4a8.2 8.2 0 0 0 5.7-7.7C20.5 6.6 16.7 3 12 3Z" />
+                </svg>
+                Debian / Ubuntu
+              </div>
+              <div class="dl-file">Yunyu-Drive_&lt;版本&gt;_amd64.deb</div>
+              <a
+                class="btn btn--ghost btn--sm"
+                href="https://github.com/4YStudio/yunyu-drive/releases/latest"
+                target="_blank"
+                rel="noopener"
+                >下载</a
+              >
+            </div>
+
+            <div class="dl-row">
+              <div class="dl-os">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M5 5.5h14v4.5a3 3 0 0 1-3 3h-8a3 3 0 0 1-3-3Z" />
+                  <path d="M8.5 13v5.5M15.5 13v5.5M6 18.5h12" />
+                </svg>
+                Fedora / openSUSE
+              </div>
+              <div class="dl-file">Yunyu-Drive-&lt;版本&gt;-1.x86_64.rpm</div>
+              <a
+                class="btn btn--ghost btn--sm"
+                href="https://github.com/4YStudio/yunyu-drive/releases/latest"
+                target="_blank"
+                rel="noopener"
+                >下载</a
+              >
+            </div>
+
+            <div class="dl-row">
+              <div class="dl-os">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M16.4 12.7c0-2.2 1.8-3.2 1.9-3.3-1-1.5-2.6-1.7-3.2-1.7-1.3-.1-2.6.8-3.3.8-.7 0-1.7-.8-2.8-.8-1.5 0-2.8.9-3.6 2.2-1.5 2.7-.4 6.6 1.1 8.8.7 1 1.6 2.2 2.7 2.1 1.1 0 1.5-.7 2.8-.7s1.6.7 2.8.7c1.1 0 1.9-1.1 2.6-2.1.8-1.2 1.2-2.4 1.2-2.5 0 0-2.3-.9-2.3-3.5ZM14.3 6.3c.6-.7 1-1.8.9-2.8-.9 0-2 .6-2.7 1.4-.6.7-1.1 1.8-.9 2.8 1 .1 2-.5 2.7-1.4Z" />
+                </svg>
+                macOS 10.15+
+              </div>
+              <div class="dl-file">Yunyu-Drive_&lt;版本&gt;_universal.dmg</div>
+              <a
+                class="btn btn--ghost btn--sm"
+                href="https://github.com/4YStudio/yunyu-drive/releases/latest"
+                target="_blank"
+                rel="noopener"
+                >下载</a
+              >
+            </div>
+          </div>
+
+          <p class="dl-note reveal">
+            macOS 包默认是 <b>ad-hoc 签名、未公证</b>，首次打开需要右键 →「打开」。
+            Linux 需要 <code>libwebkit2gtk-4.1</code>、<code>libgtk-3-0</code>、
+            <code>libayatana-appindicator3-1</code>，deb / rpm 会自动拉依赖。
+            装好之后深链可用：
+            <code>xdg-open "yunyu-drive://share?url=…"</code>
+          </p>
+        </div>
+      </section>
+
+      <!-- ========================================================= 源码 -->
+      <section class="build" id="build">
+        <div class="wrap">
+          <div class="section-head reveal">
+            <h2>从源码构建</h2>
+            <p>
+              前端 Vue 3 + TypeScript，后端 Rust。依赖两个上游 crate，
+              以源码形式放在仓库的 <code>vendor/</code> 下，因此单独拷走仓库就能编译。
+            </p>
+          </div>
+
+          <div class="build-inner">
+            <div class="panel reveal">
+              <h3>需要</h3>
+              <p>
+                Rust 1.88+、Node 20+、pnpm 12；Linux 上另需
+                <code>libwebkit2gtk-4.1-dev</code>、<code>libgtk-3-dev</code>、
+                <code>libsoup-3.0-dev</code>、<code>libayatana-appindicator3-dev</code>。
+              </p>
+              <pre><span class="c"># 装依赖并起开发环境</span>
+<span class="p">pnpm install</span>
+<span class="p">pnpm tauri dev</span>
+
+<span class="c"># 打当前平台的安装包</span>
+<span class="p">pnpm build:linux</span>    <span class="c"># deb + rpm</span>
+<span class="p">pnpm build:windows</span>  <span class="c"># NSIS exe</span>
+<span class="p">pnpm build:mac</span>      <span class="c"># universal dmg</span></pre>
+            </div>
+
+            <div class="panel reveal">
+              <h3>在浏览器里走查界面</h3>
+              <p>
+                没有登录凭据时可以脱离 Tauri 预览全部界面。mock 数据通过 Vite 别名注入，
+                不会被编进正式包。
+              </p>
+              <pre><span class="p">VITE_MOCK=1 pnpm dev</span>
+
+<span class="c"># http://localhost:5183/?view=files&amp;theme=dark</span>
+<span class="c"># view=files|transfers|settings|login|share|myShares|recycle</span></pre>
+              <h3 style="margin-top: 22px">发版</h3>
+              <p>版本号只有一个真源（<code>package.json</code>），推 tag 即三平台并行构建并发布。</p>
+              <pre><span class="p">pnpm version:set 0.2.0</span>
+<span class="p">git commit -am "chore: 0.2.0"</span>
+<span class="p">git tag v0.2.0 &amp;&amp; git push origin v0.2.0</span></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ============================================================ 页脚 -->
+    <footer>
+      <div class="wrap">
+        <div class="footer-inner">
+          <div>
+            <div class="footer-brand">
+              <img src="./assets/logo.png" alt="" />
+              云语聚合网盘
+            </div>
+            <div class="footer-note" style="margin-top: 12px">
+              以 GPL-3.0-or-later 发布。
+            </div>
+          </div>
+
+          <nav class="footer-links">
+            <a href="https://github.com/4YStudio/yunyu-drive" target="_blank" rel="noopener">GitHub</a>
+            <a href="https://github.com/4YStudio/yunyu-drive/releases" target="_blank" rel="noopener">Releases</a>
+            <a href="https://github.com/4YStudio/yunyu-drive/blob/master/README.md" target="_blank" rel="noopener">文档</a>
+            <a href="https://github.com/4YStudio/yunyu-drive/blob/master/LICENSE" target="_blank" rel="noopener">许可</a>
+            <a href="https://github.com/4YStudio/yunyu-drive/issues" target="_blank" rel="noopener">反馈</a>
+          </nav>
+        </div>
+
+        <p class="footer-note">
+          本项目与夸克、中国移动、阿里云、百度、123 云盘官方均无关联，仅为个人账号的第三方客户端；
+          所有接口均为各网盘 Web / 安卓客户端已公开使用的接口。请遵守各网盘的服务条款，
+          不要用于批量转存、爬取或任何商业分发。
+        </p>
+      </div>
+    </footer>
+
+    <script src="./assets/site.js"></script>
+  </body>
+</html>

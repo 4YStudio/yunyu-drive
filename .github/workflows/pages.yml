@@ -1,0 +1,56 @@
+name: Site
+
+# 官网（docs/）发布到 GitHub Pages。
+#
+#   push 到 master 且 docs/ 有改动  → 构建并发布
+#   手动触发                        → 同上，可指定分支
+#
+# 仓库设置里需要把 Pages 的 Source 选成 "GitHub Actions"（只需做一次）。
+# 首次发布后地址是 https://4ystudio.github.io/yunyu-drive/
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 只保留最新的一次发布；旧的排队任务直接取消。
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 打包站点
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 配置 Pages
+        uses: actions/configure-pages@v6
+
+      # docs/ 是纯静态的：一个 index.html + assets/ + 截图，没有任何构建步骤。
+      # 直接上传整个目录，避免为了拷文件再引一个 bundler。
+      - name: 上传站点
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs
+
+  deploy:
+    name: 发布到 Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 部署
+        id: deployment
+        uses: actions/deploy-pages@v5

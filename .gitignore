@@ -1,33 +1,84 @@
-# --- 前端 ---
+# ============================================================
+#  云语聚合网盘 · Git 忽略规则
+#  分四类：前端 / Rust / 打包产物 / 编辑器与系统
+#  规则写在对应的注释下面，加东西请放进同一类里。
+# ============================================================
+
+# ---------------------------------------------------------- 前端
 node_modules/
 dist/
 dist-ssr/
+dist-release/
 *.local
 .vite/
 .vite-inspect/
+.turbo/
+*.tsbuildinfo
 
-# 构建/预览时生成的 mock 包（scripts 里会写到 /tmp，这里只是兜底）
+# 依赖与包管理器的日志
+pnpm-debug.log*
+npm-debug.log*
+yarn-error.log*
+.npm/
+.pnpm-store/
+
+# 环境变量（只放本机覆盖，正式配置一律进仓库）
+.env.local
+.env.*.local
+
+# `VITE_MOCK=1 pnpm dev` 时 vite 会把 mock 包写到 /tmp，
+# 这条只是防止有人把输出目录指回仓库里。
 /mock-dist/
 
-# --- Rust / Tauri ---
+# ---------------------------------------------------------- Rust / Tauri
+# 单独构建一次就 20+ GB，绝对不要进仓库
 src-tauri/target/
-# tauri-build 每次构建都会重写这两处，不入库
+target/
+# cargo 的临时锁与增量缓存
+**/*.rs.bk
+**/.cargo-lock
+
+# tauri-build 每次构建都会重写这些，属于生成物
 src-tauri/gen/schemas/
+# 只有跑过 `tauri android init` / `tauri ios init` 才会有下面两处，
+# 里面是真正的工程文件，所以只忽略构建中间产物，不忽略整个 gen/。
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/build/
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/local.properties
 src-tauri/gen/android/app/src/main/assets/
 src-tauri/gen/apple/Assets.xcassets/
 src-tauri/gen/apple/build/
-# 打包产物
+src-tauri/gen/apple/Externals/
+src-tauri/gen/apple/*.xcworkspace/xcuserdata/
+
+# ---------------------------------------------------------- 打包产物
+# 这些在 CI 里生成，由 GitHub Release 分发，不进仓库。
+# 注意 vendor/ 下的两个 crate 是源码依赖，不受下面规则影响。
 *.deb
 *.rpm
 *.AppImage
 *.snap
+*.flatpak
 *.msi
-*.dmg
+*.msix
 *.exe
-# vendor/ 里的 crate 单独构建时产生的中间目录
-vendor/*/target/
+*.dmg
+*.pkg
+*.app
+*.AppImage.tar.gz
+*.deb.tar.gz
 
-# --- 运行时产物 ---
+# 崩溃与调试符号
+*.pdb
+*.dSYM/
+*.dmp
+
+# vendor/ 里的 crate 单独 cargo build 时产生的中间目录
+vendor/*/target/
+vendor/*/Cargo.lock.bak
+
+# ---------------------------------------------------------- 运行时产物
 # cloud139 曾经把配置丢在这里（现已改到 ~/.config/yunyu-drive/）
 src-tauri/cloud139rc.toml
 # 手滑留下的调试输出
@@ -35,12 +86,16 @@ src-tauri/err.txt
 *.log
 logs/
 
-# --- 编辑器 / 系统 ---
+# ---------------------------------------------------------- 编辑器 / 系统
 .vscode/
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea/
+*.iml
 *.swp
 *.swo
 *~
 .DS_Store
+._*
 Thumbs.db
+desktop.ini
