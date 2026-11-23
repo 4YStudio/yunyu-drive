@@ -4,6 +4,7 @@ mod error;
 mod folder;
 mod list;
 mod model;
+mod quality;
 mod rename;
 mod transfer;
 mod upload;

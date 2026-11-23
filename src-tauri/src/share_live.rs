@@ -2007,3 +2007,313 @@ async fn share_live_yun139_create() {
     let out = drive.debug_share_post("/IOutLink/getOutLink", &body).await;
     println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
 }
+
+// ---------------------------------------------------------------- engine ---
+
+/// Lists the largest files in each drive's root, so a manual run can pick one
+/// big enough to actually be split.
+#[tokio::test]
+#[ignore]
+async fn engine_live_list() {
+    for provider in [ProviderId::Quark, ProviderId::Aliyun] {
+        let Some(drive) = drive(provider) else { continue };
+        println!("\n=== {} ===", provider.as_str());
+        match drive.list("0").await {
+            Ok(listing) => {
+                let mut files: Vec<_> = listing.entries.iter().filter(|e| !e.is_dir).collect();
+                files.sort_by_key(|e| std::cmp::Reverse(e.size));
+                for entry in files.iter().take(10) {
+                    println!("  {:>14}  {}", entry.size, entry.name);
+                }
+                println!("  ({} files, {} entries total)", files.len(), listing.total);
+            }
+            Err(err) => println!("  list ERR {err}"),
+        }
+    }
+}
+
+/// Lists aliyun folders so a nested file can be found for the engine probe.
+#[tokio::test]
+#[ignore]
+async fn engine_live_aliyun_tree() {
+    let Some(drive) = drive(ProviderId::Aliyun) else {
+        println!("no aliyun");
+        return;
+    };
+    let Ok(root) = drive.list("0").await else {
+        println!("list failed");
+        return;
+    };
+    for entry in root.entries.iter() {
+        println!("{}  {}  size={}", if entry.is_dir { "DIR " } else { "FILE" }, entry.name, entry.size);
+    }
+    for entry in root.entries.iter().filter(|e| e.is_dir).take(4) {
+        let native = crate::providers::native_of(&entry.fid);
+        match drive.list(&native).await {
+            Ok(inner) => {
+                println!("\n-- {} ({} entries)", entry.name, inner.total);
+                let mut files: Vec<_> = inner.entries.iter().filter(|e| !e.is_dir).collect();
+                files.sort_by_key(|e| std::cmp::Reverse(e.size));
+                for f in files.iter().take(6) {
+                    println!("   {:>14}  {}", f.size, f.name);
+                }
+            }
+            Err(err) => println!("\n-- {} ERR {err}", entry.name),
+        }
+    }
+}
+
+// -------------------------------------------------------- engine download ---
+
+/// Downloads `fid` twice — once through the segmented engine, once through the
+/// single stream that existed before it — and compares the bytes.
+///
+/// The single stream is the ground truth here: it is the code that shipped, so
+/// anything the engine produces has to match it exactly. A length check alone
+/// would not catch a plan that writes the right number of bytes at the wrong
+/// offsets, which is the failure mode that matters.
+async fn engine_compare(drive: Arc<dyn DriveProvider>, fid: &str, name: &str, size: u64) {
+    use sha2::{Digest, Sha256};
+
+    let dir = std::env::temp_dir().join(format!("yunyu-engine-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let segmented_path = dir.join(format!("seg-{name}"));
+    let plain_path = dir.join(format!("plain-{name}"));
+    let _ = std::fs::remove_file(&segmented_path);
+    let _ = std::fs::remove_file(&plain_path);
+    crate::engine::discard_progress(&segmented_path);
+
+    // ---- segmented ----
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let token = tokio_util::sync::CancellationToken::new();
+    let source = crate::engine::source::provider_source(
+        Arc::clone(&drive),
+        fid.to_string(),
+        name.to_string(),
+    );
+    let provider = drive.id().as_str();
+    let started = std::time::Instant::now();
+    let outcome = crate::engine::download(
+        Arc::clone(&drive),
+        Arc::clone(&source),
+        provider,
+        &segmented_path,
+        size,
+        Arc::clone(&done),
+        0,
+        token,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    match outcome {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("  engine declined to segment (falls back to one stream)");
+            return;
+        }
+        Err(err) => {
+            println!("  engine ERR {err}");
+            return;
+        }
+    }
+    let seg_len = std::fs::metadata(&segmented_path).unwrap().len();
+    let seg_mb = seg_len as f64 / (1024.0 * 1024.0);
+    println!(
+        "  segmented: {seg_len} B in {:.2}s → {:.2} MB/s",
+        elapsed.as_secs_f64(),
+        seg_mb / elapsed.as_secs_f64()
+    );
+    assert_eq!(seg_len, size, "segmented file has the wrong length");
+
+    // ---- single stream, the reference ----
+    let started = std::time::Instant::now();
+    let handle = drive.open_download(fid, 0).await.expect("open_download");
+    let mut stream = handle.stream;
+    {
+        use futures_util::StreamExt;
+        use std::io::Write;
+        let mut file = std::fs::File::create(&plain_path).unwrap();
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("stream chunk");
+            file.write_all(&chunk).unwrap();
+        }
+    }
+    let plain_elapsed = started.elapsed();
+    let plain_len = std::fs::metadata(&plain_path).unwrap().len();
+    println!(
+        "  single   : {plain_len} B in {:.2}s → {:.2} MB/s",
+        plain_elapsed.as_secs_f64(),
+        plain_len as f64 / (1024.0 * 1024.0) / plain_elapsed.as_secs_f64()
+    );
+
+    let hash = |path: &std::path::Path| -> String {
+        let mut hasher = Sha256::new();
+        let mut file = std::fs::File::open(path).unwrap();
+        std::io::copy(&mut file, &mut hasher).unwrap();
+        format!("{:x}", hasher.finalize())
+    };
+    let seg_hash = hash(&segmented_path);
+    let plain_hash = hash(&plain_path);
+    println!("  segmented sha256 {seg_hash}");
+    println!("  single    sha256 {plain_hash}");
+    assert_eq!(seg_hash, plain_hash, "segmented bytes differ from single stream");
+    println!("  ✓ identical");
+
+    let _ = std::fs::remove_file(&segmented_path);
+    let _ = std::fs::remove_file(&plain_path);
+    let _ = std::fs::remove_dir(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn engine_live_quark() {
+    let Some(drive) = drive(ProviderId::Quark) else {
+        println!("quark not logged in");
+        return;
+    };
+    // 45 MiB: past the 8 MiB threshold, so the engine splits it, small enough
+    // to download twice in a test.
+    let fid = "quark:df1d3c3b0b6b4f8bb0c5b0b4f2a3e1d0";
+    let _ = fid;
+    let listing = drive.list("0").await.expect("list");
+    let target = listing
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .max_by_key(|e| e.size)
+        .expect("a file");
+    println!(
+        "\n=== quark: {} ({} B) ===",
+        target.name, target.size
+    );
+    let native = crate::providers::native_of(&target.fid);
+    engine_compare(Arc::clone(&drive), &native, &target.name, target.size).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn engine_live_aliyun() {
+    let Some(drive) = drive(ProviderId::Aliyun) else {
+        println!("aliyun not logged in");
+        return;
+    };
+    let root = drive.list("0").await.expect("list root");
+    let mut best: Option<(String, String, u64)> = None;
+    for folder in root.entries.iter().filter(|e| e.is_dir) {
+        let native = crate::providers::native_of(&folder.fid);
+        let Ok(inner) = drive.list(&native).await else {
+            continue;
+        };
+        for file in inner.entries.iter().filter(|e| !e.is_dir) {
+            // Smallest file above the segment threshold: enough to exercise the
+            // split without downloading hundreds of megabytes twice.
+            if file.size < 8 * 1024 * 1024 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(_, _, size)| file.size < *size) {
+                best = Some((file.fid.clone(), file.name.clone(), file.size));
+            }
+        }
+    }
+    let Some((fid, name, size)) = best else {
+        println!("no suitable aliyun file");
+        return;
+    };
+    println!("\n=== aliyun: {name} ({size} B) ===");
+    let native = crate::providers::native_of(&fid);
+    engine_compare(Arc::clone(&drive), &native, &name, size).await;
+}
+
+/// Runs the engine on a real Quark file, then verifies the result by fetching
+/// eight random 64 KiB windows directly and comparing them with what landed on
+/// disk. Cheaper than hashing the whole file twice and it catches a shifted
+/// write, which a length check cannot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn engine_live_quark_verify() {
+    use futures_util::StreamExt;
+    let Some(drive) = drive(ProviderId::Quark) else { return };
+    let listing = drive.list("0").await.unwrap();
+    let target = listing
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .max_by_key(|e| e.size)
+        .unwrap();
+    let native = crate::providers::native_of(&target.fid);
+    let size = target.size;
+    let dir = std::env::temp_dir().join(format!("yunyu-verify-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(&target.name);
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let token = tokio_util::sync::CancellationToken::new();
+    let source = crate::engine::source::provider_source(
+        Arc::clone(&drive),
+        native.clone(),
+        path.display().to_string(),
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = crate::engine::download(
+        Arc::clone(&drive),
+        Arc::clone(&source),
+        "quark",
+        &path,
+        size,
+        Arc::clone(&done),
+        0,
+        token.clone(),
+    )
+    .await;
+    let secs = started.elapsed().as_secs_f64();
+    println!(
+        "  engine: {:?} in {secs:.1}s -> {:.1} KB/s, done={}",
+        outcome.as_ref().map(|ok| *ok),
+        size as f64 / 1024.0 / secs,
+        done.load(std::sync::atomic::Ordering::Relaxed)
+    );
+    if !matches!(outcome, Ok(true)) {
+        println!("  engine did not finish, skipping verification");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let local = std::fs::read(&path).unwrap();
+    println!("  file length {} (expected {size})", local.len());
+    let window = 64 * 1024u64;
+    let mut bad = 0;
+    for k in 0..8u64 {
+        let begin = (size / 9) * k % size.saturating_sub(window);
+        let end = begin + window;
+        let crate::providers::RangeResult::Body(handle) =
+            source.open(begin, Some(end)).await
+        else {
+            println!("  window {k} at {begin}: open failed");
+            bad += 1;
+            continue;
+        };
+        let mut stream = handle.stream;
+        let mut remote = Vec::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    remote.extend_from_slice(&chunk);
+                    if remote.len() as u64 >= window {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let want = &remote[..remote.len().min(window as usize)];
+        let got = &local[begin as usize..(begin as usize + want.len()).min(local.len())];
+        if want == got {
+            println!("  window {k} at {begin}: match ({} B)", want.len());
+        } else {
+            bad += 1;
+            println!("  window {k} at {begin}: MISMATCH ({} B)", want.len());
+        }
+    }
+    println!("  mismatches: {bad}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

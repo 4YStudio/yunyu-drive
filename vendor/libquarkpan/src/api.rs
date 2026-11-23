@@ -10,6 +10,7 @@ use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue, RANGE};
 use serde::Serialize;
 
 use crate::error::{QuarkPanError, Result};
+use crate::quality;
 use crate::model::{
     AuthRequest, AuthResponse, CreateFolderRequest, CreateFolderResponse, DeleteFilesRequest,
     DeleteFilesResponse, DownloadInfo, EmptyData, FileDownloadUrlItem, FinishRequest,
@@ -41,8 +42,26 @@ impl ApiClient {
         let mut headers = HeaderMap::new();
         headers.insert("Origin", HeaderValue::from_static(ORIGIN));
         headers.insert("Referer", HeaderValue::from_static(REFERER));
+        // The CDN does not judge "is this the official client" on the user agent
+        // alone: it looks at a whole set of headers. Minting a url with the full
+        // browser set and then fetching it with only `Cookie` reads as two
+        // different clients and is the classic cause of a download that is
+        // silently throttled to a crawl.
         let mut download_headers = headers.clone();
         download_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        download_headers.insert(
+            "Accept",
+            HeaderValue::from_static("application/json, text/plain, */*"),
+        );
+        download_headers.insert(
+            "Accept-Language",
+            HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+        );
+        download_headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+        download_headers.insert("Pragma", HeaderValue::from_static("no-cache"));
+        download_headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
+        download_headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
+        download_headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-site"));
         let pool_size: usize = min(num_cpus::get().saturating_mul(2), 16).max(3);
         // API calls are small and finish in well under a minute, so a total
         // deadline is right for them.
@@ -61,7 +80,7 @@ impl ApiClient {
         // times out after a while" bug. `read_timeout` is the right tool: it
         // resets after every successful read, so it only fires when the
         // connection genuinely stalls.
-        let download_client = reqwest::Client::builder()
+        let download_builder = reqwest::Client::builder()
             .user_agent(UA)
             .default_headers(download_headers)
             .no_gzip()
@@ -71,8 +90,8 @@ impl ApiClient {
             .pool_idle_timeout(Duration::from_secs(50))
             .pool_max_idle_per_host(pool_size)
             .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(60))
-            .build()?;
+            .read_timeout(Duration::from_secs(60));
+        let download_client = download_builder.build()?;
         Ok(Self {
             config,
             client,
@@ -169,14 +188,38 @@ impl ApiClient {
         Ok(serde_json::from_str::<U>(&text)?)
     }
 
-    pub async fn get_download_info(&self, fid: &str) -> Result<DownloadInfo> {
+    /// The api entries a download url can be minted through.
+    ///
+    /// They differ only in query parameters, but the urls they hand back are
+    /// not equivalent: the CDN routes per entry, so one entry can return a node
+    /// that is slow or already unhealthy while another is fine. The first entry
+    /// is the plain pc-client call; the other two exist only to rescue a bad
+    /// answer from it.
+    const DOWNLOAD_ENTRIES: [&'static [(&'static str, &'static str)]; 3] = [
+        &[],
+        &[("entry", "ft")],
+        &[("fr", "android")],
+    ];
+
+    async fn download_info_from(
+        &self,
+        fid: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<DownloadInfo> {
         let req = GetFilesDownloadUrlsRequest {
             fids: vec![fid.to_string()],
         };
+        let mut query = String::from("pr=ucpro&fr=pc");
+        for (name, value) in extra {
+            query.push('&');
+            query.push_str(name);
+            query.push('=');
+            query.push_str(value);
+        }
         let res: GetFilesDownloadUrlsResponse = self
             .post_json(
                 format!(
-                    "{}/1/clouddrive/file/download?pr=ucpro&fr=pc",
+                    "{}/1/clouddrive/file/download?{query}",
                     self.config.api_base_url
                 ),
                 &req,
@@ -194,6 +237,40 @@ impl ApiClient {
             .ok_or_else(|| {
                 QuarkPanError::invalid_argument(format!("download url not found for fid {fid}"))
             })
+    }
+
+    /// Mints a download url, trying the other client entries when the first one
+    /// looks unhealthy.
+    ///
+    /// A single-file download that needs no rescue still costs exactly one api
+    /// call: a url scoring at or above [`quality::FAST_PATH_SCORE`] stops the
+    /// search, because the remaining entries would only cost latency.
+    pub async fn get_download_info(&self, fid: &str) -> Result<DownloadInfo> {
+        let mut best: Option<(i32, DownloadInfo)> = None;
+        let mut last_err: Option<QuarkPanError> = None;
+        for extra in Self::DOWNLOAD_ENTRIES {
+            match self.download_info_from(fid, extra).await {
+                Ok(info) => {
+                    let score = quality::score(&info.download_url);
+                    let better = best
+                        .as_ref()
+                        .is_none_or(|(best_score, _)| score > *best_score);
+                    if better {
+                        best = Some((score, info));
+                    }
+                    if score >= quality::FAST_PATH_SCORE {
+                        break;
+                    }
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        match best {
+            Some((_, info)) => Ok(info),
+            None => Err(last_err.unwrap_or_else(|| {
+                QuarkPanError::invalid_argument(format!("download url not found for fid {fid}"))
+            })),
+        }
     }
 
     pub async fn get_download_url(&self, fid: &str) -> Result<String> {
@@ -524,16 +601,51 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Opens a byte stream from `start_offset` to the end of the file.
+    ///
+    /// Kept for callers that only resume; `download_stream_range` is the one
+    /// `DownloadBuilder` uses.
+    #[allow(dead_code)]
     pub async fn download_stream(
         &self,
         fid: &str,
         start_offset: Option<u64>,
     ) -> Result<crate::model::BoxByteStream> {
+        Ok(self
+            .download_stream_range(fid, start_offset, None)
+            .await?
+            .0)
+    }
+
+    /// Opens a byte stream for `[start_offset, end_offset)` of the target file.
+    ///
+    /// `end_offset` is exclusive, so the request asks for
+    /// `Range: bytes=start-end-1`. `None` keeps the open-ended behaviour that
+    /// resume uses.
+    /// The second half of the result is the raw `Content-Range` header.
+    ///
+    /// A segmented download has to verify that the CDN started where it was
+    /// asked to: bytes served from a different offset would be written into the
+    /// wrong place and produce a file of exactly the right length that is
+    /// silently corrupt. `None` means the CDN did not send the header, which is
+    /// not itself an error.
+    pub async fn download_stream_range(
+        &self,
+        fid: &str,
+        start_offset: Option<u64>,
+        end_offset: Option<u64>,
+    ) -> Result<(crate::model::BoxByteStream, Option<String>)> {
         let url = self.get_download_url(fid).await?;
         let cookie = self.resolve_cookies().await;
         let mut req = self.download_client.get(url).header("Cookie", cookie);
-        if let Some(start_offset) = start_offset {
-            req = req.header(RANGE, format!("bytes={start_offset}-"));
+        match (start_offset, end_offset) {
+            (Some(start), Some(end)) if end > start => {
+                req = req.header(RANGE, format!("bytes={start}-{}", end - 1));
+            }
+            (Some(start), _) => {
+                req = req.header(RANGE, format!("bytes={start}-"));
+            }
+            _ => {}
         }
         let res = req.send().await?;
         let res = res.error_for_status()?;
@@ -542,10 +654,15 @@ impl ApiClient {
                 "server did not honor range request for resume download",
             ));
         }
+        let served = res
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let stream = res
             .bytes_stream()
             .map(|chunk| chunk.map_err(QuarkPanError::from));
-        Ok(Box::pin(stream))
+        Ok((Box::pin(stream), served))
     }
 }
 

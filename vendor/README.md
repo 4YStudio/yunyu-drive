@@ -31,6 +31,8 @@ cloud139    = { path = "../vendor/cloud139" }
 - `src/lib.rs` 新增 `QuarkPan::move_to(fids, to_pdir_fid)` 与 `QuarkPan::copy_to(fids, to_pdir_fid)`，内部调 `transfer_files` + `wait_task`。被 `src-tauri/src/providers/quark.rs` 的移动 / 复制功能使用。
 - `src/model.rs` 新增上述接口的请求 / 响应结构体。
 - `src/download.rs`：下载客户端 `.timeout(300s)` 改为 `.read_timeout(60s)` —— 修「大文件下载中途整体超时」：总时长限制改成单次读空闲限制。
+- **分段下载（本项目自己加的，不在上游）**：`src/api.rs` 的 `download_stream` 拆出 `download_stream_range(&self, fid, start_offset, end_offset)`，`Range` 头支持闭区间 `bytes={start}-{end-1}`，并额外返回原始 `Content-Range` 头；`src/download.rs` 的 `DownloadBuilder` 新增 `.end_offset()`，`DownloadRequest::stream()` 改为返回 `(stream, Option<String>)`。用途见 `src-tauri/src/engine/`：多连接分段下载需要按片取字节，并且必须核对服务端真的从请求的偏移开始返回（否则会写出长度正确、内容错乱的文件）。上游的 `download_stream(fid, start_offset)` 保留为薄封装。
+- **取链择优（本项目自己加的，不在上游）**：新增 `src/quality.rs`（`score(url)` / `FAST_PATH_SCORE`），`src/api.rs` 的 `get_download_info` 改为按三个客户端入口（无额外参数 / `entry=ft` / `fr=android`）各取一次、按 `score` 择优，达到 `FAST_PATH_SCORE` 立即停止。原来只调一次 `POST /1/clouddrive/file/download?pr=ucpro&fr=pc`，拿到的 url 可能落在慢节点上；三个入口的 CDN 路由不同，换一个往往就好了。健康 url 仍在一次请求内返回，不会因为多问两轮而变慢。
 
 ### cloud139（+9 / -18 行）
 
@@ -38,11 +40,12 @@ cloud139    = { path = "../vendor/cloud139" }
 
 ## 与上游的差异如何核对
 
-两个目录的 `src/` 与上游工作区**逐字节一致**。要复核，把上游克隆到同级目录后：
+`vendor/cloud139/src` 与上游工作区**逐字节一致**；`vendor/libquarkpan/src` 只多了上面两条补丁（分段下载、取链择优，新增文件 `quality.rs`）。要复核，把上游克隆到同级目录后：
 
 ```sh
-diff -r ../quark-cli/libquarkpan/src vendor/libquarkpan/src   # 应无输出
-diff -r ../cloud139/src        vendor/cloud139/src            # 应无输出
+diff -r ../cloud139/src vendor/cloud139/src          # 应无输出
+diff -r ../quark-cli/libquarkpan/src vendor/libquarkpan/src
+# 预期只有 api.rs / download.rs 的分段下载改动、api.rs 的取链择优，以及新增的 quality.rs
 ```
 
 ## 为了能独立编译做了什么改动
@@ -55,7 +58,7 @@ homepage = "https://github.com/i-sync/quark-cli"
 repository = "https://github.com/i-sync/quark-cli"
 ```
 
-这是**唯一**一处为了 vendoring 而改的文件；`src/` 下的代码一行未动。
+`src/` 下的改动只有上面补丁清单里的两条（**分段下载** `download_stream_range` + `DownloadBuilder::end_offset`、**取链择优** `quality.rs` + `get_download_info` 多入口），都是本项目需要的功能，不是 vendoring 的副产品。除此之外 `src/` 与上游逐字节一致。
 
 `cloud139` 是独立 crate（没有 workspace 继承），`Cargo.toml` 原样保留。
 

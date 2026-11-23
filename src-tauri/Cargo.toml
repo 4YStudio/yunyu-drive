@@ -57,6 +57,10 @@ sha2 = "0.10.9"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 
+# Deterministic clocks in tests: `start_paused` needs `test-util`.
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

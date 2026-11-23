@@ -266,6 +266,21 @@
             <article class="card reveal">
               <span class="card-icon">
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M4 16.5V19a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-2.5" />
+                  <path d="M12 3.5v11M12 14.5 7.5 10M12 14.5 16.5 10" />
+                </svg>
+              </span>
+              <h3>分段并发下载</h3>
+              <p>
+                夸克与阿里云盘按文件大小自适应开几百条连接，各取一段区间，
+                谁先完成谁再领新片。慢连接会被判定后换新连接，直链过期自动重新取链，
+                断点续传按原分片计划接着下。
+              </p>
+            </article>
+
+            <article class="card reveal">
+              <span class="card-icon">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M9.5 14.5 14.5 9.5" />
                   <path d="M13 6.8l1.6-1.6a3.9 3.9 0 0 1 5.5 5.5l-1.6 1.6" />
                   <path d="M11 17.2l-1.6 1.6a3.9 3.9 0 0 1-5.5-5.5l1.6-1.6" />

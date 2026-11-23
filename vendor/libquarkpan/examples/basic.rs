@@ -54,7 +54,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "uploaded: {}, rapid={}",
                 completed.fid, completed.rapid_upload
             );
-            let mut download = quark_pan.download().fid(fid).prepare()?.stream().await?;
+            let (mut download, _served) = quark_pan
+                .download()
+                .fid(fid)
+                .prepare()?
+                .stream()
+                .await?;
             while let Some(chunk) = futures_util::StreamExt::next(&mut download).await {
                 let chunk = chunk?;
                 println!("downloaded chunk: {}", chunk.len());

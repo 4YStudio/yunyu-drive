@@ -19,8 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider,
-    EntryDto, PathNode, ProviderId, QuotaInfo, RecycleEntry, SearchHit, ShareFile, ShareLink,
-    UploadSink,
+    EntryDto, PathNode, ProviderId, QuotaInfo, RangeResult, RecycleEntry, SearchHit, ShareFile,
+    ShareLink, UploadSink,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -433,12 +433,57 @@ impl DriveProvider for QuarkProvider {
         // Passing it on made every Quark download end in "文件校验失败", so it
         // stays unset — the size check in the engine is the guard here.
         let _ = request.info().await?;
-        let stream = request.stream().await?;
+        let (stream, _served) = request.stream().await?;
         Ok(DownloadHandle {
             size: 0,
             md5: None,
             stream: Box::new(stream.map(|item| item.map_err(AppError::from))),
         })
+    }
+
+    fn supports_ranges(&self) -> bool {
+        true
+    }
+
+    async fn open_download_range(&self, fid: &str, start: u64, end: Option<u64>) -> RangeResult {
+        let builder = self.client.download().fid(fid.to_string());
+        let builder = if start > 0 {
+            builder.start_offset(start)
+        } else {
+            builder
+        };
+        let builder = match end {
+            Some(end) => builder.end_offset(end),
+            _ => builder,
+        };
+        let request = match builder.prepare() {
+            Ok(request) => request,
+            Err(err) => return RangeResult::Failed(AppError::from(err)),
+        };
+        // Skip `info()`: a segmented download mints hundreds of links per file,
+        // and the cookie it refreshes is already current from the listing call.
+        // The single-stream path keeps calling it.
+        match request.stream().await {
+            Ok((stream, served)) => RangeResult::body(
+                DownloadHandle {
+                    size: 0,
+                    md5: None,
+                    stream: Box::new(stream.map(|item| item.map_err(AppError::from))),
+                },
+                start,
+                served.as_deref(),
+            ),
+            // A signed link that outlived its TTL answers 401/403/410/412. Those
+            // must reach the engine as `Expired`, not as a generic failure: the
+            // engine reacts by minting a new link straight away, while a plain
+            // failure burns this segment's retry budget on a url that will never
+            // work again. `describe` folds every one of them into the same
+            // "登录状态已失效" text, which would lose the distinction.
+            Err(err) => match expired_status(&err) {
+                Some(_) => RangeResult::Expired,
+                None => RangeResult::from_error(AppError::from(err)),
+            },
+        }
     }
 
     async fn upload(
@@ -1202,4 +1247,19 @@ async fn hash_file(
         format!("{:x}", sha1.finalize()),
         total,
     ))
+}
+
+/// The HTTP status inside a quark error, when it is one that means "this link
+/// is no longer valid".
+///
+/// The provider layer is the only place that still has the status: `AppError`
+/// is a bare string, and `describe` maps 401/403 onto the same "cookie expired"
+/// message a real auth failure produces, so the engine cannot tell them apart
+/// once the error has been converted.
+fn expired_status(err: &libquarkpan::QuarkPanError) -> Option<u16> {
+    let libquarkpan::QuarkPanError::Http(http) = err else {
+        return None;
+    };
+    let status = http.status()?.as_u16();
+    matches!(status, 401 | 403 | 410 | 412).then_some(status)
 }

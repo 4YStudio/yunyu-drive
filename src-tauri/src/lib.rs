@@ -2,6 +2,7 @@ mod bridge;
 mod commands;
 mod config;
 mod deeplink;
+mod engine;
 mod error;
 mod logging;
 mod login;

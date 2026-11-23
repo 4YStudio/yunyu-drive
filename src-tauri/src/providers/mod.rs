@@ -329,6 +329,77 @@ pub struct DownloadHandle {
 
 pub type BoxStream = Box<dyn Stream<Item = Result<Bytes, AppError>> + Send + Unpin + 'static>;
 
+/// Parses the first number of a `Content-Range` header (`bytes 0-1023/4096`).
+///
+/// The start offset is what matters: a CDN that answers a ranged request from a
+/// different offset than the one asked for would make the engine write those
+/// bytes at the wrong place, producing a file that is the right length and
+/// silently corrupt. Returns `None` for a missing or unparsable header, which
+/// the caller must treat as "cannot verify" rather than "verified".
+pub fn content_range_start(value: Option<&str>) -> Option<u64> {
+    let value = value?;
+    let rest = value.trim().strip_prefix("bytes")?.trim_start();
+    let rest = rest.strip_prefix('=').unwrap_or(rest);
+    let start = rest.split(['-', '/']).next()?.trim();
+    start.parse::<u64>().ok()
+}
+
+/// Outcome of asking a drive for a byte range.
+///
+/// A separate type from `AppResult` because the segmented engine has to tell
+/// three cases apart that all collapse into one string error otherwise: the
+/// link went stale (mint a new one), the CDN ignored the range (give up on
+/// segments), and the drive has no ranged endpoint (use one stream).
+pub enum RangeResult {
+    /// The drive accepted the range and is streaming it.
+    Body(DownloadHandle),
+    /// The drive answered the range but from a different offset than requested.
+    ///
+    /// Writing those bytes would put them at the wrong place in the file and
+    /// produce a corrupt download of exactly the right length — the worst kind
+    /// of failure, because nothing downstream notices. The engine abandons the
+    /// attempt instead.
+    StartMismatch { asked: u64, served: u64 },
+    /// Link expired, signature rejected, or access revoked.
+    Expired,
+    /// The CDN answered with the whole file instead of the range.
+    RangeIgnored,
+    /// A genuine failure worth reporting as-is.
+    Failed(AppError),
+}
+
+impl RangeResult {
+    /// Builds the outcome for a ranged response, verifying that the CDN started
+    /// where it was asked to.
+    ///
+    /// `start` of 0 is the whole-file case and needs no check. When the header
+    /// is absent there is nothing to verify against, so the response is taken
+    /// at its word — refusing every response without a `Content-Range` would
+    /// break CDNs that simply do not send one.
+    pub fn body(handle: DownloadHandle, start: u64, content_range: Option<&str>) -> Self {
+        if start > 0 {
+            if let Some(served) = content_range_start(content_range) {
+                if served != start {
+                    return Self::StartMismatch {
+                        asked: start,
+                        served,
+                    };
+                }
+            }
+        }
+        Self::Body(handle)
+    }
+
+    /// Maps an `open_download_range` error into the closest outcome.
+    pub fn from_error(err: AppError) -> Self {
+        if err.0 == RANGE_IGNORED {
+            Self::RangeIgnored
+        } else {
+            Self::Failed(err)
+        }
+    }
+}
+
 /// Error text a provider returns when the CDN ignored a resume `Range` and
 /// answered with the whole file.
 ///
@@ -337,9 +408,14 @@ pub type BoxStream = Box<dyn Stream<Item = Result<Bytes, AppError>> + Send + Unp
 pub const RANGE_IGNORED: &str = "服务器不支持断点续传（忽略 Range）";
 
 /// One downloadable file inside a share, as the provider addresses it.
+///
+/// Cloned because the segmented engine caches it: minting a url is cheap on
+/// most drives but not on Aliyun, where it copies the file into the user's own
+/// drive first.
+#[derive(Clone)]
 pub struct ShareLink {
-    /// Where to read the bytes from. Minted fresh for every attempt: most CDNs
-    /// sign it with a short lifetime.
+    /// Where to read the bytes from. Most CDNs sign it with a short lifetime,
+    /// so it is re-minted once it expires.
     pub url: String,
     /// Headers the CDN insists on (`Referer`, `User-Agent`, a cookie, ...).
     pub headers: Vec<(String, String)>,
@@ -440,6 +516,33 @@ pub trait DriveProvider: Send + Sync {
     /// Returning a positioned stream is what lets the transfer engine own
     /// resume, retry and pause for every drive at once.
     async fn open_download(&self, fid: &str, start: u64) -> AppResult<DownloadHandle>;
+
+    /// Opens the byte range `[start, end)` of `fid`.
+    ///
+    /// The default says "this drive only does one stream at a time", which is
+    /// what every drive except Quark and Aliyun does. Those two override it and
+    /// the segmented engine uses them; everyone else keeps the single-stream
+    /// path and is unaffected.
+    ///
+    /// Not part of `open_download` because resume already works everywhere:
+    /// widening that signature would touch five providers, their tests and the
+    /// share path for a capability only two of them have.
+    #[allow(dead_code)]
+    async fn open_download_range(&self, fid: &str, start: u64, end: Option<u64>) -> RangeResult {
+        let _ = end;
+        match self.open_download(fid, start).await {
+            Ok(handle) => RangeResult::Body(handle),
+            Err(err) => RangeResult::from_error(err),
+        }
+    }
+
+    /// True when [`Self::open_download_range`] serves real ranges.
+    ///
+    /// Cheaper than probing: the engine asks this before splitting a file, so
+    /// a drive without ranged support never pays for a probe request.
+    fn supports_ranges(&self) -> bool {
+        false
+    }
 
     /// Uploads `local` into `parent` as `name`, reporting through `sink`.
     /// Returns the new file's native id when the drive reports one.
@@ -714,6 +817,70 @@ impl UploadSink for CounterSink {
 
 #[cfg(test)]
 mod tests {
+    use super::content_range_start;
+
+    #[test]
+    fn content_range_start_reads_the_first_offset() {
+        assert_eq!(content_range_start(Some("bytes 0-1023/4096")), Some(0));
+        assert_eq!(
+            content_range_start(Some("bytes 1024-2047/4096")),
+            Some(1024)
+        );
+        assert_eq!(content_range_start(Some("bytes 2048-4095/*")), Some(2048));
+        assert_eq!(
+            content_range_start(Some("  bytes=1024-2047/4096  ")),
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn a_body_from_the_wrong_offset_is_refused() {
+        use super::{DownloadHandle, RangeResult};
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        fn handle() -> DownloadHandle {
+            DownloadHandle {
+                size: 10,
+                md5: None,
+                stream: Box::new(stream::empty::<Result<Bytes, crate::error::AppError>>()),
+            }
+        }
+
+        // Served where asked: accepted.
+        assert!(matches!(
+            RangeResult::body(handle(), 1024, Some("bytes 1024-2047/4096")),
+            RangeResult::Body(_)
+        ));
+        // Served from zero although 1024 was asked: writing this would corrupt
+        // the file, so it must be refused rather than streamed.
+        match RangeResult::body(handle(), 1024, Some("bytes 0-4095/4096")) {
+            RangeResult::StartMismatch { asked, served } => {
+                assert_eq!((asked, served), (1024, 0));
+            }
+            _ => panic!("a wrong start offset must not be accepted"),
+        }
+        // No header: nothing to verify against, so it is taken at its word.
+        assert!(matches!(
+            RangeResult::body(handle(), 1024, None),
+            RangeResult::Body(_)
+        ));
+        // The whole-file case needs no check at all.
+        assert!(matches!(
+            RangeResult::body(handle(), 0, None),
+            RangeResult::Body(_)
+        ));
+    }
+
+    #[test]
+    fn content_range_start_refuses_what_it_cannot_read() {
+        // Missing or malformed must read as "unverifiable", never as offset 0.
+        assert_eq!(content_range_start(None), None);
+        assert_eq!(content_range_start(Some("")), None);
+        assert_eq!(content_range_start(Some("items 0-10/20")), None);
+        assert_eq!(content_range_start(Some("bytes a-b/c")), None);
+    }
+
     use super::*;
 
     #[test]

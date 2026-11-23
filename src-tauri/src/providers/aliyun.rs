@@ -32,9 +32,9 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider, EntryDto,
-    PathNode, ProviderId, QuotaInfo, RecycleEntry, SearchHit, ShareFile, ShareLink, UploadSink,
-    RANGE_IGNORED,
+    native_of, qualify, AuthState, Capabilities, DirListing, DownloadHandle, DriveProvider,
+    EntryDto, PathNode, ProviderId, QuotaInfo, RangeResult, RecycleEntry, SearchHit, ShareFile,
+    ShareLink, UploadSink, RANGE_IGNORED,
 };
 use crate::error::{AppError, AppResult};
 use crate::share::{AccountInfo, ShareEntry, ShareListing, ShareSession};
@@ -62,6 +62,21 @@ const CANARY_WEB: &str = "client=web,app=adrive,version=v3.17.0";
 /// Tag used on the share endpoints; the share backend rejects other tags.
 const CANARY_SHARE: &str = "client=web,app=share,version=v2.3.1";
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+/// Referers a signed download url may have been minted against, in the order
+/// we try them.
+///
+/// The referer is part of the OSS signature (`x-oss-additional-headers=referer`),
+/// so a wrong value is a hard 403 `SignatureDoesNotMatch` and a missing one is a
+/// 400 `AuthorizationArgumentError`. Which value is right is not a constant: it
+/// depends on the account and on the canary tag that minted the url. Measured on
+/// 2026-11-23 for this account, `/v2/file/get_download_url` links answer 206 with
+/// `aliyundrive.com` and 403 with `alipan.com` — the opposite of what the older
+/// note in GeZi recorded, which is exactly why this is discovered at runtime
+/// rather than assumed.
+const DOWNLOAD_REFERERS: [&str; 2] = [
+    "https://www.aliyundrive.com/",
+    "https://www.alipan.com/",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AliyunCredentials {
@@ -123,6 +138,9 @@ pub struct AliyunProvider {
     drive_settled: std::sync::atomic::AtomicBool,
     /// Built on first use and reused, so all requests share one pool.
     client: std::sync::OnceLock<reqwest::Client>,
+    /// The referer that satisfied the OSS signature, once one has. Cached so a
+    /// download of a few hundred segments does not probe both on every range.
+    referer: std::sync::OnceLock<&'static str>,
 }
 
 impl AliyunProvider {
@@ -132,6 +150,7 @@ impl AliyunProvider {
             credential_path,
             drive_settled: std::sync::atomic::AtomicBool::new(false),
             client: std::sync::OnceLock::new(),
+            referer: std::sync::OnceLock::new(),
         }
     }
 
@@ -175,6 +194,73 @@ impl AliyunProvider {
     /// Shared client. Built once: a fresh `reqwest::Client` per call meant a new
     /// connection pool (and a new TLS handshake) for every request and every
     /// upload part.
+    /// Issues a GET against a signed download url, discovering which referer the
+    /// signature was made against.
+    ///
+    /// The referer is signed into the object url, so a wrong one is a hard 403
+    /// `SignatureDoesNotMatch` and a missing one a 400
+    /// `AuthorizationArgumentError`. Neither is fatal: the next candidate fixes
+    /// it, and the one that works is remembered for the rest of the process so a
+    /// few hundred segments do not probe twice each. Any other status is handed
+    /// back untouched, which keeps a genuinely expired url readable as expired.
+    async fn download_get(
+        &self,
+        url: &str,
+        range: Option<String>,
+    ) -> AppResult<reqwest::Response> {
+        let client = self.http()?;
+        let cached = self.referer.get().copied();
+        let mut candidates: Vec<&'static str> = Vec::with_capacity(DOWNLOAD_REFERERS.len() + 1);
+        if let Some(cached) = cached {
+            candidates.push(cached);
+        }
+        for referer in DOWNLOAD_REFERERS {
+            if Some(referer) != cached {
+                candidates.push(referer);
+            }
+        }
+        let mut last = String::from("未知原因");
+        for referer in candidates {
+            let mut request = client
+                .get(url)
+                .header(reqwest::header::REFERER, referer)
+                .header(reqwest::header::USER_AGENT, UA)
+                .header(reqwest::header::ACCEPT, "*/*")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Sec-Fetch-Dest", "empty")
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Site", "same-site");
+            if let Some(range) = &range {
+                request = request.header(reqwest::header::RANGE, range.clone());
+            }
+            let res = request
+                .send()
+                .await
+                .map_err(|e| AppError::new(format!("下载失败：{e}")))?;
+            let status = res.status();
+            if !matches!(status.as_u16(), 400 | 403) {
+                let _ = self.referer.set(referer);
+                return Ok(res);
+            }
+            let body = res.text().await.unwrap_or_default();
+            let signed = body.contains("SignatureDoesNotMatch")
+                || body.contains("AuthorizationArgumentError");
+            if !signed {
+                let _ = self.referer.set(referer);
+                return Err(AppError::new(format!(
+                    "下载失败（HTTP {}）：{}",
+                    status.as_u16(),
+                    &body[..body.len().min(300)]
+                )));
+            }
+            crate::ylog!(
+                "aliyun: referer {referer} rejected for this url, trying the next candidate"
+            );
+            last = format!("HTTP {} {}", status.as_u16(), body.chars().take(200).collect::<String>());
+        }
+        Err(AppError::new(format!("下载链接签名无法匹配（{last}）")))
+    }
+
     fn http(&self) -> AppResult<reqwest::Client> {
         if let Some(client) = self.client.get() {
             return Ok(client.clone());
@@ -750,7 +836,12 @@ impl AliyunProvider {
         let drive = self.drive().await?;
         let body = json!({ "drive_id": drive, "file_id": fid, "expire_sec": 14400 });
         let mut last = String::from("未知原因");
-        for tag in [CANARY_ANDROID, CANARY_WEB] {
+        let order: [&str; 2] = if std::env::var_os("YY_WEB_TAG").is_some() {
+            [CANARY_WEB, CANARY_ANDROID]
+        } else {
+            [CANARY_ANDROID, CANARY_WEB]
+        };
+        for tag in order {
             let token = self.token().await?;
             let (device, signature) = self.sign().await?;
             let value = self
@@ -944,12 +1035,12 @@ fn policy_refusal(text: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     match code {
-        "SharelinkCreateExceedDailyLimit" => Some(
-            "阿里云盘今天的分享次数已用完，请明天再试".to_string(),
-        ),
-        "InvalidParameter.FileIdList" if message.contains("count limit") => Some(
-            "阿里云盘一个分享只能包含有限个文件，请减少选择后重试".to_string(),
-        ),
+        "SharelinkCreateExceedDailyLimit" => {
+            Some("阿里云盘今天的分享次数已用完，请明天再试".to_string())
+        }
+        "InvalidParameter.FileIdList" if message.contains("count limit") => {
+            Some("阿里云盘一个分享只能包含有限个文件，请减少选择后重试".to_string())
+        }
         "TooManyRequests" => Some("阿里云盘请求过于频繁，请稍后重试".to_string()),
         // Everything else on 403 really is an auth problem.
         _ => None,
@@ -1364,21 +1455,12 @@ impl DriveProvider for AliyunProvider {
     async fn open_download(&self, fid: &str, start: u64) -> AppResult<DownloadHandle> {
         let (url, size) = self.download_url(fid).await?;
 
-        let mut request = self
-            .http()?
-            .get(&url)
-            // The CDN rejects bare requests: it wants the same browser-shaped
-            // headers the rest of the API gets, otherwise every download comes
-            // back as HTTP 400.
-            .header(reqwest::header::REFERER, "https://www.aliyundrive.com/")
-            .header(reqwest::header::USER_AGENT, UA);
-        if start > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={start}-"));
-        }
-        let res = request
-            .send()
-            .await
-            .map_err(|e| AppError::new(format!("下载失败：{e}")))?;
+        let range = if start > 0 {
+            Some(format!("bytes={start}-"))
+        } else {
+            None
+        };
+        let res = self.download_get(&url, range).await?;
         if !res.status().is_success() && res.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             let status = res.status().as_u16();
             let body = res.text().await.unwrap_or_default();
@@ -1401,6 +1483,73 @@ impl DriveProvider for AliyunProvider {
             md5: None,
             stream: Box::new(stream),
         })
+    }
+
+    fn supports_ranges(&self) -> bool {
+        true
+    }
+
+    async fn open_download_range(&self, fid: &str, start: u64, end: Option<u64>) -> RangeResult {
+        // A fresh url per range on purpose: the CDN load-balances by url, so
+        // re-minting is what spreads the segments over different nodes instead
+        // of queueing hundreds of requests behind one.
+        let (url, size) = match self.download_url(fid).await {
+            Ok(pair) => pair,
+            Err(err) => return RangeResult::from_error(err),
+        };
+
+        let range = match end {
+            Some(end) if end > start => Some(format!("bytes={start}-{}", end - 1)),
+            Some(_) => Some(format!("bytes={start}-")),
+            None if start > 0 => Some(format!("bytes={start}-")),
+            None => None,
+        };
+        let res = match self.download_get(&url, range).await {
+            Ok(res) => res,
+            Err(err) => return RangeResult::from_error(err),
+        };
+
+        let status = res.status();
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            let code = status.as_u16();
+            // 401/403/410/412 on a signed url mean the signature is gone, which
+            // a fresh url fixes; 404 means the file itself is gone.
+            if matches!(code, 401 | 403 | 410 | 412) {
+                return RangeResult::Expired;
+            }
+            let body = res.text().await.unwrap_or_default();
+            crate::ylog!(
+                "aliyun: range HTTP {code} body={}",
+                &body[..body.len().min(300)]
+            );
+            return RangeResult::Failed(AppError::new(format!("下载失败（HTTP {code}）：{body}")));
+        }
+        // A CDN that ignores `Range` answers 200 with the whole body; writing
+        // that into a segment would corrupt the file.
+        if start > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            return RangeResult::RangeIgnored;
+        }
+        // Read the served offset before consuming the response: a CDN that
+        // answers from a different offset would corrupt the file silently.
+        let served = res
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let stream = {
+            use futures_util::StreamExt;
+            res.bytes_stream()
+                .map(|chunk| chunk.map_err(|e| AppError::new(format!("读取失败：{e}"))))
+        };
+        RangeResult::body(
+            DownloadHandle {
+                size,
+                md5: None,
+                stream: Box::new(stream),
+            },
+            start,
+            served.as_deref(),
+        )
     }
 
     async fn upload(
@@ -1941,7 +2090,11 @@ impl DriveProvider for AliyunProvider {
                     return Ok(ShareLink {
                         url,
                         headers: vec![
-                            ("Referer".to_string(), "https://www.aliyundrive.com/".to_string()),
+                            (
+                                "Referer".to_string(),
+                                self.referer.get().copied().unwrap_or(DOWNLOAD_REFERERS[0])
+                                    .to_string(),
+                            ),
                             ("User-Agent".to_string(), UA.to_string()),
                         ],
                         size,
@@ -1951,6 +2104,9 @@ impl DriveProvider for AliyunProvider {
                 Err(err) => last = err.to_string(),
             }
         }
+        // The copy is real even though no url came back, and the caller will
+        // never learn its id: delete it here or it stays in the user's drive.
+        self.share_cleanup(&copy).await;
         Err(AppError::new(format!(
             "阿里云盘分享文件无法获取下载地址（{last}）"
         )))

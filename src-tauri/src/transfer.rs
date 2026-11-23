@@ -128,6 +128,15 @@ pub fn set_speed_limit(kbps: u64) {
     SPEED_LIMIT.store(kbps.saturating_mul(1024), Ordering::Relaxed);
 }
 
+/// The current cap in bytes per second (0 = unlimited).
+///
+/// Read by the segmented engine's limiter, which cannot reuse [`throttle`]: that
+/// one measures a single writer against the whole budget, so several workers
+/// calling it each get the full budget and the cap stops holding.
+pub(crate) fn speed_limit_bytes() -> u64 {
+    SPEED_LIMIT.load(Ordering::Relaxed)
+}
+
 /// Sleeps just enough to keep `written` bytes on schedule.
 ///
 /// Called after each chunk: the budget is the bytes so far over the cap, and the
@@ -1275,10 +1284,25 @@ impl UploadSink for OffsetSink {
 /// mismatch) is never retried — it would fail identically every time.
 fn is_retryable(err: &AppError) -> bool {
     let text = err.0.to_lowercase();
-    if text.contains("登录状态") || text.contains("校验失败") || text.contains("不存在") {
+    // A verdict that will not change on a second attempt. These are checked
+    // first: a message can mention a connection ("连接已关闭，写入磁盘失败")
+    // while the real problem is the disk.
+    const TERMINAL: [&str; 10] = [
+        "登录状态",
+        "校验失败",
+        "不一致",
+        "磁盘空间",
+        "空间不足",
+        "拒绝访问",
+        "没有权限",
+        "无权限",
+        "不存在",
+        "不支持",
+    ];
+    if TERMINAL.iter().any(|needle| text.contains(needle)) {
         return false;
     }
-    const NEEDLES: [&str; 12] = [
+    const NEEDLES: [&str; 16] = [
         "timed out",
         "timeout",
         "connection",
@@ -1291,6 +1315,13 @@ fn is_retryable(err: &AppError) -> bool {
         "decode",
         "dns",
         "temporar",
+        // A segmented attempt that ran out of rounds is worth resuming: the
+        // sidecar keeps every finished segment, so the next attempt continues
+        // where this one stopped instead of starting over.
+        "分段下载",
+        "链接已失效",
+        "连接过慢",
+        "连接中断",
     ];
     NEEDLES.iter().any(|needle| text.contains(needle))
 }
@@ -1411,11 +1442,36 @@ async fn run_provider_download(
     if let Ok(meta) = tokio::fs::metadata(part_path).await {
         start = meta.len();
     }
+    // The provider expects a native id; the qualified form is what the transfer
+    // record carries, so strip it here. Done before the completeness check:
+    // that check needs the source fingerprint, which is built from this id.
+    let native = crate::providers::native_of(fid);
+    // A length equal to the file is *not* proof of completeness any more: the
+    // segmented engine preallocates the file, so a run that died halfway leaves
+    // it full of holes at exactly `size`. The sidecar is the only thing that
+    // knows whether the bytes are really there — and which file they belong to.
     if size > 0 && start == size && start > 0 {
-        // The partial already holds the whole file — finish it.
-        tokio::fs::rename(part_path, final_path).await?;
-        done.store(base + size, Ordering::Relaxed);
-        return Ok(());
+        let identity = crate::engine::source::provider_source(
+            Arc::clone(drive),
+            native.clone(),
+            part_path.display().to_string(),
+        )
+        .fingerprint();
+        match crate::engine::resume_state(part_path, size, &identity) {
+            crate::engine::ResumeState::Finished => {
+                tokio::fs::rename(part_path, final_path).await?;
+                done.store(base + size, Ordering::Relaxed);
+                return Ok(());
+            }
+            // Work remains. Hand the offset to the engine, which resumes from
+            // its own plan; starting at `size` would read as "already done".
+            crate::engine::ResumeState::Partial => start = 0,
+            crate::engine::ResumeState::None => {
+                tokio::fs::rename(part_path, final_path).await?;
+                done.store(base + size, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
     }
     if size > 0 && start > size {
         // A partial longer than the file cannot be a prefix of it (an earlier
@@ -1426,10 +1482,59 @@ async fn run_provider_download(
         done.store(base, Ordering::Relaxed);
     }
 
-    // The provider expects a native id; the qualified form is what the transfer
-    // record carries, so strip it here.
-    let native = crate::providers::native_of(fid);
     done.store(base + start, Ordering::Relaxed);
+
+    // Drives that serve byte ranges get the segmented engine, which is where
+    // the throughput comes from. It returns `Ok(false)` when the file is too
+    // small or the drive turns out not to honour ranges, and then everything
+    // below runs exactly as before.
+    if start == 0 && size > 0 {
+        let provider = provider_of(fid);
+        let source = crate::engine::source::provider_source(
+            Arc::clone(drive),
+            native.clone(),
+            part_path.display().to_string(),
+        );
+        let segmented = crate::engine::download(
+            Arc::clone(drive),
+            source,
+            provider,
+            part_path,
+            size,
+            Arc::clone(&done),
+            base,
+            token.clone(),
+        )
+        .await;
+        match segmented {
+            Ok(true) => {
+                let written = tokio::fs::metadata(part_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if written != size {
+                    return Err(AppError::new(format!(
+                        "下载不完整：已下载 {written} / {size} 字节"
+                    )));
+                }
+                tokio::fs::rename(part_path, final_path).await?;
+                done.store(base + written, Ordering::Relaxed);
+                return Ok(());
+            }
+            // The engine gave up. Falling through to the single stream would be
+            // wrong: it reopens with `File::create`, which truncates a file the
+            // engine had preallocated to full length, while the sidecar still
+            // describes segments that are now zero-filled — a later resume would
+            // trust that plan and hand back a file of the right length with
+            // holes in it. Returning the error instead lets the caller's retry
+            // loop re-enter the engine, which resumes from the sidecar.
+            Err(err) => return Err(err),
+            // The drive turned out not to honour ranges (or the file is too
+            // small to be worth splitting): the single stream below runs
+            // exactly as it did before segmentation existed.
+            Ok(false) => {}
+        }
+    }
 
     // A drive that refuses the Range means the byte offset cannot be trusted:
     // drop the partial and fetch the whole file rather than appending garbage.
@@ -1554,17 +1659,94 @@ async fn run_share_download(
     if let Ok(meta) = tokio::fs::metadata(part_path).await {
         start = meta.len();
     }
+    // Same caveat as `run_provider_download`: the engine preallocates, so a
+    // partial at full length may still be a sparse file.
     if size > 0 && start == size && start > 0 {
-        // The partial already holds the whole file — finish it.
-        tokio::fs::rename(part_path, final_path).await?;
-        done.store(size, Ordering::Relaxed);
-        return Ok(());
+        let identity = crate::engine::source::share_source(
+            Arc::clone(drive),
+            share.clone(),
+            fid.to_string(),
+            part_path.display().to_string(),
+        )
+        .fingerprint();
+        match crate::engine::resume_state(part_path, size, &identity) {
+            crate::engine::ResumeState::Partial => start = 0,
+            _ => {
+                tokio::fs::rename(part_path, final_path).await?;
+                done.store(size, Ordering::Relaxed);
+                return Ok(());
+            }
+        }
     }
     if size > 0 && start > size {
         // A partial longer than the file cannot be a prefix of it. Truncating to
         // `size` would keep the wrong bytes, so start over.
         let _ = tokio::fs::remove_file(part_path).await;
         done.store(0, Ordering::Relaxed);
+    }
+
+    // Share files get the same segmented engine as ordinary ones: the link is
+    // re-minted per segment, which is exactly what a multi-connection download
+    // needs anyway. Falls through to one stream when the drive cannot do ranges.
+    if start == 0 && size > 0 {
+        let qualified = format!("{}:{}", share.provider, fid);
+        let provider = provider_of(&qualified);
+        let source = crate::engine::source::share_source(
+            Arc::clone(drive),
+            share.clone(),
+            fid.to_string(),
+            part_path.display().to_string(),
+        );
+        let segmented = crate::engine::download(
+            Arc::clone(drive),
+            Arc::clone(&source),
+            provider,
+            part_path,
+            size,
+            Arc::clone(&done),
+            // Share downloads report progress from zero, like the single-stream
+            // path below does.
+            0,
+            token.clone(),
+        )
+        .await;
+        match segmented {
+            Ok(true) => {
+                let written = tokio::fs::metadata(part_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if written != size {
+                    return Err(AppError::new(format!(
+                        "下载不完整：已下载 {written} / {size} 字节"
+                    )));
+                }
+                tokio::fs::rename(part_path, final_path).await?;
+                done.store(size, Ordering::Relaxed);
+                return Ok(());
+            }
+            Err(err) => {
+                // Do not fall through to the single stream: it opens the file
+                // with `File::create`, truncating a file the engine had
+                // preallocated to full length, while the sidecar still claims
+                // segments that are now zero-filled — a later resume would
+                // trust that plan and hand back a file of the right length with
+                // holes in it. Returning the error lets the caller's retry loop
+                // re-enter the engine, which resumes from the sidecar. The
+                // temporary copy a drive may have made to serve the link is not
+                // reusable either way.
+                source.cleanup().await;
+                return Err(err);
+            }
+            // The drive cannot do ranges: one stream, exactly as before. The
+            // engine may have minted a link before giving up, and on a drive
+            // that copies a share file into the user's drive to make it
+            // downloadable that copy has to go now — the single-stream path
+            // below mints its own.
+            Ok(false) => {
+                source.cleanup().await;
+            }
+        }
     }
 
     // Download urls are short lived on every drive, so mint one per attempt and
@@ -1623,6 +1805,9 @@ async fn discard_partial(task: &TransferTask) {
     if path.exists() {
         let _ = tokio::fs::remove_file(path).await;
     }
+    // The segmented engine keeps its own plan next to the partial; without the
+    // partial it describes nothing.
+    crate::engine::discard_progress(path);
 }
 
 async fn md5_file(path: &Path) -> AppResult<String> {
@@ -1637,6 +1822,17 @@ async fn md5_file(path: &Path) -> AppResult<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The provider id embedded in a qualified fid (`"quark:abc"` → `"quark"`).
+///
+/// Falls back to `"unknown"`, which the connection budget maps to its generic
+/// profile — a bare id still downloads, just with conservative defaults.
+fn provider_of(fid: &str) -> &str {
+    match fid.split_once(':') {
+        Some((head, _)) if crate::providers::ProviderId::parse(head).is_some() => head,
+        _ => "unknown",
+    }
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -1804,8 +2000,19 @@ mod retry_tests {
             "登录状态已失效，请重新设置 Cookie",
             "文件校验失败（MD5 不一致），已删除临时文件",
             "分享链接不存在或已被取消",
+            "写入磁盘失败：磁盘空间不足",
+            "没有权限访问目标目录",
+            "服务器不支持分段下载",
         ] {
             assert!(!is_retryable(&AppError::new(msg)), "must not retry: {msg}");
+        }
+        // A segmented attempt that gave up is resumable, not terminal.
+        for msg in [
+            "分段下载失败：3 个分段缺失（已下载 900 / 1000 字节）",
+            "下载链接已失效",
+            "连接过慢（1024 B/s），已换新连接",
+        ] {
+            assert!(is_retryable(&AppError::new(msg)), "should retry: {msg}");
         }
     }
 }

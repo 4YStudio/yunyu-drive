@@ -8,6 +8,7 @@ pub struct DownloadBuilder {
     inner: Arc<QuarkPanInner>,
     fid: Option<String>,
     start_offset: Option<u64>,
+    end_offset: Option<u64>,
 }
 
 impl DownloadBuilder {
@@ -16,6 +17,7 @@ impl DownloadBuilder {
             inner,
             fid: None,
             start_offset: None,
+            end_offset: None,
         }
     }
 
@@ -31,6 +33,16 @@ impl DownloadBuilder {
         self
     }
 
+    /// Stops reading at the given byte offset (exclusive).
+    ///
+    /// Together with [`Self::start_offset`] this asks for one slice of the
+    /// file, which is what a segmented download needs: several connections,
+    /// each fetching its own slice of the same file.
+    pub fn end_offset(mut self, end_offset: u64) -> Self {
+        self.end_offset = Some(end_offset);
+        self
+    }
+
     /// Prepares the download request.
     pub fn prepare(self) -> Result<DownloadRequest> {
         let fid = self
@@ -40,6 +52,7 @@ impl DownloadBuilder {
             inner: self.inner,
             fid,
             start_offset: self.start_offset,
+            end_offset: self.end_offset,
         })
     }
 }
@@ -48,6 +61,7 @@ pub struct DownloadRequest {
     inner: Arc<QuarkPanInner>,
     fid: String,
     start_offset: Option<u64>,
+    end_offset: Option<u64>,
 }
 
 impl DownloadRequest {
@@ -56,11 +70,11 @@ impl DownloadRequest {
         self.inner.api.get_download_info(&self.fid).await
     }
 
-    /// Opens a byte stream for the target file.
-    pub async fn stream(&self) -> Result<BoxByteStream> {
+    /// Opens a byte stream for the target file, plus the raw `Content-Range`.
+    pub async fn stream(&self) -> Result<(BoxByteStream, Option<String>)> {
         self.inner
             .api
-            .download_stream(&self.fid, self.start_offset)
+            .download_stream_range(&self.fid, self.start_offset, self.end_offset)
             .await
     }
 }
