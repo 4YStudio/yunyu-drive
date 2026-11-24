@@ -49,6 +49,46 @@ use crate::providers::DriveProvider;
 
 pub use plan::Segment;
 
+/// Live connection counters, shared between the engine and the transfer list.
+///
+/// The engine knows how wide the pool actually is (the budget is per account,
+/// and a round only opens as many workers as there are segments left); the UI
+/// otherwise has no way to tell a 256-connection download from a single stream,
+/// and "why is it slow" is usually answered by that number.
+#[derive(Debug, Default)]
+pub struct Stats {
+    connections: AtomicU64,
+    segments: AtomicU64,
+    finished: AtomicU64,
+}
+
+impl Stats {
+    /// Records the shape of the round about to run.
+    pub fn report(&self, connections: usize, segments: usize, finished: usize) {
+        self.connections.store(connections as u64, Ordering::Relaxed);
+        self.segments.store(segments as u64, Ordering::Relaxed);
+        self.finished.store(finished as u64, Ordering::Relaxed);
+    }
+
+    pub fn connections(&self) -> u64 {
+        self.connections.load(Ordering::Relaxed)
+    }
+
+    pub fn segments(&self) -> u64 {
+        self.segments.load(Ordering::Relaxed)
+    }
+
+    pub fn finished(&self) -> u64 {
+        self.finished.load(Ordering::Relaxed)
+    }
+
+    /// Drops the connection count without forgetting the plan, for the moment
+    /// the last round ends.
+    pub fn idle(&self) {
+        self.connections.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Floor for a tail-refill split. Matches the planner's 128 KiB minimum: below
 /// that the handshake is a larger cost than the parallelism it buys.
 const TAIL_MIN_BYTES: u64 = 128 * 1024;
@@ -186,8 +226,12 @@ fn refresh_budget(size: u64, speed: f64) -> u32 {
 ///
 /// `done` counts from `base`, so a batch of files can share one counter; the
 /// base stays baked into the total because every update is additive.
+///
+/// `stats` receives the pool's shape (how many connections are open, how many
+/// pieces the file was cut into) for the transfer list; pass `None` when
+/// nobody is watching.
 #[allow(clippy::too_many_arguments)]
-pub async fn download(
+pub async fn download_with_stats(
     drive: Arc<dyn DriveProvider>,
     source: Arc<dyn source::Source>,
     provider: &str,
@@ -196,6 +240,7 @@ pub async fn download(
     done: Arc<AtomicU64>,
     base: u64,
     token: CancellationToken,
+    stats: Option<Arc<Stats>>,
 ) -> AppResult<bool> {
     if size < MIN_SEGMENTED || !drive.supports_ranges() {
         return Ok(false);
@@ -246,7 +291,7 @@ pub async fn download(
             progress.segments.len()
         );
     }
-    run_shared(
+    let outcome = run_shared(
         source,
         part,
         size,
@@ -256,8 +301,15 @@ pub async fn download(
         profile,
         connections,
         progress,
+        stats.clone(),
     )
-    .await
+    .await;
+    // The pool is gone once this returns; a readout still claiming 256 open
+    // connections would be the last thing the list ever showed.
+    if let Some(stats) = stats.as_deref() {
+        stats.idle();
+    }
+    outcome
 }
 
 /// Releases a registry slot on every exit path, including errors and early
@@ -299,6 +351,7 @@ async fn run_shared(
     profile: budget::Profile,
     connections: usize,
     mut progress: meta::Progress,
+    stats: Option<Arc<Stats>>,
 ) -> AppResult<bool> {
     // Pre-flight before fanning out: one DNS resolve and one request. Hundreds
     // of connections starting at once would otherwise all fail together on a
@@ -313,6 +366,13 @@ async fn run_shared(
         progress.segments.len(),
         connections
     );
+
+    if let Some(stats) = stats.as_deref() {
+        // The plan, not the width: no connection is open yet, and claiming the
+        // full budget before preflight has even run would be a lie the readout
+        // then has to walk back.
+        stats.report(0, progress.segments.len(), progress.completed() as usize);
+    }
 
     let sink = worker::Sink::open(part, size)?;
     // Bytes already on disk count towards progress from the first tick.
@@ -519,6 +579,11 @@ async fn run_shared(
         crate::ylog!(
             "download: round {round} over {workers} connections ({pending} segments left)"
         );
+        if let Some(stats) = stats.as_deref() {
+            let state = progress.lock().await;
+            let finished = state.segments.len() - pending;
+            stats.report(workers, state.segments.len(), finished);
+        }
 
         // Decide whether dropping slow connections is worth anything right now.
         let slow_floor = profile.slow_floor;
@@ -579,6 +644,7 @@ async fn run_shared(
             let ramp = Arc::clone(&ramp);
             let part = part.to_path_buf();
             let control = control.clone();
+            let stats = stats.clone();
 
             handles.push(tokio::spawn(async move {
                 // Stagger the first connections. A whole round starting at once
@@ -647,6 +713,10 @@ async fn run_shared(
                         Ok(()) => {
                             let mut state = progress.lock().await;
                             state.mark(index);
+                            if let Some(stats) = stats.as_deref() {
+                                let finished = state.segments.len() - state.remaining();
+                                stats.finished.store(finished as u64, Ordering::Relaxed);
+                            }
                             let mut at = last_save.lock().await;
                             if at.elapsed() >= SAVE_INTERVAL {
                                 let _ = state.save(&part);
@@ -725,9 +795,7 @@ async fn run_shared(
                 if range_gate.observe(Instant::now()) {
                     drop(state);
                     sampling.abort();
-                gate_ticker.abort();
                     gate_ticker.abort();
-            gate_ticker.abort();
                     meta::Progress::discard(part);
                     return Ok(false);
                 }
@@ -736,9 +804,7 @@ async fn run_shared(
                 if state.completed() == 0 && refused >= 2 {
                     drop(state);
                     sampling.abort();
-                gate_ticker.abort();
                     gate_ticker.abort();
-            gate_ticker.abort();
                     meta::Progress::discard(part);
                     return Ok(false);
                 }
@@ -769,7 +835,6 @@ async fn run_shared(
             if stalled_rounds >= MAX_STALLED_ROUNDS {
                 sampling.abort();
                 gate_ticker.abort();
-            gate_ticker.abort();
                 let mut state = progress.lock().await;
                 let missing = state.remaining();
                 let completed = state.completed();

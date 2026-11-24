@@ -2093,7 +2093,7 @@ async fn engine_compare(drive: Arc<dyn DriveProvider>, fid: &str, name: &str, si
     );
     let provider = drive.id().as_str();
     let started = std::time::Instant::now();
-    let outcome = crate::engine::download(
+    let outcome = crate::engine::download_with_stats(
         Arc::clone(&drive),
         Arc::clone(&source),
         provider,
@@ -2102,6 +2102,7 @@ async fn engine_compare(drive: Arc<dyn DriveProvider>, fid: &str, name: &str, si
         Arc::clone(&done),
         0,
         token,
+        None,
     )
     .await;
     let elapsed = started.elapsed();
@@ -2254,7 +2255,7 @@ async fn engine_live_quark_verify() {
     );
 
     let started = std::time::Instant::now();
-    let outcome = crate::engine::download(
+    let outcome = crate::engine::download_with_stats(
         Arc::clone(&drive),
         Arc::clone(&source),
         "quark",
@@ -2263,6 +2264,7 @@ async fn engine_live_quark_verify() {
         Arc::clone(&done),
         0,
         token.clone(),
+        None,
     )
     .await;
     let secs = started.elapsed().as_secs_f64();

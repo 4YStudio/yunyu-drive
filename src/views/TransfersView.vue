@@ -83,6 +83,23 @@ function preparedSize(task: TransferTask) {
   return task.status === "hashing" ? (task.prepared ?? 0) : 0;
 }
 
+/**
+ * "256 线程 · 38/183 片", or empty when the transfer is not segmented.
+ *
+ * The connection count is the number the engine actually has open, which is the
+ * per-account budget (or however many pieces are left, whichever is smaller) —
+ * not what the drive would allow in theory.
+ */
+function poolLabel(task: TransferTask): string {
+  const connections = task.connections ?? 0;
+  const segments = task.segments ?? 0;
+  if (connections <= 0 && segments <= 0) return "";
+  const parts: string[] = [];
+  if (connections > 0) parts.push(`${connections} 线程`);
+  if (segments > 0) parts.push(`${task.segmentsDone ?? 0}/${segments} 片`);
+  return parts.join(" · ");
+}
+
 function statusLabel(task: TransferTask) {
   switch (task.status) {
     case "queued":
@@ -256,13 +273,14 @@ onActivated(() => {
                 {{ formatSize(task.transferred + preparedSize(task)) }} /
                 {{ formatSize(task.size) }}
               </span>
-              <template v-if="task.status === 'running' || task.status === 'paused'">
+              <template v-if="task.status === 'running'">
                 <span class="dot">·</span>
-                <template v-if="task.status === 'running'">
+                <span class="mono">{{ formatSpeed(task.speed) }}</span>
+                <span class="dot">·</span>
+                <span class="mono">{{ formatEta(task.size - task.transferred, task.speed) || "—" }}</span>
+                <template v-if="poolLabel(task)">
                   <span class="dot">·</span>
-                  <span class="mono">{{ formatSpeed(task.speed) }}</span>
-                  <span class="dot">·</span>
-                  <span class="mono">{{ formatEta(task.size - task.transferred, task.speed) || "—" }}</span>
+                  <span class="mono task-pool">{{ poolLabel(task) }}</span>
                 </template>
               </template>
               <template v-else-if="task.status === 'failed' && task.error">
@@ -465,6 +483,9 @@ onActivated(() => {
   min-width: 0;
 }
 .task-error {
+  color: var(--text-2);
+}
+.task-pool {
   color: var(--text-2);
 }
 .dot {

@@ -126,6 +126,15 @@ export interface TransferTask {
    * reports through `transferred`.
    */
   prepared?: number;
+  /**
+   * How many connections the segmented downloader had open, and how the file
+   * was cut up. Zero for single-stream downloads and for uploads. Without this
+   * the list cannot tell a 256-connection transfer from one slow stream, which
+   * is the first thing anyone asks when a download looks stuck.
+   */
+  connections?: number;
+  segments?: number;
+  segmentsDone?: number;
   speed: number;
   status:
     | "queued"

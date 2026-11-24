@@ -245,6 +245,14 @@ impl Default for Limiter {
 
 /// How much is buffered before a segment is written to disk. Big enough that
 /// the blocking hop is rare, small enough that progress is visible promptly.
+///
+/// This is an upper bound on a flush, not the only reason to flush: a segment
+/// here is typically 128-256 KiB, so a segment is *smaller* than this buffer and
+/// waiting for it to fill meant the progress counter only moved when a whole
+/// segment finished. On a slow node that took twenty-five seconds, the UI
+/// showed 0 KB/s the entire time and then jumped — reported as "the download
+/// hangs at zero before it starts". See the window close in [`drain`], which
+/// flushes whatever has arrived at least once per speed window.
 const FLUSH_BYTES: usize = 512 * 1024;
 
 /// How many times one segment is reopened before the attempt is called failed.
@@ -269,6 +277,16 @@ const SPEED_RECONNECTS: u32 = 80;
 /// connection finishes its whole segment inside one window and is never judged;
 /// only one that is visibly crawling survives long enough to be measured.
 const SPEED_WINDOW: Duration = Duration::from_millis(1500);
+
+/// The first window closes early, for reporting only.
+///
+/// Progress is flushed when a window closes, so the first window decides how
+/// long the transfer list sits at 0 KB/s after the user clicks download. A full
+/// window there meant a second and a half of nothing even when bytes were
+/// already arriving; 400 ms is enough to have a real reading. The window is not
+/// used to judge the connection — 400 ms of a 20 KB/s connection looks like a
+/// burst, and reconnecting on that would churn every good connection at start.
+const FIRST_WINDOW: Duration = Duration::from_millis(400);
 /// Age at which a connection is replaced even though it is still moving.
 const SPEED_ROTATE: Duration = Duration::from_millis(2500);
 /// A connection delivering this much is worth keeping past `SPEED_ROTATE`.
@@ -497,6 +515,7 @@ async fn drain(
     // production and a controllable one under `start_paused` tests.
     let mut window_at = tokio::time::Instant::now();
     let mut window_bytes = 0u64;
+    let mut first_window = true;
     // A connection that goes quiet must not hold the round hostage. The CDN
     // sometimes accepts a request and then stops sending (a node shedding
     // load, a truncated range): without a read deadline the worker waits
@@ -512,6 +531,33 @@ async fn drain(
     let mut finishing = *cursor >= segment.end;
     let mut overflow = 0u64;
     let mut draining_at: Option<tokio::time::Instant> = None;
+
+    /// Writes everything buffered and advances the durable position.
+    ///
+    /// Split out because it now happens for two reasons — the buffer is full,
+    /// or the speed window closed — and both must move `*cursor` and `done`
+    /// together, or the next read starts after bytes that never reached disk.
+    async fn flush(
+        buffer: &mut Vec<u8>,
+        buffer_at: u64,
+        cursor: &mut u64,
+        sink: &Sink,
+        limiter: &Limiter,
+        done: &std::sync::atomic::AtomicU64,
+    ) -> Result<(), FetchError> {
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let flushed = buffer.len() as u64;
+        let payload = Bytes::from(std::mem::take(buffer));
+        sink.write_at(buffer_at, payload)
+            .await
+            .map_err(FetchError::Failed)?;
+        *cursor += flushed;
+        done.fetch_add(flushed, Ordering::Relaxed);
+        limiter.acquire(flushed).await;
+        Ok(())
+    }
 
     loop {
         let item = tokio::select! {
@@ -562,23 +608,29 @@ async fn drain(
         window_bytes += take as u64;
 
         if buffer.len() >= FLUSH_BYTES {
-            let flushed = buffer.len() as u64;
-            let payload = Bytes::from(std::mem::take(&mut buffer));
-            sink.write_at(buffer_at, payload)
-                .await
-                .map_err(FetchError::Failed)?;
-            *cursor += flushed;
-            done.fetch_add(flushed, Ordering::Relaxed);
-            limiter.acquire(flushed).await;
+            flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
         }
 
         // Judged on arrival, so a connection that is too slow to fill a flush
         // buffer is still caught inside one window instead of at the end.
         let elapsed = window_at.elapsed();
-        if elapsed >= SPEED_WINDOW {
+        let window = if first_window { FIRST_WINDOW } else { SPEED_WINDOW };
+        if elapsed >= window {
             let bps = window_bytes as f64 / elapsed.as_secs_f64();
             window_at = tokio::time::Instant::now();
             window_bytes = 0;
+            // Report what has arrived even when it is far short of a full
+            // flush buffer: `done` is what the UI turns into a speed, and a
+            // segment smaller than `FLUSH_BYTES` would otherwise hold its
+            // bytes back until the whole segment landed.
+            flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
+            // The short first window is a report, not a verdict: it is too
+            // brief to tell a burst from a healthy connection, and a
+            // reconnect here would churn the whole pool at start.
+            if first_window {
+                first_window = false;
+                continue;
+            }
             if let Some(speeds) = control.speeds.as_ref() {
                 speeds.lock().await.push(bps);
             }
@@ -607,15 +659,7 @@ async fn drain(
                     // Whatever is buffered belongs to this segment and is about
                     // to be fetched again by the next connection: write it so
                     // the reopen starts from the true offset.
-                    if !buffer.is_empty() {
-                        let flushed = buffer.len() as u64;
-                        let payload = Bytes::from(std::mem::take(&mut buffer));
-                        sink.write_at(buffer_at, payload)
-                            .await
-                            .map_err(FetchError::Failed)?;
-                        *cursor += flushed;
-                        done.fetch_add(flushed, Ordering::Relaxed);
-                    }
+                    flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
                     return Err(FetchError::Slow { bps });
                 }
             }
@@ -630,16 +674,7 @@ async fn drain(
         }
     }
 
-    if !buffer.is_empty() {
-        let written = buffer.len() as u64;
-        let payload = Bytes::from(std::mem::take(&mut buffer));
-        sink.write_at(buffer_at, payload)
-            .await
-            .map_err(FetchError::Failed)?;
-        *cursor += written;
-        done.fetch_add(written, Ordering::Relaxed);
-        limiter.acquire(written).await;
-    }
+    flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
 
     if *cursor < segment.end {
         return Err(FetchError::Short {
@@ -892,6 +927,113 @@ mod tests {
         // true offset rather than re-fetching them.
         assert!(done.load(Ordering::Relaxed) > 0, "nothing landed");
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 8 * 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A source that never ends: one 64 KiB chunk every `pace`, forever.
+    struct EndlessSource {
+        chunk: usize,
+        pace: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::source::Source for EndlessSource {
+        async fn open(
+            &self,
+            _start: u64,
+            _end: Option<u64>,
+        ) -> crate::providers::RangeResult {
+            let chunk = self.chunk;
+            let pace = self.pace;
+            let stream = futures_util::stream::unfold((), move |()| async move {
+                tokio::time::sleep(pace).await;
+                Some((Ok(Bytes::from(vec![9u8; chunk])), ()))
+            });
+            crate::providers::RangeResult::Body(crate::providers::DownloadHandle {
+                size: 0,
+                md5: None,
+                stream: Box::new(Box::pin(stream)),
+            })
+        }
+
+        fn label(&self) -> &str {
+            "endless"
+        }
+
+        fn fingerprint(&self) -> String {
+            "endless".to_string()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_is_reported_before_the_segment_finishes() {
+        // A segment is typically 128-256 KiB while a flush buffer is 512 KiB, so
+        // waiting for a full buffer meant the counter only moved when the whole
+        // segment landed. On a slow CDN node that is twenty-five seconds of a
+        // readout stuck at 0 KB/s, which users report as "the download hangs at
+        // zero before it starts".
+        //
+        // The source here never ends, so any non-zero reading has to come from
+        // the speed-window flush inside `drain` — the tail flush never runs.
+        let dir = temp_dir("early");
+        let path = dir.join("f.bin");
+        let total = 8 * 1024 * 1024u64;
+        let sink = Sink::open(&path, total).unwrap();
+        let source: Arc<dyn super::super::source::Source> = Arc::new(EndlessSource {
+            // 4 KiB every 200 ms: two windows' worth is 64 KiB, an eighth of a
+            // flush buffer, so nothing can be reported by a full-buffer flush.
+            chunk: 4096,
+            pace: Duration::from_millis(200),
+        });
+        let segment = Segment { start: 0, end: total };
+        let handle = match source.open(segment.start, Some(segment.end)).await {
+            crate::providers::RangeResult::Body(handle) => handle,
+            _ => panic!("expected a body"),
+        };
+        let done = Arc::new(AtomicU64::new(0));
+        let token = CancellationToken::new();
+        let control = Control {
+            // Never judge the connection: this is about reporting, not preempting.
+            slow_threshold: 0.0,
+            endgame: false,
+            speeds: None,
+            reconnects: None,
+        };
+
+        let running = {
+            let done = Arc::clone(&done);
+            let token = token.clone();
+            tokio::spawn(async move {
+                let mut cursor = segment.start;
+                drain(
+                    handle,
+                    segment,
+                    &mut cursor,
+                    &sink,
+                    &Limiter::new(),
+                    &done,
+                    &token,
+                    &control,
+                )
+                .await
+            })
+        };
+
+        // Past the short first window, but before a full speed window closes:
+        // the report has to come from the early flush, not from a regular one.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mid = done.load(Ordering::Relaxed);
+        assert!(
+            mid > 0,
+            "progress stayed at zero while the segment was still downloading"
+        );
+
+        token.cancel();
+        let outcome = running.await.unwrap();
+        assert!(
+            matches!(outcome, Err(FetchError::Cancelled)),
+            "expected the drain to stop on cancel"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

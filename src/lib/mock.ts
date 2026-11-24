@@ -205,6 +205,9 @@ function makeTransfer(partial: Partial<TransferTask> & { name: string; kind: Tra
     createdAt: now,
     updatedAt: now,
     rapid: false,
+    connections: 0,
+    segments: 0,
+    segmentsDone: 0,
     partPath: null,
     share: null,
     cross: null,
@@ -222,6 +225,10 @@ function seedTransfers() {
     size: 512_000_000,
     transferred: 188_400_000,
     speed: 6_840_000,
+    // A segmented download, so the list has a real pool to show.
+    connections: 256,
+    segments: 1953,
+    segmentsDone: 719,
   });
   transfers.push(running);
   transfers.push(

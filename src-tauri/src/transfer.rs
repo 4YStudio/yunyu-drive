@@ -43,6 +43,20 @@ pub struct TransferTask {
     /// full while Baidu hashes a large file.
     #[serde(default)]
     pub prepared: u64,
+    /// How many connections the segmented engine has open right now, and how
+    /// many pieces the file was cut into. Zero for a single-stream download and
+    /// for uploads. This is the number users ask about when a transfer looks
+    /// slow: 1 connection means the drive refused ranges, 256 means the pool is
+    /// wide and the bottleneck is upstream.
+    #[serde(default)]
+    pub connections: u64,
+    #[serde(default)]
+    pub segments: u64,
+    /// Pieces already fetched, out of `segments`. Shows the real granularity of
+    /// a multi-connection download, where a progress bar alone hides the fact
+    /// that hundreds of pieces are in flight.
+    #[serde(default)]
+    pub segments_done: u64,
     /// Partial file a download writes into. Kept across a failure so the next
     /// attempt resumes with a Range request instead of starting over, and
     /// removed together with the task so no orphaned `.part` is left behind.
@@ -520,6 +534,9 @@ impl TransferManager {
             updated_at: now_millis(),
             rapid: false,
             prepared: 0,
+            connections: 0,
+            segments: 0,
+            segments_done: 0,
             part_path: Some(part_path.to_string_lossy().to_string()),
             share: job.share.clone(),
             provider: job.provider.clone(),
@@ -617,6 +634,7 @@ impl TransferManager {
             // Bumped before every attempt so the speed readout rebases on the
             // bytes actually pulled by that attempt.
             let epoch = Arc::new(AtomicU64::new(0));
+            let stats = Arc::new(crate::engine::Stats::default());
             let ticker = spawn_ticker(
                 handle.clone(),
                 manager.clone(),
@@ -625,6 +643,7 @@ impl TransferManager {
                 size,
                 epoch.clone(),
                 None,
+                Some(Arc::clone(&stats)),
             );
 
             // A dropped connection or a stalled CDN endpoint is normal on a long
@@ -667,6 +686,7 @@ impl TransferManager {
                             size,
                             done.clone(),
                             token.clone(),
+                            Some(Arc::clone(&stats)),
                         )
                         .await
                     }
@@ -680,6 +700,7 @@ impl TransferManager {
                             done.clone(),
                             token.clone(),
                             0,
+                            Some(Arc::clone(&stats)),
                         )
                         .await
                     }
@@ -795,6 +816,9 @@ impl TransferManager {
             updated_at: now_millis(),
             rapid: false,
             prepared: 0,
+            connections: 0,
+            segments: 0,
+            segments_done: 0,
             part_path: None,
             share: None,
             provider: drive.id().as_str().to_string(),
@@ -831,6 +855,7 @@ impl TransferManager {
                 meta.len(),
                 Arc::new(AtomicU64::new(0)),
                 Some(sink.prepared_counter()),
+                None,
             );
 
             let sink_trait: Arc<dyn UploadSink> = Arc::new(ThrottledSink {
@@ -999,6 +1024,9 @@ impl TransferManager {
             updated_at: now_millis(),
             rapid: false,
             prepared: 0,
+            connections: 0,
+            segments: 0,
+            segments_done: 0,
             part_path: None,
             share: None,
             provider: from.id().as_str().to_string(),
@@ -1049,6 +1077,7 @@ impl TransferManager {
                 total,
                 Arc::new(AtomicU64::new(0)),
                 None,
+                None,
             );
 
             let mut base = 0u64;
@@ -1066,6 +1095,7 @@ impl TransferManager {
                     base,
                     done.clone(),
                     token.clone(),
+                    None,
                 )
                 .await;
                 match attempt {
@@ -1153,7 +1183,8 @@ pub async fn run_cross_direct(
     let token = CancellationToken::new();
     let mut base = 0u64;
     for file in job.files.iter() {
-        run_cross_file(&from, &to, &temp_root, file, base, done.clone(), token.clone()).await?;
+        run_cross_file(&from, &to, &temp_root, file, base, done.clone(), token.clone(), None)
+            .await?;
         base += file.size;
     }
     if !job.copy {
@@ -1179,6 +1210,7 @@ async fn run_cross_file(
     base: u64,
     done: Arc<AtomicU64>,
     token: CancellationToken,
+    stats: Option<Arc<crate::engine::Stats>>,
 ) -> AppResult<()> {
     tokio::fs::create_dir_all(temp_root).await?;
     let name = crate::paths::safe_component(&file.name);
@@ -1194,6 +1226,7 @@ async fn run_cross_file(
         Arc::clone(&done),
         token.clone(),
         base,
+        stats,
     )
     .await
     .map_err(|err| AppError::new(format!("{}：{err}", file.name)))?;
@@ -1342,6 +1375,7 @@ async fn finish_failed(
         .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_ticker(
     app: AppHandle,
     manager: Arc<TransferManager>,
@@ -1350,6 +1384,7 @@ fn spawn_ticker(
     total: u64,
     epoch: Arc<AtomicU64>,
     prepared: Option<Arc<AtomicU64>>,
+    stats: Option<Arc<crate::engine::Stats>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Speed is measured over a ~1.2s sliding window and then smoothed, so
@@ -1415,6 +1450,11 @@ fn spawn_ticker(
                     if let Some(prepared) = prepared.as_ref() {
                         t.prepared = prepared.load(Ordering::Relaxed);
                     }
+                    if let Some(stats) = stats.as_ref() {
+                        t.connections = stats.connections();
+                        t.segments = stats.segments();
+                        t.segments_done = stats.finished();
+                    }
                 })
                 .await;
         }
@@ -1437,6 +1477,7 @@ async fn run_provider_download(
     done: Arc<AtomicU64>,
     token: CancellationToken,
     base: u64,
+    stats: Option<Arc<crate::engine::Stats>>,
 ) -> AppResult<()> {
     let mut start = 0u64;
     if let Ok(meta) = tokio::fs::metadata(part_path).await {
@@ -1495,7 +1536,7 @@ async fn run_provider_download(
             native.clone(),
             part_path.display().to_string(),
         );
-        let segmented = crate::engine::download(
+        let segmented = crate::engine::download_with_stats(
             Arc::clone(drive),
             source,
             provider,
@@ -1504,6 +1545,7 @@ async fn run_provider_download(
             Arc::clone(&done),
             base,
             token.clone(),
+            stats,
         )
         .await;
         match segmented {
@@ -1592,7 +1634,7 @@ pub async fn run_provider_download_for_test(
     done: Arc<AtomicU64>,
     token: CancellationToken,
 ) -> AppResult<()> {
-    run_provider_download(drive, fid, part_path, final_path, size, done, token, 0).await
+    run_provider_download(drive, fid, part_path, final_path, size, done, token, 0, None).await
 }
 
 /// Drains `stream` into `part_path`, appending at `start` and reporting progress.
@@ -1654,6 +1696,7 @@ async fn run_share_download(
     mut size: u64,
     done: Arc<AtomicU64>,
     token: CancellationToken,
+    stats: Option<Arc<crate::engine::Stats>>,
 ) -> AppResult<()> {
     let mut start = 0u64;
     if let Ok(meta) = tokio::fs::metadata(part_path).await {
@@ -1697,7 +1740,7 @@ async fn run_share_download(
             fid.to_string(),
             part_path.display().to_string(),
         );
-        let segmented = crate::engine::download(
+        let segmented = crate::engine::download_with_stats(
             Arc::clone(drive),
             Arc::clone(&source),
             provider,
@@ -1708,6 +1751,7 @@ async fn run_share_download(
             // path below does.
             0,
             token.clone(),
+            stats,
         )
         .await;
         match segmented {
@@ -1870,6 +1914,9 @@ mod tests {
             updated_at: 1,
             rapid: false,
             prepared: 0,
+            connections: 0,
+            segments: 0,
+            segments_done: 0,
             part_path: part.map(|p| p.to_string()),
             share: None,
             provider: "quark".to_string(),
