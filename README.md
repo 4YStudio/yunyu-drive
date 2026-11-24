@@ -4,7 +4,7 @@
 
 # 云语聚合网盘
 
-**把夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘、天翼云盘装进同一个窗口。**
+**把夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘、天翼云盘、115 网盘装进同一个窗口。**
 
 一套文件浏览、一套上传下载队列、一套传输列表、一套分享流程。
 
@@ -136,8 +136,9 @@
 | <img src="public/netdisk-pan123.png" width="18" align="top" /> 123 云盘 | 账号 + 密码 | 自实现，安卓协议移植 | 移动走 `mod_pid`；复制走 `copy/async`（原地复制再移动） |
 | <img src="public/netdisk-baidu.png" width="18" align="top" /> 百度网盘 | 内置网页登录抓 Cookie / 粘贴 Cookie | 自实现，网页版 `pan.baidu.com/api` | 网页会话（`BDUSS` + `PANPSC` + `bdstoken`），不需要开发者 app_key |
 | <img src="public/netdisk-cloud189.png" width="18" align="top" /> 天翼云盘 | App 扫码（QR） | 自实现，网页版 `api.cloud.189.cn` | HMAC-SHA1 会话签名 + MD5 分享签名；上传支持秒传，分享一次只能选一项 |
+| <img src="public/netdisk-115.png" width="18" align="top" /> 115 网盘 | Cookie 粘贴 / 内置网页扫码 | 自实现，网页版 `webapi.115.com` + 客户端 `uplb/proapi.115.com` | 上传走 P-224 ECDH 加密的 `initupload`，下载/分享走 RSA 加密直链；`fid` 与 `cid` 是两套 id |
 
-> 源码里仍能找到 `quark` 的痕迹：那是**六个网盘之一**（`ProviderId::Quark`）以及夸克自己的
+> 源码里仍能找到 `quark` 的痕迹：那是**七个网盘之一**（`ProviderId::Quark`）以及夸克自己的
 > 接口地址与深链 `qklink://`（夸克官网「打开客户端」按钮会触发它）。这些都不是历史残留。
 
 ## 下载安装
@@ -262,7 +263,7 @@ yunyu-drive/
 │   ├── lib/motion.ts     全站动画语言（motion-v：面板展开 / 弹层 / 滑块 / 列表错开）
 │   └── styles/           tokens.css（设计令牌）+ global.css（原语）
 ├── src-tauri/
-│   ├── src/providers/    DriveProvider 抽象 + 六个网盘适配器
+│   ├── src/providers/    DriveProvider 抽象 + 七个网盘适配器
 │   │   ├── mod.rs        trait、EntryId（`<provider>:<native>`）、Capabilities
 │   │   ├── quark.rs      夸克（libquarkpan）
 │   │   ├── yun139.rs     中国移动云盘（cloud139，路径 ↔ base64 id）
@@ -271,7 +272,10 @@ yunyu-drive/
 │   │   ├── pan123.rs     123 云盘（安卓协议）
 │   │   ├── baidu.rs      百度网盘（网页会话 + 4 MiB 分片上传）
 │   │   ├── cloud189.rs   天翼云盘（会话签名 + 秒传上传）
-│   │   └── cloud189_qr.rs 天翼扫码登录
+│   │   ├── cloud189_qr.rs 天翼扫码登录
+│   │   ├── pan115.rs     115 网盘（webapi + 加密上传/直链）
+│   │   ├── pan115_crypto.rs 115 直链的 RSA 裸模幂加解密
+│   │   └── pan115_ec.rs  115 上传的 P-224 ECDH + LZ4 通道
 │   ├── src/engine/       分段并发下载引擎（多连接拉满带宽）
 │   │   ├── mod.rs        编排：预检、分轮取片、直链自愈、无进展熔断
 │   │   ├── plan.rs       分片规划（纯函数：片数与片长、头部更细）
@@ -291,7 +295,7 @@ yunyu-drive/
 ├── vendor/               两个 crate 的源码（见 vendor/README.md）
 └── docs/
     ├── index.html        官网（单页，无构建步骤）
-    ├── assets/           site.css / site.js / logo 与六个网盘图标
+    ├── assets/           site.css / site.js / logo 与七个网盘图标
     ├── *-light.png       四张界面截图（浅色 / 深色各一套）
     ├── provider-login.md 各网盘登录方式与凭据文件
     └── tauri-webkitgtk-flicker.md  页面切换闪烁的排查笔记
@@ -323,6 +327,7 @@ yunyu-drive/
 | 123 云盘 | 账号 + 密码 | — | `pan123.json` |
 | 百度网盘 | 内嵌窗口登录，抓整包 Cookie | 粘贴 Cookie | `baidu.json` |
 | 天翼云盘 | App 扫码（QR） | — | `cloud189.json` |
+| 115 网盘 | 内嵌窗口登录抓整包 Cookie | 粘贴 Cookie | `pan115.json` |
 
 </details>
 
@@ -415,7 +420,7 @@ yunyu-drive/
   `{"fileList":[{"fileId":…,"size":…,"etag":…,"type":0,"parentFileId":…,"fileName":…,"driveId":0}],"targetFileId":<目标文件夹>}`。
   用安卓风格的 `{"FileId":…}` + 顶层 `parentFileId` 会回 `code: 0` 但**什么都不复制**（静默空转），
   这也是之前把 123 的「复制」标成不支持的原因。
-- 六个网盘的列表排序由同一段代码决定（文件夹优先，再按名称小写排序），
+- 七个网盘的列表排序由同一段代码决定（文件夹优先，再按名称小写排序），
   时间戳也由同一个 `parse_time` 解析——123 的 `UpdateAt` 是 ISO 字符串、百度是秒、
   夸克是毫秒，各读一种形状会让列表显示 1970。
 - 139 的上传是自建的四步协议（`file/create` → 逐片 `PUT` → `file/complete`），
