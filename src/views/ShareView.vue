@@ -2,11 +2,14 @@
 import { computed, onActivated, onDeactivated, ref, watch } from "vue";
 import { pickFiles } from "@/lib/host";
 
+import { motion } from "motion-v";
+import { rowEnter, rowTransition } from "@/lib/motion";
 import Icon from "@/components/Icon.vue";
 import Avatar from "@/components/Avatar.vue";
 import FileIcon from "@/components/FileIcon.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import { api } from "@/lib/backend";
+import { errText } from "@/lib/format";
 import { PROVIDERS } from "@/lib/types";
 import type { ShareEntry, ShareListing, ShareSession } from "@/lib/types";
 import { formatDate, formatSize, fileKind, kindLabel } from "@/lib/format";
@@ -64,7 +67,7 @@ async function open(target?: string) {
     crumbs.value = [{ fid: root, name: opened.title || "分享内容" }];
     await listDir(root);
   } catch (err) {
-    error.value = String(err);
+    error.value = errText(err);
   } finally {
     busy.value = false;
   }
@@ -109,7 +112,7 @@ async function listDir(pdirFid: string) {
     );
     selected.value = new Set();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   }
 }
 
@@ -178,7 +181,7 @@ async function save() {
     toast(`已转存 ${count} 项到「我的文件」`, "success");
     requestFilesRefresh();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     saving.value = false;
   }
@@ -217,7 +220,7 @@ async function download() {
     toast(`已加入下载队列 ${tasks.length} 项`, "success");
     app.view = "transfers";
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     downloading.value = false;
   }
@@ -272,7 +275,7 @@ watch(
           class="link-input"
           type="text"
           spellcheck="false"
-          placeholder="粘贴夸克 / 139 / 阿里 / 123 / 百度 分享链接"
+          placeholder="粘贴夸克 / 139 / 阿里 / 123 / 百度 / 天翼 分享链接"
           @keydown.enter.prevent="open()"
         />
         <button v-if="link" class="clear" @click="link = ''">
@@ -292,13 +295,29 @@ watch(
       </button>
     </div>
 
-    <div v-if="error" class="alert">
-      <Icon name="alert" :size="15" />
-      <span>{{ error }}</span>
-    </div>
+    <AnimatePresence>
+      <motion.div
+        v-if="error"
+        class="alert"
+        :initial="{ opacity: 0, y: -4 }"
+        :animate="{ opacity: 1, y: 0 }"
+        :exit="{ opacity: 0, transition: { duration: 0.1 } }"
+        :transition="rowTransition"
+      >
+        <Icon name="alert" :size="15" />
+        <span>{{ error }}</span>
+      </motion.div>
+    </AnimatePresence>
 
     <template v-if="session">
-      <div class="session">
+      <AnimatePresence>
+        <motion.div
+          class="session"
+        :initial="{ opacity: 0, y: 6 }"
+        :animate="{ opacity: 1, y: 0 }"
+        :exit="{ opacity: 0, transition: { duration: 0.1 } }"
+        :transition="rowTransition"
+      >
         <Avatar :src="session.ownerAvatar" :name="session.owner" :size="34" />
         <div class="session-copy">
           <div class="session-title truncate">
@@ -338,7 +357,8 @@ watch(
             <span>{{ selected.size ? `下载 ${selected.size} 项` : "全部下载" }}</span>
           </button>
         </div>
-      </div>
+        </motion.div>
+      </AnimatePresence>
 
       <div class="crumbs-wrap">
         <button class="icon-btn" :disabled="crumbs.length <= 1" title="返回上级" @click="goUp">
@@ -379,12 +399,13 @@ watch(
           <div v-if="!rows.length" class="state">
             <EmptyState icon="folder" title="这个文件夹是空的" description="分享内容可能还在上传中。" />
           </div>
-          <TransitionGroup v-else name="row" tag="div" class="rows">
-            <div
-              v-for="entry in rows"
+          <div v-else class="rows">
+            <motion.div
+              v-for="(entry, i) in rows"
               :key="entry.fid"
               class="row"
               :class="{ 'row--selected': selected.has(entry.fid) }"
+              v-bind="rowEnter(i)"
               @click="toggle(entry)"
               @dblclick="enter(entry)"
             >
@@ -411,8 +432,8 @@ watch(
                 {{ entry.isDir ? "—" : formatSize(entry.size) }}
               </div>
               <div class="cell cell--date">{{ formatDate(entry.updatedAt) }}</div>
-            </div>
-          </TransitionGroup>
+            </motion.div>
+          </div>
         </div>
 
         <footer class="list-foot">
@@ -553,14 +574,8 @@ watch(
   /* Rest on an identity transform: an element whose final computed transform
      is `none` has its compositing layer destroyed at the end of the animation,
      and WebKitGTK repaints one stale frame — the visible "blink". */
+  /* Animated by motion-v on the element itself (see the template). */
   transform: translateY(0);
-  animation: alert-in var(--dur-3) var(--ease-out);
-}
-@keyframes alert-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
 }
 .session {
   display: flex;
@@ -571,14 +586,8 @@ watch(
   border-radius: var(--radius-md);
   border: 1px solid var(--line);
   background: var(--bg-sunken);
+  /* Animated by motion-v on the element itself (see the template). */
   transform: translateY(0);
-  animation: session-in var(--dur-3) var(--ease-out);
-}
-@keyframes session-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
 }
 .session-copy {
   min-width: 0;
@@ -801,22 +810,10 @@ watch(
   display: grid;
   place-items: center;
 }
-.row-move {
-  transition: transform var(--dur-3) var(--ease-out);
-}
-.row-enter-active {
-  transition: opacity var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
-}
-.row-enter-from {
-  opacity: 0;
-  transform: translateY(-4px);
-}
-.row-leave-active {
-  transition: opacity var(--dur-1) var(--ease-out);
-  position: absolute;
-  width: calc(100% - 10px);
-}
-.row-leave-to {
-  opacity: 0;
+:where(.row) {
+  /* Rows are `motion.div`s — enter and layout animations come from motion-v
+     (`rowHidden`/`rowShown` in src/lib/motion.ts). Resting identity transform
+     keeps the compositing layer from being torn down after the animation. */
+  transform: translateY(0);
 }
 </style>

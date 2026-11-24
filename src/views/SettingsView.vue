@@ -8,7 +8,7 @@ import Segmented from "@/components/Segmented.vue";
 import { api } from "@/lib/backend";
 import { BRAND } from "@/lib/brand";
 import { PROVIDERS, type AppInfo, type ProviderId, type Settings } from "@/lib/types";
-import { formatSize } from "@/lib/format";
+import { errText, formatSize } from "@/lib/format";
 import {
   app,
   cycleTheme,
@@ -57,7 +57,7 @@ async function quitApp() {
   try {
     await api.quitApp();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   }
 }
 
@@ -80,7 +80,7 @@ async function persist() {
     await saveSettings({ ...draft.value });
     toast("设置已保存", "success");
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     saving.value = false;
   }
@@ -128,7 +128,7 @@ async function logoutDrive(id: ProviderId) {
     await logoutProvider(id);
     toast(`已退出${PROVIDERS.find((p) => p.id === id)?.name ?? ""}`, "success");
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     busyDrive.value = null;
   }

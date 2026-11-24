@@ -7,7 +7,7 @@ import DriveLoader from "@/components/DriveLoader.vue";
 import Modal from "@/components/Modal.vue";
 import { api } from "@/lib/backend";
 import { copyText } from "@/lib/clipboard";
-import { formatFullDate } from "@/lib/format";
+import { errText, formatFullDate } from "@/lib/format";
 import { PROVIDERS, type ShareRecord } from "@/lib/types";
 import { app, activeProviderState, toast } from "@/store/app";
 
@@ -56,7 +56,7 @@ async function load() {
   try {
     rows.value = await api.shareRecords(app.activeProvider);
   } catch (err) {
-    error.value = String(err);
+    error.value = errText(err);
     rows.value = [];
   } finally {
     loading.value = false;
@@ -91,7 +91,7 @@ async function confirmRevoke() {
     revoking.value = null;
     await load();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     busy.value = false;
   }

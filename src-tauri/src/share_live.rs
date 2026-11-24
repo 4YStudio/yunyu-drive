@@ -49,6 +49,14 @@ fn drive(provider: ProviderId) -> Option<Arc<dyn DriveProvider>> {
             let p: Arc<dyn DriveProvider> = Arc::new(p);
             p
         }),
+        ProviderId::Cloud189 => crate::providers::cloud189::Cloud189Provider::load(&dir).map(|p| {
+            let p: Arc<dyn DriveProvider> = Arc::new(p);
+            p
+        }),
+        ProviderId::Pan115 => crate::providers::pan115::Pan115Provider::load(&dir).map(|p| {
+            let p: Arc<dyn DriveProvider> = Arc::new(p);
+            p
+        }),
     };
     match built {
         Ok(d) => Some(d),

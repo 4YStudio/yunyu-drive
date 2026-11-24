@@ -10,6 +10,7 @@
 | 阿里云盘 | App 扫码（QR） | 粘贴 `refresh_token` | `aliyun.json` |
 | 123 云盘 | 账号 + 密码 | — | `pan123.json` |
 | 百度网盘 | 内嵌窗口登录，抓整包 Cookie | 粘贴 Cookie | `baidu.json` |
+| 天翼云盘 | App 扫码（QR） | — | `cloud189.json` |
 
 ## 中国移动云盘
 
@@ -73,6 +74,67 @@ Android 协议，见 `src-tauri/src/providers/pan123.rs`。`provider_login` 把
 - 再用 `GET /api/gettemplatevariable?fields=["uk","username","bdstoken","is_vip"]`
   换 `bdstoken` 与昵称，连同 cookie 一起存进 `baidu.json`。
 - 不需要开发者 app_key（OpenAPI 路线需要，本机没有）。
+
+## 天翼云盘
+
+走网页版会话签名接口，实现在 `src-tauri/src/providers/cloud189.rs` +
+`src-tauri/src/providers/cloud189_qr.rs`。没有可用的密码登录：会话密钥只有扫码
+（或密码登录 + 短信二次校验）才拿得到，所以登录页只提供二维码。
+
+**下载连接数**：天翼云盘按**单连接**限速，不是按账号 —— 2026-11 对同一 31 MB 文件
+实测（每档两轮各 4 秒取中位）：1 路 1.2 MB/s、16 路 4.0、32 路 7.5、64 路 8.5、
+96 路 10.2、**128 路 10.7**、192 路 10.1。所以 `engine/budget.rs` 里天翼的
+profile 是 floor 8 / ceiling 128（默认 GENERIC 只有 64），且它与夸克、阿里各自
+独立计账（`engine/mod.rs` 的 `bucket()`），不共用连接预算。
+
+扫码链路（`appId=8025431004`，这个 appId 的登录页仍会把参数直接写在 HTML 里）：
+
+1. `GET cloud.189.cn/unifyLoginForPC.action?appId=8025431004&clientType=10020&…`
+   跟随重定向落到 `open.e.189.cn/api/logbox/oauth2/unifyAccountLogin.do`，
+   从页面里正则取 `lt = "…"`、`paramId = "…"`、`reqId = "…"`。
+   **注意**：页面里还有一句 `lt="二维码登录成功"`，正则必须锚定带空格的 `lt = "`。
+2. `POST …/oauth2/getUUID.do` 拿 `uuid` / `encryuuid`。二维码内容就是 `uuid` 本身。
+3. 轮询 `POST …/oauth2/qrcodeLoginState.do`（`clientType=1`，`date` 是北京时间
+   `%Y-%m-%d%H:%M:%S.%3f`，**日期与小时之间没有分隔符**）：`-106` 待扫码、
+   `-11002` 已扫码待确认、`-11001` 过期、`0` 成功并返回 `redirectUrl`。
+   缺 `user-finger` 头会回 `22001 非正确来源`。
+4. `POST api.cloud.189.cn/getSessionForPC.action?redirectURL=…` 换到
+   `sessionKey` / `sessionSecret`，存进 `cloud189.json`（0600）。
+
+签名（每个业务接口都要）：
+
+```
+plain = "SessionKey=<k>&Operate=<METHOD>&RequestURI=<path>&Date=<GMT>"
+        [ + "&params=<AES-ECB-hex-upper>" ]
+Signature = HMAC-SHA1(sessionSecret, plain) 的**大写** hex
+```
+
+`params` 是 AES-128-ECB + PKCS7、key = `sessionSecret[:16]`、输出大写 hex；
+`RequestURI` 只取 path（不含 host 与 query）；所有请求再附一段
+`clientType=TELEPC&version=7.2.4.0&channelId=web_cloud.189.cn&rand=…`。
+未签名的请求统一回 `{"errorCode":"InvalidArgument","errorMsg":"date/signature is null"}`。
+
+### 分享（`open/*` 家族）
+
+分享用的是另一套签名，跟会话接口完全不同，实现在 `cloud189.rs` 的 `open_post()`：
+
+- `AccessToken` 不能直接用 `cloud189.json` 里那个，必须用 sessionKey 现换一次：
+  `GET api.cloud.189.cn/open/oauth2/getAccessTokenBySsKey.action?sessionKey=…`，
+  头 `AppKey: 601102120`、`Timestamp`、`Signature = md5("AppKey=…&Timestamp=…&sessionKey=…")`
+  （**小写** hex）、`Sign-Type: 1`。换来的 token 缓存在内存里，进程退出即失效。
+- 业务调用：头 `AccessToken` / `Timestamp` / `Signature` / `Sign-Type: 1`，
+  签名集合 = `{AccessToken, Timestamp}` **加上 POST 的 form 字段**，
+  `Signature = md5(按 key 排序的 "k=v" 用 & 连接)`。
+- **必须用 POST + form-urlencoded**。同样的参数放 query 会回
+  `accessTokenSignature is not match`。
+- 链接里的短码先 `checkAccessCode.action` 换成数字 `shareId`，之后所有调用都用它。
+- 文件夹分享列目录必须带 `shareMode=3`（取 `getShareInfoByCodeV2` 返回的原值），
+  否则一律 `Argument invalid`。
+- `createShareLink.action` 的 `expireTime` 是**天数**（`1`/`7`/`30`，`0` 或 `2099` 为永久），
+  `withAccessCode` 与自定义提取码都会被忽略：服务端总是发一个 4 位访问码。
+- 多选分享没有可用接口（`createBatchShare.action` 试过所有 body 形态都是
+  `Argument invalid`），所以一次只能分享一个文件或文件夹。
+- 取消分享回的是**空响应体**，不是 JSON。
 
 ## 通用约定
 

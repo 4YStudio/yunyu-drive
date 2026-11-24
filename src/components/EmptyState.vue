@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { motion } from "motion-v";
+import { rowHidden, rowShown, rowTransition } from "@/lib/motion";
+
 import Icon from "@/components/Icon.vue";
 import type { IconName } from "@/lib/icons";
 
@@ -13,7 +16,12 @@ withDefaults(
 </script>
 
 <template>
-  <div class="empty">
+  <motion.div
+    class="empty"
+    :initial="rowHidden"
+    :animate="rowShown"
+    :transition="rowTransition"
+  >
     <div class="empty-glyph">
       <Icon :name="icon" :size="26" :stroke="1.4" />
     </div>
@@ -22,7 +30,7 @@ withDefaults(
     <div v-if="$slots.default" class="empty-actions">
       <slot />
     </div>
-  </div>
+  </motion.div>
 </template>
 
 <style scoped>
@@ -35,13 +43,8 @@ withDefaults(
   padding: 64px 24px 72px;
   text-align: center;
   transform: translateY(0);
-  animation: empty-in var(--dur-4) var(--ease-out);
-}
-@keyframes empty-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
+  /* Animated by motion-v (`rowHidden`/`rowShown`), not by CSS: a CSS transition
+     on WebKitGTK paints one intermediate frame and then stalls. */
 }
 .empty-glyph {
   display: grid;

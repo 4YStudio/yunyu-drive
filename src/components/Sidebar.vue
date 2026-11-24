@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { AnimatePresence, motion } from "motion-v";
 import Icon from "@/components/Icon.vue";
 import {
   app,
@@ -13,8 +14,22 @@ import {
   toast,
   type View,
 } from "@/store/app";
-import { formatSize } from "@/lib/format";
-import { pop } from "@/lib/motion";
+import { errText, formatSize } from "@/lib/format";
+import {
+  barTransition,
+  itemEnter,
+  slideTo,
+  panelHidden,
+  panelLeaveTransition,
+  panelShown,
+  panelTransition,
+  popHidden,
+  popLeaveTransition,
+  popShown,
+  popTransition,
+  pressDown,
+  pressTransition,
+} from "@/lib/motion";
 import { PROVIDERS, type ProviderId } from "@/lib/types";
 import type { IconName } from "@/lib/icons";
 
@@ -45,6 +60,49 @@ const items = computed<{ view: View; label: string; icon: IconName }[]>(() => {
   );
   return list;
 });
+
+/** Where the travelling highlight has to sit, in rows. -1 parks it off-screen
+ *  for the one frame where the current section is not in the rail. */
+const navIndex = computed(() => items.value.findIndex((item) => item.view === app.view));
+
+/* The rails below are driven by `slideTo` rather than motion-v: a travelling
+   element needs its final transform *held* (WAAPI `fill: "both"`), because
+   WebKitGTK repaints once from the layout position if the transform is ever
+   briefly absent — see `slideTo` in `lib/motion.ts` for the full explanation. */
+const navThumbEl = ref<HTMLElement | null>(null);
+const NAV_ROW = 36;
+
+const themeThumbEl = ref<HTMLElement | null>(null);
+
+
+/** Theme switch, in the order the segments are drawn. */
+const themeOptions = [
+  { value: "light", title: "浅色", icon: "sun" },
+  { value: "system", title: "跟随系统", icon: "palette" },
+  { value: "dark", title: "深色", icon: "moon" },
+] as const;
+
+const themeIndex = computed(() => {
+  const at = themeOptions.findIndex((option) => option.value === app.themeMode);
+  return at < 0 ? 0 : at;
+});
+
+/* Park both rails where they belong on first paint, then hand every change to
+   `slideTo` — see the note above `navThumbEl`. */
+onMounted(() => {
+  if (navThumbEl.value) navThumbEl.value.style.transform = `translateY(${navIndex.value * NAV_ROW}px)`;
+  if (themeThumbEl.value) themeThumbEl.value.style.transform = `translateX(${themeIndex.value * 100}%)`;
+});
+
+watch(navIndex, (next, previous) => {
+  slideTo(navThumbEl.value, `translateY(${previous * NAV_ROW}px)`, `translateY(${next * NAV_ROW}px)`);
+});
+
+watch(themeIndex, (next, previous) => {
+  slideTo(themeThumbEl.value, `translateX(${previous * 100}%)`, `translateX(${next * 100}%)`, 0.26);
+});
+
+
 
 /**
  * Account row of the *active* drive.
@@ -83,6 +141,30 @@ function go(view: View) {
 
 /** Drive switcher: open state + the label of the current drive. */
 const switcherOpen = ref(false);
+
+/* The switcher used to close only when you clicked the button again or picked a
+   drive, so it stayed on screen while you clicked anywhere else — which reads
+   as the menu being stuck. Mirror the account bubble: click-outside and Escape. */
+function onSwitcherOutside(event: PointerEvent) {
+  const target = event.target as Node | null;
+  if (target && !(target as HTMLElement).closest?.(".switcher")) switcherOpen.value = false;
+}
+function onSwitcherKey(event: KeyboardEvent) {
+  if (event.key === "Escape") switcherOpen.value = false;
+}
+
+watch(switcherOpen, (open) => {
+  if (open) {
+    // Only one popup at a time: two glass panels stacked on the sidebar read as
+    // a glitch, and the second one has nowhere to go.
+    accountOpen.value = false;
+    window.addEventListener("pointerdown", onSwitcherOutside, true);
+    window.addEventListener("keydown", onSwitcherKey);
+  } else {
+    window.removeEventListener("pointerdown", onSwitcherOutside, true);
+    window.removeEventListener("keydown", onSwitcherKey);
+  }
+});
 
 const currentProvider = computed(
   () => PROVIDERS.find((p) => p.id === app.activeProvider) ?? PROVIDERS[0],
@@ -142,6 +224,7 @@ function onAccountKey(event: KeyboardEvent) {
 
 watch(accountOpen, (open) => {
   if (open) {
+    switcherOpen.value = false;
     window.addEventListener("pointerdown", onAccountOutside, true);
     window.addEventListener("keydown", onAccountKey);
   } else {
@@ -153,6 +236,8 @@ watch(accountOpen, (open) => {
 onBeforeUnmount(() => {
   window.removeEventListener("pointerdown", onAccountOutside, true);
   window.removeEventListener("keydown", onAccountKey);
+  window.removeEventListener("pointerdown", onSwitcherOutside, true);
+  window.removeEventListener("keydown", onSwitcherKey);
 });
 
 /** The drive's capacity, shown inside the bubble as well as on the bar. */
@@ -166,7 +251,7 @@ async function signOut() {
     toast(`已退出${currentProvider.value.name}`, "success");
     closeAccount();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     accountBusy.value = false;
   }
@@ -202,9 +287,11 @@ function pick(id: ProviderId) {
     <!-- Drive switcher. The brand lives in the title bar, so this is purely
          "which cloud am I looking at", with one dot per drive. -->
     <div class="switcher">
-      <button
+      <motion.button
         class="switcher-btn"
         :aria-expanded="switcherOpen"
+        :while-press="pressDown"
+        :transition="pressTransition"
         @click="switcherOpen = !switcherOpen"
       >
         <img class="switcher-logo" :src="currentProvider.logo" alt="" draggable="false" />
@@ -219,39 +306,62 @@ function pick(id: ProviderId) {
           </span>
         </span>
         <Icon name="chevron-down" :size="14" class="switcher-chevron" />
-      </button>
+      </motion.button>
 
-      <Transition :css="false" v-bind="pop">
-        <div v-if="switcherOpen" class="switcher-menu">
-          <button
-            v-for="p in PROVIDERS"
-            :key="p.id"
-            class="switcher-item"
-            :class="{ 'switcher-item--active': p.id === app.activeProvider }"
-            @click="pick(p.id)"
-          >
-            <img class="switcher-logo switcher-logo--sm" :src="p.logo" alt="" draggable="false" />
-            <span class="switcher-item-copy">
-              <span class="truncate">{{ p.name }}</span>
-              <span class="switcher-item-sub truncate">
-                {{
-                  providerState(p.id)?.authenticated
-                    ? (providerState(p.id)?.nickname ?? "已连接")
-                    : "未登录"
-                }}
+      <!-- The menu unrolls from zero height rather than scaling open: a
+           shadowed panel that scales is re-rasterised every frame, and the last
+           frame of the shrink is what read as the close twitching. The clip
+           wrapper carries the height, the inner box carries the border and
+           shadow, and the extra padding around it gives that shadow room to
+           paint without being cut off. -->
+      <AnimatePresence>
+        <motion.div
+          v-if="switcherOpen"
+          class="switcher-clip"
+          :initial="panelHidden"
+          :animate="panelShown"
+          :exit="{ height: 0, opacity: 0, transition: panelLeaveTransition }"
+          :transition="panelTransition"
+        >
+          <div class="switcher-menu">
+            <motion.button
+              v-for="(p, i) in PROVIDERS"
+              :key="p.id"
+              class="switcher-item"
+              :class="{ 'switcher-item--active': p.id === app.activeProvider }"
+              v-bind="itemEnter(i)"
+              @click="pick(p.id)"
+            >
+              <img class="switcher-logo switcher-logo--sm" :src="p.logo" alt="" draggable="false" />
+              <span class="switcher-item-copy">
+                <span class="truncate">{{ p.name }}</span>
+                <span class="switcher-item-sub truncate">
+                  {{
+                    providerState(p.id)?.authenticated
+                      ? (providerState(p.id)?.nickname ?? "已连接")
+                      : "未登录"
+                  }}
+                </span>
               </span>
-            </span>
-            <span
-              class="switcher-dot"
-              :class="{ 'switcher-dot--on': providerState(p.id)?.authenticated }"
-            />
-          </button>
-        </div>
-      </Transition>
+              <span
+                class="switcher-dot"
+                :class="{ 'switcher-dot--on': providerState(p.id)?.authenticated }"
+              />
+            </motion.button>
+          </div>
+        </motion.div>
+      </AnimatePresence>
     </div>
 
     <nav class="nav">
-      <button
+      <!-- One highlight for the whole rail: it travels to the section you pick
+           instead of blinking there. Step is the row height plus the 2px gap. -->
+      <span
+        ref="navThumbEl"
+        class="nav-thumb"
+        :style="{ opacity: navIndex < 0 ? 0 : 1 }"
+      />
+      <motion.button
         v-for="item in items"
         :key="item.view"
         class="nav-item"
@@ -263,7 +373,7 @@ function pick(id: ProviderId) {
         <span v-if="item.view === 'transfers' && activeTransfers" class="nav-badge">
           {{ activeTransfers }}
         </span>
-      </button>
+      </motion.button>
     </nav>
 
     <div class="sidebar-foot">
@@ -271,18 +381,28 @@ function pick(id: ProviderId) {
            endpoint and while the request is in flight. -->
       <div v-if="quota" class="quota" :title="quotaLabel">
         <div class="quota-track">
-          <div
+          <motion.div
             class="quota-fill"
             :class="{ 'quota-fill--full': quotaPercent >= 90 }"
-            :style="{ width: `${quotaPercent}%` }"
+            :animate="{ width: `${quotaPercent}%` }"
+            :transition="barTransition"
           />
         </div>
         <span class="quota-label truncate">{{ quotaLabel }}</span>
       </div>
 
       <div class="account-area">
-        <Transition :css="false" v-bind="pop">
-          <div v-if="accountOpen" class="account-pop" role="dialog" aria-label="账号">
+        <AnimatePresence>
+          <motion.div
+            v-if="accountOpen"
+            class="account-pop"
+            role="dialog"
+            aria-label="账号"
+            :initial="popHidden"
+            :animate="popShown"
+            :exit="{ ...popHidden, transition: popLeaveTransition }"
+            :transition="popTransition"
+          >
             <div class="account-pop-head">
               <img class="account-pop-logo" :src="currentProvider.logo" alt="" draggable="false" />
               <span class="account-pop-copy">
@@ -319,8 +439,8 @@ function pick(id: ProviderId) {
                 <span>去登录</span>
               </button>
             </div>
-          </div>
-        </Transition>
+          </motion.div>
+        </AnimatePresence>
 
         <button
           class="account"
@@ -340,30 +460,22 @@ function pick(id: ProviderId) {
       </div>
 
       <div class="theme-row">
-        <button
+        <span
+          ref="themeThumbEl"
+          class="theme-thumb"
+        />
+        <motion.button
+          v-for="option in themeOptions"
+          :key="option.value"
           class="theme-btn"
-          :class="{ 'theme-btn--active': app.themeMode === 'light' }"
-          title="浅色"
-          @click="setThemeMode('light')"
+          :class="{ 'theme-btn--active': app.themeMode === option.value }"
+          :title="option.title"
+          :while-press="pressDown"
+          :transition="pressTransition"
+          @click="setThemeMode(option.value)"
         >
-          <Icon name="sun" :size="15" />
-        </button>
-        <button
-          class="theme-btn"
-          :class="{ 'theme-btn--active': app.themeMode === 'system' }"
-          title="跟随系统"
-          @click="setThemeMode('system')"
-        >
-          <Icon name="palette" :size="15" />
-        </button>
-        <button
-          class="theme-btn"
-          :class="{ 'theme-btn--active': app.themeMode === 'dark' }"
-          title="深色"
-          @click="setThemeMode('dark')"
-        >
-          <Icon name="moon" :size="15" />
-        </button>
+          <Icon :name="option.icon" :size="15" />
+        </motion.button>
       </div>
     </div>
   </aside>
@@ -434,24 +546,38 @@ function pick(id: ProviderId) {
   flex: none;
   color: var(--text-3);
 }
-.switcher-menu {
+.switcher-clip {
+  /* Carries the height animation; the inner box carries the chrome. The 8px
+     side padding and 40px bottom padding exist only so `--shadow-lg` (which
+     reaches ~36px below the box) is inside the clip box instead of being cut
+     off — `overflow: hidden` is what makes a height animation possible at all. */
   position: absolute;
   z-index: 30;
-  top: calc(100% + 4px);
-  left: 0;
-  right: 0;
+  top: calc(100% + 2px);
+  left: -8px;
+  right: -8px;
+  padding: 8px 8px 40px;
+  overflow: hidden;
+  pointer-events: none;
+  /* `content-box` is load-bearing: the app is `border-box` globally, and with
+     `border-box` a `height: 0` animation can never get below the 48px of
+     vertical padding — the first 8px of the menu would stay visible at rest. */
+  box-sizing: content-box;
+}
+.switcher-menu {
   padding: 4px;
   border-radius: var(--radius-md);
   border: 1px solid var(--line);
   background: var(--bg-raised);
   box-shadow: var(--shadow-lg);
-  /* WebKitGTK re-rasterises a scaled, shadowed layer on every frame, which
-     reads as the menu (and the sidebar under it) flickering. Keeping a stable
-     identity transform and asking for the layer up front stops that. */
-  transform: translateY(0);
-  will-change: opacity, transform;
-  /* Keep the popup's paint work out of the sidebar's layer. */
-  contain: layout paint;
+  pointer-events: auto;
+  /* Animated by motion-v as a height change (`panelHidden` → `panelShown`),
+     which is why the motion lives on `.switcher-clip` and not here: scaling a
+     shadowed panel re-rasterises the blur every frame, and the last frame of a
+     shrink is what read as the menu twitching on close.
+     Nothing motion-related belongs here: motion-v writes `transform`/`opacity`
+     inline and manages `will-change` itself, removing it when it settles.
+     Do NOT add `transform` or `will-change` back. */
 }
 .switcher-item {
   display: flex;
@@ -509,7 +635,8 @@ function pick(id: ProviderId) {
   height: 100%;
   border-radius: 999px;
   background: var(--text-3);
-  transition: width var(--dur-3) var(--ease-out), background-color var(--dur-2) var(--ease-out);
+  /* Width is animated by motion-v (`barTransition`); only the colour is CSS. */
+  transition: background-color var(--dur-2) var(--ease-out);
 }
 .quota-fill--full {
   background: #e0554f;
@@ -521,12 +648,46 @@ function pick(id: ProviderId) {
 }
 
 .nav {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
+/* The travelling highlight. Absolutely placed and behind the buttons, so the
+   rail keeps one moving surface instead of one background per row appearing and
+   disappearing. Height matches `.nav-item` (34px); the step used by `navIndex`
+   in the script is 34 + the 2px gap above. */
+.nav-thumb {
+  /* WebKitGTK drops a compositing layer the moment the last `will-change`
+     disappears, and motion clears its inline `will-change` as soon as an
+     animation finishes. The repaint that follows uses the element's *layout*
+     position, so a travelled slider flashes back to its slot of origin for a
+     frame before the final transform is re-applied — the "B → A → B" snap.
+     Declaring the hint in CSS keeps the layer alive after motion is done. */
+  will-change: transform;
+
+  position: absolute;
+  z-index: 0;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  /* A ring, not a blurred shadow: this element *travels*, and a blur has to be
+     re-rasterised on every frame of that travel. On WebKitGTK the result is a
+     visible wobble in the ring — the "抽搐" that made the highlight feel broken
+     even though the motion itself was smooth. An inset ring is painted once and
+     composited. */
+  box-shadow: inset 0 0 0 1px var(--line);
+  pointer-events: none;
+}
+:root[data-theme="dark"] .nav-thumb {
+  background: rgba(255, 255, 255, 0.07);
+}
 .nav-item {
   position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -537,7 +698,7 @@ function pick(id: ProviderId) {
   font-weight: 490;
   color: var(--text-2);
   transition: background-color var(--dur-2) var(--ease-out),
-    color var(--dur-1) var(--ease-out), box-shadow var(--dur-2) var(--ease-out);
+    color var(--dur-1) var(--ease-out);
 }
 .nav-item:hover:not(:disabled) {
   background: var(--bg-hover);
@@ -548,13 +709,8 @@ function pick(id: ProviderId) {
   background: var(--bg-active);
 }
 .nav-item--active {
+  /* Background and shadow live on `.nav-thumb`, which slides between rows. */
   color: var(--text);
-  background: var(--bg);
-  box-shadow: var(--shadow-sm), 0 0 0 1px var(--line);
-}
-:root[data-theme="dark"] .nav-item--active {
-  background: rgba(255, 255, 255, 0.07);
-  box-shadow: 0 0 0 1px var(--line);
 }
 .nav-item:disabled {
   opacity: 0.42;
@@ -598,11 +754,8 @@ function pick(id: ProviderId) {
   border: 1px solid var(--line);
   background: var(--bg-raised);
   box-shadow: var(--shadow-lg);
-  /* Same WebKitGTK workaround as the drive switcher: a stable identity
-     transform plus a layer hint keeps the popup from re-rasterising. */
-  transform: translateY(0);
-  will-change: opacity, transform;
-  contain: layout paint;
+  /* Same rule as `.switcher-menu`: motion-v owns the animation, so no
+     `will-change`, no `contain`, no static transform here. */
 }
 .account-pop-head {
   display: flex;
@@ -743,8 +896,12 @@ function pick(id: ProviderId) {
   margin-left: auto;
 }
 .theme-row {
-  display: flex;
-  gap: 2px;
+  /* A grid rather than a flex row with gaps: the thumb has to be exactly one
+     third wide for `x: index * 100%` to land on a segment, and a gap would make
+     each segment narrower than a third. */
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
   padding: 3px;
   border-radius: var(--radius-sm);
   background: var(--bg);
@@ -753,21 +910,44 @@ function pick(id: ProviderId) {
 :root[data-theme="dark"] .theme-row {
   background: rgba(255, 255, 255, 0.04);
 }
+/* Slides to the selected mode instead of blinking there — `thumbTransition`. */
+.theme-thumb {
+  /* WebKitGTK drops a compositing layer the moment the last `will-change`
+     disappears, and motion clears its inline `will-change` as soon as an
+     animation finishes. The repaint that follows uses the element's *layout*
+     position, so a travelled slider flashes back to its slot of origin for a
+     frame before the final transform is re-applied — the "B → A → B" snap.
+     Declaring the hint in CSS keeps the layer alive after motion is done. */
+  will-change: transform;
+
+  position: absolute;
+  z-index: 0;
+  top: 3px;
+  bottom: 3px;
+  left: 3px;
+  /* An absolutely positioned box resolves percentages against the ancestor's
+     *padding* box, so the 3px of padding on each side has to come back out —
+     otherwise the thumb is 2px too wide and each step drifts another 2px, which
+     is why the middle slot never lined up and the last one overflowed. */
+  width: calc((100% - 6px) / 3);
+  border-radius: 6px;
+  background: var(--bg-active);
+  pointer-events: none;
+}
 .theme-btn {
-  flex: 1;
+  position: relative;
+  z-index: 1;
   display: grid;
   place-items: center;
   height: 26px;
   border-radius: 6px;
   color: var(--text-3);
-  transition: background-color var(--dur-2) var(--ease-out),
-    color var(--dur-2) var(--ease-out);
+  transition: color var(--dur-2) var(--ease-out);
 }
 .theme-btn:hover {
   color: var(--text-2);
 }
 .theme-btn--active {
   color: var(--text);
-  background: var(--bg-active);
 }
 </style>

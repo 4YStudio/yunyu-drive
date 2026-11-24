@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, watch } from "vue";
+import { AnimatePresence, motion } from "motion-v";
+import { dialogHidden, dialogLeaveTransition, dialogShown, dialogTransition, reducedMotion } from "@/lib/motion";
 
 const props = defineProps<{
   open: boolean;
@@ -30,13 +32,25 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
        ancestor turns it into the containing block for `position: fixed`, and
        the screens carry an identity transform. -->
   <Teleport to="body">
-    <Transition name="modal">
-      <div v-if="open" class="backdrop" @click.self="closeOnBackdrop !== false && emit('close')">
-        <div
+    <AnimatePresence>
+      <motion.div
+        v-if="open"
+        class="backdrop"
+        :initial="{ opacity: 0 }"
+        :animate="{ opacity: 1 }"
+        :exit="{ opacity: 0 }"
+        :transition="{ duration: reducedMotion ? 0 : 0.14 }"
+        @click.self="closeOnBackdrop !== false && emit('close')"
+      >
+        <motion.div
           class="modal"
           :style="{ width: width ? `${width}px` : undefined }"
           role="dialog"
           aria-modal="true"
+          :initial="dialogHidden"
+          :animate="dialogShown"
+          :exit="{ opacity: 0, scale: 0.96, y: 6, transition: dialogLeaveTransition }"
+          :transition="dialogTransition"
         >
           <header v-if="title" class="modal-head">
             <div>
@@ -55,9 +69,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           <footer v-if="$slots.footer" class="modal-foot">
             <slot name="footer" />
           </footer>
-        </div>
-      </div>
-    </Transition>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
   </Teleport>
 </template>
 
@@ -123,36 +137,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
    transition covers 243 000 px (8.7% of the viewport, bbox = the whole screen);
    with it instant, only 36 000 px (bbox = the panel alone). See
    docs/tauri-webkitgtk-flicker.md. */
-.modal-enter-active {
-  transition: none;
-}
-/* Leaving the backdrop is instant too, for the same reason: an opacity
-   transition that finishes on a full-viewport layer costs one full-surface
-   repaint right after it ends (measured 140 000 px, bbox = whole window, ~60 ms
-   after the transition completed). Instant removal is a single honest frame. */
-.modal-leave-active {
-  transition: none;
-}
-/* Translate only, and rest on an identity transform. `scale()` on a panel that
-   carries text plus `--shadow-lg` forces a re-raster of the whole box every
-   frame, and dropping the transform at the end tears the layer down — WebKitGTK
-   then repaints one frame from the stale tile, which reads as the panel (and
-   the page behind it) blinking. See docs/tauri-webkitgtk-flicker.md. */
-.modal-enter-active .modal {
-  transition: transform var(--dur-3) var(--ease-out), opacity var(--dur-3) var(--ease-out);
-}
-.modal-leave-active .modal {
-  transition: transform var(--dur-2) var(--ease-out), opacity var(--dur-2) var(--ease-out);
-}
-.modal-leave-to {
-  opacity: 0;
-}
-.modal-enter-from .modal,
-.modal-leave-to .modal {
-  opacity: 0;
-  transform: translateY(10px);
-}
 :where(.modal) {
-  transform: translateY(0);
+  /* The dialog is a `motion.div` inside `<AnimatePresence>`; its spring and its
+     exit live in the template. Nothing here may declare a transform — motion-v
+     writes one inline and a stylesheet value only fights it. */
 }
 </style>

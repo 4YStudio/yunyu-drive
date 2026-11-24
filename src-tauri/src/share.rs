@@ -484,6 +484,36 @@ pub fn parse_link(input: &str) -> AppResult<ShareTarget> {
         });
     }
 
+    // 115 网盘: `https://115cdn.com/s/<share_code>?password=<code>#`.
+    // 分享码是 11 位的短串，提取码就是链接里的 `password`。
+    if host == "115.com"
+        || host.ends_with(".115.com")
+        || host.ends_with("115cdn.com")
+        || host.ends_with("115666.com")
+    {
+        let code = path_part
+            .split("/s/")
+            .nth(1)
+            .map(|v| v.trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty() && !v.contains('/'))
+            .ok_or_else(|| AppError::new("没有从链接里找到分享码，请检查链接"))?;
+        if passcode.is_empty() {
+            passcode = query
+                .split('&')
+                .find_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    (k == "password" || k == "pwd" || k == "passcode")
+                        .then(|| percent_decode(v))
+                })
+                .unwrap_or_default();
+        }
+        return Ok(ShareTarget {
+            provider: ProviderId::Pan115,
+            id: code,
+            passcode,
+        });
+    }
+
     if host.contains("quark.cn") {
         let pwd_id = path_part
             .split("/s/")
@@ -494,6 +524,31 @@ pub fn parse_link(input: &str) -> AppResult<ShareTarget> {
         return Ok(ShareTarget {
             provider: ProviderId::Quark,
             id: pwd_id,
+            passcode,
+        });
+    }
+
+    // 天翼云盘: `https://cloud.189.cn/t/<shareCode>`, sometimes with the
+    // access code appended as `?code=<pwd>`.
+    if host.ends_with("189.cn") {
+        let code = path_part
+            .split("/t/")
+            .nth(1)
+            .map(|v| v.trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty() && !v.contains('/'))
+            .ok_or_else(|| AppError::new("没有从链接里找到分享 ID，请检查链接"))?;
+        if passcode.is_empty() {
+            passcode = query
+                .split('&')
+                .find_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    (k == "code" || k == "pwd" || k == "passcode").then(|| percent_decode(v))
+                })
+                .unwrap_or_default();
+        }
+        return Ok(ShareTarget {
+            provider: ProviderId::Cloud189,
+            id: code,
             passcode,
         });
     }
@@ -618,6 +673,9 @@ fn image_referer(url: &str) -> Option<&'static str> {
         "https://www.123pan.com/"
     } else if host.ends_with("quark.cn") {
         "https://pan.quark.cn/"
+    } else if host.ends_with("115.com") || host.ends_with("115cdn.com") || host.ends_with("115666.com")
+    {
+        "https://115cdn.com/"
     } else {
         return None;
     };
@@ -988,6 +1046,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_115_share_links() {
+        // 115 把提取码叫 password，链接尾巴上还挂一个 `#`。
+        let target = parse_link("https://115cdn.com/s/swlwole3wdn?password=f977#").unwrap();
+        assert_eq!(target.provider, ProviderId::Pan115);
+        assert_eq!(target.id, "swlwole3wdn");
+        assert_eq!(target.passcode, "f977");
+
+        let target = parse_link("115.com/s/swlwole3wdn").unwrap();
+        assert_eq!(target.provider, ProviderId::Pan115);
+        assert_eq!(target.id, "swlwole3wdn");
+        assert!(target.passcode.is_empty());
+    }
+
+    #[test]
     fn parses_every_other_drive() {
         let target = parse_link("https://yun.139.com/shareweb/#/w/i/2yA8EKhoE66zy").unwrap();
         assert_eq!(target.provider, ProviderId::Yun139);
@@ -1005,6 +1077,18 @@ mod tests {
         let target = parse_link("https://pan.baidu.com/s/1Gb3CPF1uBTgEaH5BdXwbAQ").unwrap();
         assert_eq!(target.provider, ProviderId::Baidu);
         assert_eq!(target.id, "Gb3CPF1uBTgEaH5BdXwbAQ");
+
+        // 天翼云盘 puts the share code in the path; the access code may ride
+        // along as `?code=`.
+        let target = parse_link("https://cloud.189.cn/t/YRry2aRzmUNr").unwrap();
+        assert_eq!(target.provider, ProviderId::Cloud189);
+        assert_eq!(target.id, "YRry2aRzmUNr");
+        assert_eq!(target.passcode, "");
+
+        let target = parse_link("https://cloud.189.cn/t/YRry2aRzmUNr?code=2sc1").unwrap();
+        assert_eq!(target.provider, ProviderId::Cloud189);
+        assert_eq!(target.id, "YRry2aRzmUNr");
+        assert_eq!(target.passcode, "2sc1");
     }
 
     #[test]

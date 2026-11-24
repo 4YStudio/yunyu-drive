@@ -11,6 +11,7 @@ import QRCode from "qrcode";
 
 import Icon from "@/components/Icon.vue";
 import { api } from "@/lib/backend";
+import { errText } from "@/lib/format";
 import { toast } from "@/store/app";
 
 const emit = defineEmits<{ done: [] }>();
@@ -69,7 +70,7 @@ async function start() {
     schedulePoll();
   } catch (err) {
     status.value = "expired";
-    message.value = String(err);
+    message.value = errText(err);
   }
 }
 
@@ -130,7 +131,7 @@ async function poll() {
     // blip is right; hiding a real failure until the deadline is wrong, so show
     // the message at once and stop after a few consecutive failures.
     failures += 1;
-    message.value = String(err);
+    message.value = errText(err);
     if (failures >= 3) {
       status.value = "expired";
       return;

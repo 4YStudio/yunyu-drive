@@ -65,11 +65,29 @@ impl Profile {
         slow_floor: 8.0 * 1024.0,
     };
 
+    /// 天翼云盘 throttles per connection, not per account, so the knee sits far
+    /// above the generic ceiling.
+    ///
+    /// Measured 2026-11 against a 31 MB file on `shusheng2.mini189.cn` (median of
+    /// two 4 s rounds each): 1 conn 1.2 MB/s, 16 conns 4.0, 32 conns 7.5, 64
+    /// conns 8.5, 96 conns 10.2, 128 conns 10.7, 192 conns 10.1 — so 128 is the
+    /// knee and 192 only adds handshakes. A second file confirmed the shape
+    /// (single connection anywhere between 2.0 and 10.2 MB/s depending on which
+    /// CDN node answered, 128 conns 8.5). The per-connection rate is jittery
+    /// enough that a connection regularly sits at ~100 KiB/s, so the slow floor
+    /// stays at the generic 8 KiB/s rather than marking peers half-dead.
+    pub const CLOUD189: Profile = Profile {
+        floor: 8,
+        ceiling: 128,
+        slow_floor: 8.0 * 1024.0,
+    };
+
     /// Picks the profile for a drive id (`"quark"`, `"aliyun"`, ...).
     pub fn for_provider(provider: &str) -> Profile {
         match provider {
             "quark" => Profile::QUARK,
             "aliyun" => Profile::ALIYUN,
+            "cloud189" => Profile::CLOUD189,
             _ => Profile::GENERIC,
         }
     }
@@ -399,6 +417,8 @@ mod tests {
         assert_eq!(Profile::for_provider("quark").ceiling, 512);
         assert_eq!(Profile::for_provider("aliyun").ceiling, 64);
         assert_eq!(Profile::for_provider("baidu").ceiling, 64);
+        assert_eq!(Profile::for_provider("cloud189").ceiling, 128);
+        assert_eq!(Profile::for_provider("cloud189").floor, 8);
     }
 
     #[test]

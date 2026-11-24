@@ -196,6 +196,8 @@ pub fn run() {
             commands::transfer_retry,
             commands::aliyun_qr_start,
             commands::aliyun_qr_poll_with,
+            commands::cloud189_qr_start,
+            commands::cloud189_qr_poll,
             commands::provider_login,
             commands::provider_logout,
             commands::provider_quota,
@@ -204,6 +206,8 @@ pub fn run() {
             commands::recycle_purge,
             commands::recycle_clear,
             commands::inline_image,
+            #[cfg(debug_assertions)]
+            commands::debug_probe,
             commands::settings_get,
             commands::settings_set,
             commands::app_info,
@@ -221,6 +225,7 @@ pub fn run() {
             login::open_web_login,
             login::open_web_login_139,
             login::open_web_login_baidu,
+        login::open_web_login_115,
             login::close_web_login,
         ])
         .run(tauri::generate_context!())

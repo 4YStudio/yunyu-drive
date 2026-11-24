@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { AnimatePresence, motion } from "motion-v";
 import Icon from "@/components/Icon.vue";
-import { pop } from "@/lib/motion";
+import { popHidden, popLeaveTransition, popShown, popTransition } from "@/lib/motion";
 import type { MenuItem } from "@/lib/menu";
 
 const props = defineProps<{
@@ -62,13 +63,17 @@ function pick(item: MenuItem) {
 
 <template>
   <Teleport to="body">
-    <Transition :css="false" v-bind="pop">
-      <div
+    <AnimatePresence>
+      <motion.div
         v-if="open"
         ref="root"
         class="menu"
         :style="{ left: `${pos.x}px`, top: `${pos.y}px` }"
         role="menu"
+        :initial="popHidden"
+        :animate="popShown"
+        :exit="{ ...popHidden, transition: popLeaveTransition }"
+        :transition="popTransition"
       >
         <template v-for="item in items" :key="item.id">
           <div v-if="item.separatorBefore" class="menu-sep" />
@@ -85,8 +90,8 @@ function pick(item: MenuItem) {
             <span v-if="item.hint" class="menu-hint">{{ item.hint }}</span>
           </button>
         </template>
-      </div>
-    </Transition>
+      </motion.div>
+    </AnimatePresence>
   </Teleport>
 </template>
 

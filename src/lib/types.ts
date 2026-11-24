@@ -1,7 +1,7 @@
 /** Shared IPC payload types (mirrors the Rust structs in src-tauri). */
 
 /** Which cloud drive an entry belongs to. */
-export type ProviderId = "quark" | "yun139" | "aliyun" | "pan123" | "baidu";
+export type ProviderId = "quark" | "yun139" | "aliyun" | "pan123" | "baidu" | "pan115" | "cloud189";
 
 export const PROVIDERS: {
   id: ProviderId;
@@ -14,7 +14,9 @@ export const PROVIDERS: {
   { id: "yun139", name: "中国移动云盘", short: "移动", logo: "/netdisk-yun139.png" },
   { id: "aliyun", name: "阿里云盘", short: "阿里", logo: "/netdisk-aliyun.png" },
   { id: "pan123", name: "123 云盘", short: "123", logo: "/netdisk-pan123.png" },
+  { id: "pan115", name: "115 网盘", short: "115", logo: "/netdisk-115.png" },
   { id: "baidu", name: "百度网盘", short: "百度", logo: "/netdisk-baidu.png" },
+  { id: "cloud189", name: "天翼云盘", short: "天翼", logo: "/netdisk-cloud189.png" },
 ];
 
 export interface EntryDto {

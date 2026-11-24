@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { motion } from "motion-v";
+import { thumbTransition } from "@/lib/motion";
+
 withDefaults(
   defineProps<{
     modelValue: boolean;
@@ -31,7 +34,11 @@ function toggle(current: boolean) {
       :disabled="disabled"
       @click="toggle(modelValue)"
     >
-      <span class="switch-knob" />
+      <motion.span
+        class="switch-knob"
+        :animate="{ x: modelValue ? 17 : 0 }"
+        :transition="thumbTransition"
+      />
     </button>
   </div>
 </template>
@@ -73,6 +80,14 @@ function toggle(current: boolean) {
   box-shadow: inset 0 0 0 1px transparent;
 }
 .switch-knob {
+  /* WebKitGTK drops a compositing layer the moment the last `will-change`
+     disappears, and motion clears its inline `will-change` as soon as an
+     animation finishes. The repaint that follows uses the element's *layout*
+     position, so a travelled slider flashes back to its slot of origin for a
+     frame before the final transform is re-applied — the "B → A → B" snap.
+     Declaring the hint in CSS keeps the layer alive after motion is done. */
+  will-change: transform;
+
   position: absolute;
   top: 2.5px;
   left: 2.5px;
@@ -81,11 +96,11 @@ function toggle(current: boolean) {
   border-radius: 50%;
   background: var(--bg);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-  transition: transform var(--dur-2) var(--ease-out),
-    background-color var(--dur-2) var(--ease-out);
+  /* The slide is motion-v's (`thumbTransition`); only the colour fades in CSS,
+     because a colour cannot be handed to the compositor anyway. */
+  transition: background-color var(--dur-2) var(--ease-out);
 }
 .switch--on .switch-knob {
-  transform: translateX(17px);
   background: var(--on-fill);
 }
 .switch:disabled {

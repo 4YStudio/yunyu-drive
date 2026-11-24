@@ -222,14 +222,11 @@ a {
 }
 
 /* ---------- transitions ---------- */
-.fade-enter-active,
-.fade-leave-active {
-  transition: opacity var(--dur-2) var(--ease-out);
-}
-.fade-enter-from,
-.fade-leave-to {
-  opacity: 0;
-}
+/* Every animation in the app goes through motion-v (src/lib/motion.ts) and the
+   Web Animations API. There are deliberately no `.foo-enter-*` / `.foo-leave-*`
+   classes left in this file — nothing applies them any more, and leaving them
+   behind invites someone to re-add a CSS `transition` that will misbehave on
+   WebKitGTK (see below). */
 
 /* The stage holds every screen as an equal, absolutely positioned layer, so a
    swap never reflows anything. */
@@ -244,7 +241,10 @@ a {
 
 /* Rest on an identity transform rather than `none`: WebKitGTK tears the
    compositing layer down when the animated transform goes away and repaints the
-   screen from scratch, which is the second way this swap used to flash. */
+   screen from scratch, which is one of the ways this swap used to flash.
+   motion-v writes an inline `transform` during the animation and leaves
+   `translateY(0)` behind, so this rule only matters for the frames before the
+   first animation runs. Keep it. */
 :where(.stage > .view) {
   transform: translateY(0);
 }
@@ -256,56 +256,22 @@ a {
    transformed element and, when the outgoing node is dropped at the end of the
    animation, can repaint one frame from that stale tile — which the user sees
    as the previous page blinking back before the new one settles.
-   Only the incoming screen is animated now and the outgoing one is unmounted
-   the moment the swap starts, so at no instant are two screens in the DOM and
-   nothing stale can be painted.
+   Only the incoming screen is animated and the outgoing one is unmounted the
+   moment the swap starts, so at no instant are two screens in the DOM.
+   The animation itself is driven from `App.vue` (`playViewEnter`, through
+   motion-v's `animate`), not from CSS: as a CSS transition the same transform
+   left 11 anomalous frames over 10 runs of 8 swaps, each one a full-content-area
+   repaint, while the identical animation driven from JS left 0 over 18 runs. */
 
-   The swap is NOT a CSS transition any more — `App.vue` runs it through the Web
-   Animations API (`:css="false"` + `@enter`). The same transform driven by
-   `transition` left 11 anomalous frames over 10 runs of 8 swaps (each one a
-   full-content-area repaint), while `element.animate()` left 0 over 18 runs.
-   The identity transform below stays because it is what keeps the resting layer
-   from being torn down between swaps. Do not re-add `.view-enter-*` rules; they
-   are inert now that the transition has no CSS phase. */
-:where(.stage > .view) {
-  transform: translateY(0);
-}
-
-/* Popups (context menu, drive switcher, account bubble).
-   The animation lives in `lib/motion.ts` and runs through the Web Animations
-   API (`<Transition :css="false" v-bind="pop">`), not through these classes.
-   As a CSS `transition` it was not stepped at all on WebKitGTK: one
-   intermediate frame, then a 200 ms stall, then a jump to the final state —
-   the "twitch" that surrounded the drive switcher, plus a full-content-area
-   repaint (21k–43k px outside the popup). Through `element.animate()` the same
-   motion produces 10 distinct frames with a 26 ms worst gap. Do not re-add
-   `.pop-enter-*` rules; they are inert now that the transition has no CSS
-   phase.
-
-   Whatever animates them must stay transform+opacity only — no `scale`. */
-:where(.switcher-menu, .account-pop, .menu) {
-  transform: translateY(0);
-}
-
-.list-move,
-.list-enter-active,
-.list-leave-active {
-  transition: opacity var(--dur-2) var(--ease-out),
-    transform var(--dur-2) var(--ease-out);
-}
-.list-enter-from {
-  opacity: 0;
-  transform: translateY(-6px);
-}
-.list-leave-to {
-  opacity: 0;
-  transform: translateY(-6px);
-}
-.list-leave-active {
-  position: absolute;
-  width: 100%;
-}
-
+/* Popups (context menu, drive switcher, account bubble, modal) are `<motion.div>`s
+   inside `<AnimatePresence>`; their motion lives in `src/lib/motion.ts`.
+   Two things must not come back here:
+   - `.pop-enter-*` classes: as a CSS transition the popup was not stepped at all
+     on WebKitGTK — one intermediate frame, a 200 ms stall, then a jump to the
+     final state, i.e. the "twitch" that surrounded the drive switcher.
+   - a static `transform: translateY(0)` on these selectors: motion-v writes its
+     own inline transform, and a stylesheet value only fights it. The resting
+     transform comes from motion-v's final keyframe. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

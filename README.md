@@ -4,7 +4,7 @@
 
 # 云语聚合网盘
 
-**把夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘装进同一个窗口。**
+**把夸克、中国移动云盘、阿里云盘、123 云盘、百度网盘、天翼云盘装进同一个窗口。**
 
 一套文件浏览、一套上传下载队列、一套传输列表、一套分享流程。
 
@@ -77,21 +77,24 @@
 
 **分段并发下载**
 
-夸克与阿里云盘走多连接分段下载：按文件大小自适应连接数（8 MB 以下单流，
-1 GB 以上最多 512 路），每路只取一段区间，谁先完成谁再领新片，
-慢连接会被判定后换新连接而不是拖死整个任务。
+六个盘都走多连接分段下载：按文件大小自适应连接数（8 MB 以下单流），每路只取
+一段区间，谁先完成谁再领新片，慢连接会被判定后换新连接而不是拖死整个任务。
+连接上限按盘实测分别设定 —— 夸克按账号限速，512 路才到 24 MB/s；阿里云盘按 IP
+限速，64 路已封顶；天翼云盘按**单连接**限速，128 路才到 10.7 MB/s（单流只有
+1.2 MB/s，64 路 8.5 MB/s），所以天翼的上限是 128 而不是默认的 64。
 直链过期、CDN 回 200 错误页、服务端不认 `Range` 都有对应处理，
 断点续传把分片计划写进 `.part.yyparts`，重启后按原偏移继续。
 
-**分享链接（五个盘都支持）**
+**分享链接（夸克、移动、阿里、123、百度、天翼六个盘支持）**
 
 粘贴链接即可预览、逐级浏览子目录、批量转存到自己网盘或下载到本地。
 支持系统深链 `yunyu-drive://share?url=…`，夸克官网的 `qklink://` 也照收。
 
 **创建分享 · 我的分享**
 
-四个盘可建可撤（139 除外）。「我的分享」列出已建分享的标题、链接、提取码、
+五个盘可建可撤（139 除外）。「我的分享」列出已建分享的标题、链接、提取码、
 到期时间与浏览 / 转存 / 下载次数，可以复制链接或直接取消。
+天翼云盘一次只能分享一个文件或文件夹，访问码由它自己生成（4 位，不能自定义）。
 
 </td>
 </tr>
@@ -118,7 +121,7 @@
   `data:`，所以由后端带上网盘要求的 `Referer` 下载后内联（阿里预览 CDN 缺 referer 会 403）。
   前端同一 URL 只取一次、并发 4 个，失败自动回退到文件图标。
 - **大目录不会卡死**：列表只挂载前 200 行，滚到底部再续 200（状态栏显示「已显示 N / M」）。
-- **五个盘都显示真实头像和昵称**：头像由 Rust 侧下载后内联成 `data:` URL，结果缓存在凭据文件里，
+- **六个盘都显示真实头像和昵称**：头像由 Rust 侧下载后内联成 `data:` URL，结果缓存在凭据文件里，
   第二次启动不再联网；拿不到时回退到昵称首字。
 - **凭据只存本地**：`~/.config/yunyu-drive/`，权限 `0600`。
 - **登录凭据不落日志**，错误统一转成中文文案（`src-tauri/src/error.rs`）。
@@ -132,8 +135,9 @@
 | <img src="public/netdisk-aliyun.png" width="18" align="top" /> 阿里云盘 | 扫码登录 / 粘贴 refresh_token | 自实现，网页版 `api.aliyundrive.com` | 需要 ECDSA 设备签名 |
 | <img src="public/netdisk-pan123.png" width="18" align="top" /> 123 云盘 | 账号 + 密码 | 自实现，安卓协议移植 | 移动走 `mod_pid`；复制走 `copy/async`（原地复制再移动） |
 | <img src="public/netdisk-baidu.png" width="18" align="top" /> 百度网盘 | 内置网页登录抓 Cookie / 粘贴 Cookie | 自实现，网页版 `pan.baidu.com/api` | 网页会话（`BDUSS` + `PANPSC` + `bdstoken`），不需要开发者 app_key |
+| <img src="public/netdisk-cloud189.png" width="18" align="top" /> 天翼云盘 | App 扫码（QR） | 自实现，网页版 `api.cloud.189.cn` | HMAC-SHA1 会话签名 + MD5 分享签名；上传支持秒传，分享一次只能选一项 |
 
-> 源码里仍能找到 `quark` 的痕迹：那是**五个网盘之一**（`ProviderId::Quark`）以及夸克自己的
+> 源码里仍能找到 `quark` 的痕迹：那是**六个网盘之一**（`ProviderId::Quark`）以及夸克自己的
 > 接口地址与深链 `qklink://`（夸克官网「打开客户端」按钮会触发它）。这些都不是历史残留。
 
 ## 下载安装
@@ -255,17 +259,19 @@ yunyu-drive/
 │   ├── lib/host.ts       原生能力桥（对话框 / 打开所在目录 / 拖拽 / 窗口主题）
 │   ├── lib/mock.ts       内存版后端（fixtures + 模拟进度）
 │   ├── lib/types.ts      PROVIDERS 与 DTO 类型
-│   ├── lib/motion.ts     popup 动画（WAAPI）
-│   └── styles/           tokens.css（设计令牌）+ global.css（原语与过渡）
+│   ├── lib/motion.ts     全站动画语言（motion-v：面板展开 / 弹层 / 滑块 / 列表错开）
+│   └── styles/           tokens.css（设计令牌）+ global.css（原语）
 ├── src-tauri/
-│   ├── src/providers/    DriveProvider 抽象 + 五个网盘适配器
+│   ├── src/providers/    DriveProvider 抽象 + 六个网盘适配器
 │   │   ├── mod.rs        trait、EntryId（`<provider>:<native>`）、Capabilities
 │   │   ├── quark.rs      夸克（libquarkpan）
 │   │   ├── yun139.rs     中国移动云盘（cloud139，路径 ↔ base64 id）
 │   │   ├── aliyun.rs     阿里云盘（网页版 API + ECDSA 设备签名）
 │   │   ├── aliyun_qr.rs  阿里扫码登录
 │   │   ├── pan123.rs     123 云盘（安卓协议）
-│   │   └── baidu.rs      百度网盘（网页会话 + 4 MiB 分片上传）
+│   │   ├── baidu.rs      百度网盘（网页会话 + 4 MiB 分片上传）
+│   │   ├── cloud189.rs   天翼云盘（会话签名 + 秒传上传）
+│   │   └── cloud189_qr.rs 天翼扫码登录
 │   ├── src/engine/       分段并发下载引擎（多连接拉满带宽）
 │   │   ├── mod.rs        编排：预检、分轮取片、直链自愈、无进展熔断
 │   │   ├── plan.rs       分片规划（纯函数：片数与片长、头部更细）
@@ -285,7 +291,7 @@ yunyu-drive/
 ├── vendor/               两个 crate 的源码（见 vendor/README.md）
 └── docs/
     ├── index.html        官网（单页，无构建步骤）
-    ├── assets/           site.css / site.js / logo 与五个网盘图标
+    ├── assets/           site.css / site.js / logo 与六个网盘图标
     ├── *-light.png       四张界面截图（浅色 / 深色各一套）
     ├── provider-login.md 各网盘登录方式与凭据文件
     └── tauri-webkitgtk-flicker.md  页面切换闪烁的排查笔记
@@ -316,6 +322,7 @@ yunyu-drive/
 | 阿里云盘 | App 扫码（QR） | 粘贴 `refresh_token` | `aliyun.json` |
 | 123 云盘 | 账号 + 密码 | — | `pan123.json` |
 | 百度网盘 | 内嵌窗口登录，抓整包 Cookie | 粘贴 Cookie | `baidu.json` |
+| 天翼云盘 | App 扫码（QR） | — | `cloud189.json` |
 
 </details>
 
@@ -408,7 +415,7 @@ yunyu-drive/
   `{"fileList":[{"fileId":…,"size":…,"etag":…,"type":0,"parentFileId":…,"fileName":…,"driveId":0}],"targetFileId":<目标文件夹>}`。
   用安卓风格的 `{"FileId":…}` + 顶层 `parentFileId` 会回 `code: 0` 但**什么都不复制**（静默空转），
   这也是之前把 123 的「复制」标成不支持的原因。
-- 五个网盘的列表排序由同一段代码决定（文件夹优先，再按名称小写排序），
+- 六个网盘的列表排序由同一段代码决定（文件夹优先，再按名称小写排序），
   时间戳也由同一个 `parse_time` 解析——123 的 `UpdateAt` 是 ISO 字符串、百度是秒、
   夸克是毫秒，各读一种形状会让列表显示 1970。
 - 139 的上传是自建的四步协议（`file/create` → 逐片 `PUT` → `file/complete`），
@@ -525,8 +532,35 @@ yunyu-drive/
 见 [docs/tauri-webkitgtk-flicker.md](docs/tauri-webkitgtk-flicker.md)。
 
 结论摘要：视图切换不能走 CSS `transition`（WebKitGTK 上不逐帧推进，且丢弃 transform 时
-会拆掉合成层导致整屏重绘），改用 Web Animations API 的 `element.animate()`；
-弹出层同理；动画只用 transform + opacity，**不要用 `scale()`**。
+会拆掉合成层导致整屏重绘），动画必须由 JS 驱动。
+
+**现状：全站动画统一走 [motion-v](https://motion.dev)**，不再有手写的
+`element.animate()`，也不再有任何 `.foo-enter-*` / `.foo-leave-*` CSS 过渡类。
+`src/lib/motion.ts` 是唯一的动画参数来源，弹出层/模态/提示条/列表行/分段控件全部
+是 `<motion.div>` + `<AnimatePresence>`。比手写 WAAPI 多解决一个问题：连续点击时
+（比如菜单还没关完又点开）旧写法会 cancel 掉一个动画再起一个，有一帧停在
+`fill: "both"` 的旧值上；motion-v 是「一个元素一个动画、原地改目标」，打断时是混合
+而不是归零重来。
+
+动画语言只有三个动词，都在 `src/lib/motion.ts` 里定义：
+
+| 令牌 | 用在哪 | 行为 |
+| --- | --- | --- |
+| `panel*` | 云盘切换菜单 | **高度从 0 展开**到内容高度，关闭是收回。不是缩放：带阴影的面板每帧重新栅格化，收缩的最后一帧就是「关闭抽搐」的来源 |
+| `pop*` | 右键菜单、账号气泡 | 从锚点下方弹起，spring 带一点过冲 |
+| `dialog*` | 模态框 | 更重的位移 + 更慢的 spring |
+| `thumb*` | 分段控件 / 主题切换 / 侧栏高亮 | **滑过去**，不是原地出现；全站唯一一段连续运动 |
+| `item*` | 菜单/列表内部条目 | 依次错开 22 ms 进场，读起来是「展开」而不是「换图」 |
+| `row*` | 文件列表行 | 前 40 行错开进场，之后直接出现 |
+
+视图切换是**纯透明度淡入**，不含 transform：视图根节点是
+`position: absolute; inset: 0`，是界面里面积最大的一块，给它做位移会在动画结束、
+合成层降级时让 WebKitGTK 残留一帧栅格偏移——现象就是内容先往下跳几像素再弹回来。
+分区切换的「动感」由下面列表行错开进场提供，不靠整块画布移动。
+
+另外两条仍然有效的教训：动画只用 transform + opacity，别让大面积元素做 `scale()`；
+`will-change` / `contain: paint` 不要常驻，它们会让 WebKitGTK 每帧重传图层——
+那本身就是一个闪烁源。
 
 </details>
 

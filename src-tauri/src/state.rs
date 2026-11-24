@@ -8,8 +8,8 @@ use libquarkpan::QuarkPan;
 use crate::config::{AppPaths, Settings};
 use crate::error::{AppError, AppResult};
 use crate::providers::{
-    AliyunProvider, BaiduProvider, DriveProvider, Pan123Provider, ProviderId, Providers,
-    QuarkProvider, Yun139Provider,
+    AliyunProvider, BaiduProvider, Cloud189Provider, DriveProvider, Pan115Provider, Pan123Provider,
+    ProviderId, Providers, QuarkProvider, Yun139Provider,
 };
 use crate::transfer::TransferManager;
 
@@ -51,6 +51,8 @@ pub struct AppState {
     pub providers: RwLock<Option<Arc<Providers>>>,
     /// In-flight 阿里云盘 QR login, kept between `generate` and `poll`.
     pub aliyun_qr: RwLock<Option<Arc<crate::providers::aliyun_qr::AliyunQrSession>>>,
+    /// In-flight 天翼云盘 QR login.
+    pub cloud189_qr: RwLock<Option<Arc<crate::providers::cloud189_qr::Cloud189QrSession>>>,
 }
 
 impl AppState {
@@ -74,6 +76,7 @@ impl AppState {
             client: RwLock::new(None),
             providers: RwLock::new(None),
             aliyun_qr: RwLock::new(None),
+            cloud189_qr: RwLock::new(None),
             settings: RwLock::new(settings),
             transfers,
             account: RwLock::new(None),
@@ -162,6 +165,9 @@ impl AppState {
         }
 
         // 123 云盘: account/password token stored in its own file.
+        if let Ok(drive) = Pan115Provider::load(&self.paths.config_dir) {
+            list.push(Arc::new(drive));
+        }
         if let Ok(drive) = Pan123Provider::load(&self.paths.config_dir) {
             list.push(Arc::new(drive));
         }
@@ -173,6 +179,11 @@ impl AppState {
 
         // 百度网盘: a web session cookie lifted from the login webview.
         if let Ok(drive) = BaiduProvider::load(&self.paths.config_dir) {
+            list.push(Arc::new(drive));
+        }
+
+        // 天翼云盘: session key/secret from the QR login.
+        if let Ok(drive) = Cloud189Provider::load(&self.paths.config_dir) {
             list.push(Arc::new(drive));
         }
 

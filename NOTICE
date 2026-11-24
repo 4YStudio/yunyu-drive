@@ -58,6 +58,12 @@ License: GPL-3.0-or-later（见 LICENSE）
   策略（4/16/32 MiB）、`slice-md5` 取前 256 KiB、`filelist` 在
   `rename`/`move`/`copy`/`delete` 下的不同形状、`dlink` 到 CDN 的
   `Location` 跳转，以及网页版 cookie 会话（`BDUSS`/`STOKEN` + `bdstoken`）。
+
+* cloud189 / cloudpan189-go / OpenList `drivers/189pc`
+  天翼云盘接口的端点与签名布局（`getSessionForPC`、`listFiles`、
+  `createBatchTask`、`getFileDownloadUrl`、`createUploadFile` 三步上传）的
+  参考资料。这三个项目均已年久失修，且 `drivers/189pc` 为 AGPL-3.0：
+  本程序的 `providers/cloud189.rs` 仅根据协议行为独立重写，未复制任何代码。
   同样未复制其代码。
 
 * Bao-qing/123pan 与 OlyMarco/123pan-uploader-cli

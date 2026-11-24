@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, onActivated, ref, watch } from "vue";
 
+import { motion } from "motion-v";
+import { rowEnter } from "@/lib/motion";
 import Icon from "@/components/Icon.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import DriveLoader from "@/components/DriveLoader.vue";
 import Modal from "@/components/Modal.vue";
 import { api } from "@/lib/backend";
-import { formatFullDate, formatSize } from "@/lib/format";
+import { errText, formatFullDate, formatSize } from "@/lib/format";
 import { PROVIDERS, type RecycleEntry } from "@/lib/types";
 import { app, activeProviderState, toast } from "@/store/app";
 
@@ -60,7 +62,7 @@ async function load() {
     rows.value = await api.recycleList(app.activeProvider, 0, 200);
     selected.value = new Set();
   } catch (err) {
-    error.value = String(err);
+    error.value = errText(err);
     rows.value = [];
   } finally {
     loading.value = false;
@@ -86,7 +88,7 @@ async function restore() {
     toast(`已恢复 ${count} 项到${provider.value.name}`, "success");
     await load();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     busy.value = false;
   }
@@ -100,7 +102,7 @@ async function purge() {
     toast(`已彻底删除 ${count} 项`, "success");
     await load();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     busy.value = false;
   }
@@ -114,7 +116,7 @@ async function clearAll() {
     confirmClear.value = false;
     await load();
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     busy.value = false;
   }
@@ -229,12 +231,13 @@ watch(
         description="删除的文件会在这里保留一段时间。"
       />
 
-      <TransitionGroup v-else name="row" tag="div" class="rows">
-        <button
-          v-for="row in rows"
+      <div v-else class="rows">
+        <motion.button
+          v-for="(row, i) in rows"
           :key="row.fid"
           class="row"
           :class="{ 'row--on': selected.has(row.fid) }"
+          v-bind="rowEnter(i)"
           @click="toggle(row.fid)"
         >
           <span class="check" :class="{ 'check--on': selected.has(row.fid) }">
@@ -244,8 +247,8 @@ watch(
           <span class="row-name truncate" :title="row.name">{{ row.name }}</span>
           <span class="row-size mono">{{ row.isDir ? "—" : formatSize(row.size) }}</span>
           <span class="row-time mono">{{ formatFullDate(row.deletedAt) }}</span>
-        </button>
-      </TransitionGroup>
+        </motion.button>
+      </div>
     </div>
 
     <Modal

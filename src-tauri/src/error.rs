@@ -42,14 +42,14 @@ impl From<reqwest::Error> for AppError {
             return Self("网络超时，请检查连接".to_string());
         }
         if value.is_connect() {
-            return Self("无法连接到夸克服务器".to_string());
+            return Self("无法连接到服务器，请检查网络".to_string());
         }
         if let Some(status) = value.status() {
             return Self(match status.as_u16() {
                 401 | 403 => "登录状态已失效，请重新设置 Cookie".to_string(),
                 404 => "请求的内容不存在或已被删除".to_string(),
                 429 => "请求过于频繁，请稍后再试".to_string(),
-                code if code >= 500 => format!("夸克服务器暂时不可用（{code}），请稍后重试"),
+                code if code >= 500 => format!("服务器暂时不可用（{code}），请稍后重试"),
                 code => format!("接口错误（{code}）"),
             });
         }
@@ -88,14 +88,14 @@ fn describe(err: &libquarkpan::QuarkPanError) -> String {
                     401 | 403 => "登录状态已失效，请重新设置 Cookie".to_string(),
                     404 => "请求的内容不存在或已被删除".to_string(),
                     429 => "请求过于频繁，请稍后再试".to_string(),
-                    code if code >= 500 => format!("夸克服务器暂时不可用（{code}），请稍后重试"),
+                    code if code >= 500 => format!("服务器暂时不可用（{code}），请稍后重试"),
                     code => format!("接口错误（{code}）"),
                 };
             }
             if e.is_timeout() {
                 "网络超时，请检查连接".to_string()
             } else if e.is_connect() {
-                "无法连接到夸克服务器".to_string()
+                "无法连接到服务器，请检查网络".to_string()
             } else {
                 "网络异常，请稍后重试".to_string()
             }

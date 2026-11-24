@@ -1,17 +1,24 @@
 <script setup lang="ts">
+import { AnimatePresence, motion } from "motion-v";
 import { app, dismissToast } from "@/store/app";
 import Icon from "@/components/Icon.vue";
+import { toastHidden, toastShown, toastTransition } from "@/lib/motion";
 </script>
 
 <template>
   <Teleport to="body">
     <div class="toasts" aria-live="polite">
-      <TransitionGroup name="toast">
-        <div
+      <AnimatePresence>
+        <motion.div
           v-for="item in app.toasts"
           :key="item.id"
           class="toast"
           :class="`toast--${item.kind}`"
+          :initial="toastHidden"
+          :animate="toastShown"
+          :exit="{ opacity: 0, scale: 0.96, transition: { duration: 0.12 } }"
+          :transition="toastTransition"
+          layout
           @click="dismissToast(item.id)"
         >
           <Icon
@@ -19,8 +26,8 @@ import Icon from "@/components/Icon.vue";
             :size="15"
           />
           <span class="toast-text">{{ item.message }}</span>
-        </div>
-      </TransitionGroup>
+        </motion.div>
+      </AnimatePresence>
     </div>
   </Teleport>
 </template>
@@ -54,8 +61,7 @@ import Icon from "@/components/Icon.vue";
   box-shadow: var(--shadow-md);
   pointer-events: auto;
   cursor: pointer;
-  transition: opacity var(--dur-2) var(--ease-out),
-    transform var(--dur-2) var(--ease-out);
+  /* Animated by motion-v; a CSS transition here would fight it. */
 }
 .toast-text {
   line-height: 1.45;
@@ -63,28 +69,12 @@ import Icon from "@/components/Icon.vue";
 .toast--error {
   box-shadow: var(--shadow-md), inset 0 0 0 1px var(--line-strong);
 }
-.toast-enter-active {
-  transition: opacity var(--dur-3) var(--ease-out),
-    transform var(--dur-3) var(--ease-out);
-}
-.toast-leave-active {
-  position: absolute;
-  transition: opacity var(--dur-2) var(--ease-out),
-    transform var(--dur-2) var(--ease-out);
-}
-/* Translate only, resting on an identity transform: `scale()` here made the
-   glass panel re-raster every frame and blink on teardown. */
-.toast-enter-from {
-  opacity: 0;
-  transform: translateY(10px);
-}
-.toast-leave-to {
-  opacity: 0;
-  transform: translateY(4px);
-}
-.toast-move {
-  transition: transform var(--dur-3) var(--ease-out);
-}
+/* Entry/exit come from motion-v (see the template). These classes are inert —
+   Vue never adds them any more. `layout` on the motion element handles the
+   "slide up when the one below disappears" reflow that `.toast-move` used to. */
+/* Rest on an identity transform rather than `none`: WebKitGTK tears the
+   compositing layer down when the animated transform disappears and repaints
+   the area once from scratch. */
 :where(.toast) {
   transform: translateY(0);
 }

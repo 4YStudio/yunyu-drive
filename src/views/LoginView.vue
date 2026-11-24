@@ -13,13 +13,16 @@
  *   aliyun — QR code (refresh_token paste as fallback)
  *   pan123 — account + password
  *   baidu  — webview window that harvests `BDUSS`/`STOKEN` (paste as fallback)
+ *   cloud189 — QR code (天翼云盘 has no usable password-less web harvest)
  */
 import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import Icon from "@/components/Icon.vue";
 import AliyunQrLogin from "@/components/AliyunQrLogin.vue";
+import Cloud189QrLogin from "@/components/Cloud189QrLogin.vue";
 import { api, events } from "@/lib/backend";
+import { errText } from "@/lib/format";
 import { PROVIDERS, type ProviderId } from "@/lib/types";
 import {
   app,
@@ -60,6 +63,7 @@ const cookiePath = ref("");
 let unlisten: UnlistenFn | null = null;
 let unlisten139: UnlistenFn | null = null;
 let unlistenBaidu: UnlistenFn | null = null;
+let unlisten115: UnlistenFn | null = null;
 
 const meta = computed(
   () => PROVIDERS.find((p) => p.id === target.value) ?? PROVIDERS[0],
@@ -82,6 +86,7 @@ const canSubmit = computed(() => {
   // 百度网盘 takes a full `Cookie:` header too, so require the `name=value`
   // shape rather than a bare token.
   if (target.value === "baidu") return looksLikeCookie.value;
+  if (target.value === "pan115") return looksLikeCookie.value;
   return trimmed.value.length > 8;
 });
 
@@ -97,6 +102,10 @@ const instructions = computed(() => {
       return "使用 123 云盘的账号和密码登录，密码只保存在本机。";
     case "baidu":
       return "在弹出的登录窗口里登录百度账号，登录状态会自动保存到本地。";
+    case "cloud189":
+      return "用天翼云盘 App 扫码登录，登录状态会自动保存到本地。";
+    case "pan115":
+      return "在弹出的登录窗口里扫码或账号登录 115，登录状态会自动保存到本地。";
   }
   return "";
 });
@@ -111,6 +120,8 @@ const placeholder = computed(() => {
       return "粘贴 refresh_token";
     case "baidu":
       return "BDUSS=...; STOKEN=...";
+    case "pan115":
+      return "UID=...; CID=...; SEID=...; KID=...";
     default:
       return "";
   }
@@ -142,6 +153,19 @@ const helpSteps = computed(() => {
         "推荐用上面的登录窗口；也可以在浏览器登录 pan.baidu.com 后手动粘贴 Cookie。",
         "按 F12 打开开发者工具，切换到「网络 / Network」，刷新页面。",
         "点开任意 pan.baidu.com 请求，复制请求头里的完整 Cookie 值。",
+      ];
+    case "pan115":
+      return [
+        "推荐用上面的登录窗口，登录完会自动取到凭据。",
+        "手动粘贴需要四个 Cookie：UID、CID、SEID、KID。",
+        "在浏览器登录 115.com，F12 打开「网络」，刷新页面。",
+        "点开任意 webapi.115.com 请求，复制请求头里的完整 Cookie。",
+      ];
+    case "cloud189":
+      return [
+        "打开天翼云盘手机 App，点右上角「扫一扫」。",
+        "扫描上方的二维码，在手机上确认登录即可。",
+        "二维码约两分钟失效，过期后点「刷新二维码」重新获取。",
       ];
     default:
       return [];
@@ -178,9 +202,10 @@ async function loginWithWeb() {
   try {
     if (target.value === "yun139") await api.openWebLogin139();
     else if (target.value === "baidu") await api.openWebLoginBaidu();
+    else if (target.value === "pan115") await api.openWebLogin115();
     else await api.openWebLogin();
   } catch (err) {
-    error.value = String(err);
+    error.value = errText(err);
     webBusy.value = false;
   }
 }
@@ -235,7 +260,7 @@ async function submit() {
     }
     await finishLogin();
   } catch (err) {
-    error.value = String(err);
+    error.value = errText(err);
   } finally {
     busy.value = false;
   }
@@ -245,6 +270,13 @@ async function submit() {
 async function onAliyunDone() {
   await loadProviderStates();
   target.value = "aliyun";
+  await finishLogin();
+}
+
+/** The QR component just authenticated 天翼云盘; refresh and leave. */
+async function onCloud189Done() {
+  await loadProviderStates();
+  target.value = "cloud189";
   await finishLogin();
 }
 
@@ -290,7 +322,7 @@ async function logout() {
     await loadProviderStates();
     toast(`已退出${meta.value.name}`, "success");
   } catch (err) {
-    error.value = String(err);
+    error.value = errText(err);
   } finally {
     busy.value = false;
   }
@@ -355,6 +387,22 @@ onMounted(async () => {
       toast(evt.message, "error");
     }
   });
+  unlisten115 = await events.onWebLogin115(async (evt) => {
+    webBusy.value = false;
+    if (evt.ok) {
+      toast(evt.message || "登录成功", "success");
+      target.value = "pan115";
+      await loadProviderStates();
+      const current = app.providers.find((p) => p.provider === "pan115");
+      if (current?.authenticated) {
+        setActiveProvider("pan115");
+        app.view = "files";
+        requestFilesRefresh();
+      }
+    } else if (evt.message && evt.message !== "登录窗口已关闭") {
+      toast(evt.message, "error");
+    }
+  });
 });
 
 onBeforeUnmount(() => {
@@ -364,6 +412,8 @@ onBeforeUnmount(() => {
   unlisten139 = null;
   unlistenBaidu?.();
   unlistenBaidu = null;
+  unlisten115?.();
+  unlisten115 = null;
   if (webBusy.value) void api.closeWebLogin().catch(() => {});
 });
 </script>
@@ -498,6 +548,63 @@ onBeforeUnmount(() => {
               <span>登录</span>
             </button>
           </div>
+        </details>
+      </template>
+
+      <!-- 天翼云盘: QR code only — the session needs a signed key pair that
+           only the QR flow produces. -->
+      <template v-else-if="target === 'cloud189'">
+        <Cloud189QrLogin @done="onCloud189Done" />
+        <details class="manual">
+          <summary>
+            <Icon name="info" :size="13" />
+            <span>扫码遇到问题？</span>
+          </summary>
+          <ol class="help-list">
+            <li v-for="(step, i) in helpSteps" :key="i">{{ step }}</li>
+          </ol>
+        </details>
+      </template>
+
+      <!-- 115 网盘: webview window first, cookie paste as fallback. -->
+      <template v-else-if="target === 'pan115'">
+        <button class="btn btn--solid btn--wide" :disabled="webBusy" @click="loginWithWeb">
+          <Icon v-if="webBusy" name="loader" :size="14" spin />
+          <Icon v-else name="external" :size="14" />
+          <span>{{ webBusy ? "等待登录窗口…" : "打开登录窗口" }}</span>
+        </button>
+        <p v-if="webBusy" class="hint">
+          <Icon name="info" :size="12.5" />
+          <span>已弹出登录窗口，登录成功后会自动继续；关掉窗口即可取消。</span>
+        </p>
+
+        <details class="manual">
+          <summary>
+            <Icon name="keyboard" :size="13" />
+            <span>手动粘贴 Cookie</span>
+          </summary>
+          <label class="field">
+            <span class="field-label">Cookie</span>
+            <textarea
+              v-model="credential"
+              class="cookie-input"
+              rows="4"
+              spellcheck="false"
+              :placeholder="placeholder"
+            />
+          </label>
+          <div class="actions">
+            <button class="btn btn--ghost" @click="pasteFromClipboard">
+              <Icon name="copy" :size="14" />
+              <span>粘贴剪贴板</span>
+            </button>
+            <button class="btn btn--solid" :disabled="busy || !canSubmit" @click="submit">
+              <span>登录</span>
+            </button>
+          </div>
+          <ol class="help-list">
+            <li v-for="(step, i) in helpSteps" :key="i">{{ step }}</li>
+          </ol>
         </details>
       </template>
 

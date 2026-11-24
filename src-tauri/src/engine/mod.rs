@@ -101,6 +101,20 @@ const TAIL_MIN_BYTES: u64 = 128 * 1024;
 /// it still has to fetch.
 static ACTIVE: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// The budget bucket a provider draws from.
+///
+/// Drives with a measured profile get their own bucket, because their ceilings
+/// differ (Quark 512, 天翼 128, the rest 64) and pooling two drives under one key
+/// would hand one of them a budget it cannot use while starving the other.
+fn bucket(provider: &str) -> &'static str {
+    match provider {
+        "quark" => "quark",
+        "aliyun" => "aliyun",
+        "cloud189" => "cloud189",
+        _ => "other",
+    }
+}
+
 /// Registers a file and returns its share of the drive's connection budget.
 ///
 /// The returned id must be handed to [`leave`] when the download ends, on every
@@ -112,21 +126,11 @@ fn enter(provider: &str, size: u64, profile: budget::Profile) -> (u64, usize) {
     };
     let id = active.iter().map(|(_, _, id)| *id).max().unwrap_or(0) + 1;
     // The id doubles as the ordering key, so keep it on the entry.
-    let key: &'static str = match provider {
-        "quark" => "quark",
-        "aliyun" => "aliyun",
-        _ => "other",
-    };
+    let key = bucket(provider);
     active.push((key, size, id));
     let sizes: Vec<u64> = active
         .iter()
-        .filter(|(key, _, _)| {
-            *key == match provider {
-                "quark" => "quark",
-                "aliyun" => "aliyun",
-                _ => "other",
-            }
-        })
+        .filter(|(entry_key, _, _)| *entry_key == key)
         .map(|(_, size, _)| *size)
         .collect();
     let index = sizes.len() - 1;
@@ -135,11 +139,7 @@ fn enter(provider: &str, size: u64, profile: budget::Profile) -> (u64, usize) {
 
 /// Removes a file from the registry.
 fn leave(provider: &str, id: u64) {
-    let key: &'static str = match provider {
-        "quark" => "quark",
-        "aliyun" => "aliyun",
-        _ => "other",
-    };
+    let key = bucket(provider);
     let mut active = match ACTIVE.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

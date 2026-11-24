@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { AnimatePresence, animate, motion } from "motion-v";
 
 import Sidebar from "@/components/Sidebar.vue";
 import TitleBar from "@/components/TitleBar.vue";
@@ -15,6 +16,8 @@ import ShareView from "@/views/ShareView.vue";
 import LoginView from "@/views/LoginView.vue";
 import { BRAND } from "@/lib/brand";
 import { IS_TAURI } from "@/lib/host";
+import { errText } from "@/lib/format";
+import { popHidden, popShown, reducedMotion, viewHidden, viewShown, viewTransition } from "@/lib/motion";
 import { app, bootstrap, toast } from "@/store/app";
 
 const booting = ref(true);
@@ -39,58 +42,56 @@ const currentView = computed(() => {
 const showSidebar = computed(() => !booting.value);
 const showChrome = IS_TAURI;
 
-/* The screen swap is driven by the Web Animations API instead of a CSS
-   transition, and that is not a style choice — it is the only form that stops
-   the packaged app from flashing.
+/* The screen swap is driven by motion-v, which runs animations through the Web
+   Animations API through the compositor.
 
-   With `.view-enter-active { transition: transform }` WebKitGTK 2.54 on
-   amdgpu/DMABUF occasionally paints one frame that is neither the outgoing nor
-   the incoming screen right after the transition ends (measured: 11 anomalous
-   frames over 10 runs of 8 view swaps; each one repaints 150k–250k px, i.e. the
-   whole content area). Every CSS-level workaround was measured and rejected:
-   resting identity transform, `translateZ(0)`, `will-change`, `contain: paint`,
-   `isolation`, animating the child instead, shorter durations, keyframes — all
-   still leave 7–22 anomalies, several are worse than the baseline. Moving the
-   identical animation to `element.animate()` leaves 0 anomalies over 18 runs.
+   History, because every one of these was measured and matters: a CSS
+   `transition: transform` on the view left WebKitGTK 2.54 (amdgpu/DMABUFF)
+   painting one frame that is neither the outgoing nor the incoming screen right
+   after the transition ends — 11 anomalous frames over 10 runs of 8 swaps, each
+   one repainting 150k–250k px (the whole content area). Every CSS-level
+   workaround was measured and rejected: resting identity transform,
+   `translateZ(0)`, `will-change`, `contain: paint`, `isolation`, animating the
+   child instead, shorter durations, keyframes — all still leave 7–22 anomalies,
+   several worse than the baseline. Driving the identical animation from JS
+   leaves 0 over 18 runs.
 
-   Keep the animation transform-only: `<KeepAlive>` replays the enter hook when
-   a cached screen is re-activated, so an opacity fade would run twice and read
-   as a blink. A 6px slide replayed at that point is invisible. */
-const reduceMotion =
-  typeof window !== "undefined" &&
-  window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+   So: **opacity only, no transform.** Sliding the view root up 6px still left
+   the content jumping a couple of pixels downwards and snapping back once the
+   animation ended: the view is `position: absolute; inset: 0` — the largest
+   surface in the app — and dropping the promoted layer at the end of the
+   animation leaves WebKitGTK's raster offset behind for a frame. A fade cannot
+   shift anything, so it cannot do that, and the movement a section change needs
+   comes from the rows staggering in underneath (`rowEnter` in the listings).
 
-function viewEnter(el: Element, done: () => void) {
-  if (reduceMotion) {
-    done();
-    return;
-  }
-  const anim = (el as HTMLElement).animate(
-    [{ transform: "translateY(6px)" }, { transform: "translateY(0)" }],
-    // `fill: "both"` is required, not cosmetic. Without it WebKitGTK drops the
-    // animation's compositing layer the moment it finishes and repaints the
-    // whole content area once from scratch — the flash this code exists to
-    // avoid. Measured over 10 runs of 8 swaps each: 19 anomalous frames without
-    // it, 0 with it. Filling forwards leaves the layer resting on the same
-    // identity transform the stylesheet already declares, so nothing else
-    // changes.
-    {
-      duration: 300,
-      easing: "cubic-bezier(0.22, 1, 0.36, 1)",
-      fill: "both",
-    },
-  );
-  // `finished` rejects if the element is torn down mid-flight; either way the
-  // transition has to be told it is over or the screen stays pinned.
-  anim.finished.then(done, done);
+   No leave animation on purpose: the outgoing screen is removed before the
+   incoming one fades in, because two mounted screens let WebKitGTK paint a
+   frame from the outgoing screen's stale tile. */
+const stageView = ref<{ $el?: unknown } | null>(null);
+
+async function playViewEnter() {
+  if (reducedMotion) return;
+  await nextTick();
+  const el = stageView.value?.$el as HTMLElement | undefined;
+  if (!el) return;
+  // Start from zero *before* the first paint of the incoming screen: a cached
+  // screen keeps `opacity: 1` inline from its previous run, so waiting for the
+  // animation's own first frame would show it for one frame and then blink it
+  // out again.
+  el.style.opacity = "0";
+  animate(el, { opacity: [viewHidden.opacity, viewShown.opacity] }, viewTransition);
 }
+
+// Fires on every swap, including a return to a `<KeepAlive>`-cached screen —
+// that replay is what makes switching sections feel continuous.
+watch(() => app.view, playViewEnter);
 
 onMounted(async () => {
   try {
     await bootstrap();
   } catch (err) {
     bootFailed.value = true;
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     // Let the splash breathe for a beat so the reveal animation reads.
     window.setTimeout(() => (booting.value = false), 180);
@@ -104,7 +105,7 @@ async function retryBoot() {
     await bootstrap();
   } catch (err) {
     bootFailed.value = true;
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     window.setTimeout(() => (booting.value = false), 180);
   }
@@ -119,16 +120,14 @@ async function retryBoot() {
       <Sidebar v-if="showSidebar" />
 
       <main class="stage">
-        <!-- `:css="false"` + `@enter`: no CSS classes are applied, the swap is
-             animated by `viewEnter` above. No leave hook on purpose — the
-             outgoing screen must be gone before the incoming one animates in,
-             otherwise both sit in the DOM and WebKitGTK paints from a stale
-             tile. See the note on `viewEnter`. -->
-        <Transition name="view" :css="false" @enter="viewEnter">
-          <KeepAlive>
-            <component :is="currentView" :key="app.view" class="view" />
-          </KeepAlive>
-        </Transition>
+        <!-- The swap is animated imperatively by `playViewEnter` above, not by
+             a <Transition>: there is deliberately no leave animation, so the
+             outgoing screen is gone before the incoming one animates in.
+             Two screens in the DOM at once let WebKitGTK paint a frame from the
+             outgoing screen's stale tile — the flash this code exists to avoid. -->
+        <KeepAlive>
+          <component :is="currentView" :key="app.view" ref="stageView" class="view" />
+        </KeepAlive>
       </main>
     </div>
 
@@ -137,23 +136,42 @@ async function retryBoot() {
     <Toasts />
 
     <!-- boot splash -->
-    <Transition name="fade">
-      <div v-if="booting" class="boot">
+    <AnimatePresence>
+      <motion.div
+        v-if="booting"
+        class="boot"
+        :initial="{ opacity: 0 }"
+        :animate="{ opacity: 1 }"
+        :exit="{ opacity: 0 }"
+        :transition="{ duration: 0.16 }"
+      >
         <div class="boot-inner">
-          <div class="boot-mark">
+          <motion.div
+            class="boot-mark"
+            :initial="{ opacity: 0, scale: 0.92 }"
+            :animate="{ opacity: 1, scale: 1 }"
+            :transition="{ type: 'spring', stiffness: 260, damping: 26, mass: 0.9 }"
+          >
             <!-- The squircle icon carries its own dark plate, so it reads on
                  both themes without a variant. -->
             <img src="/logo.png" alt="" draggable="false" />
-          </div>
+          </motion.div>
           <span class="boot-name">{{ BRAND.name }}</span>
           <span class="boot-bar"><i /></span>
         </div>
-      </div>
-    </Transition>
+      </motion.div>
+    </AnimatePresence>
 
     <!-- fatal boot error -->
-    <Transition name="fade">
-      <div v-if="!booting && bootFailed" class="boot boot--error">
+    <AnimatePresence>
+      <motion.div
+        v-if="!booting && bootFailed"
+        class="boot boot--error"
+        :initial="popHidden"
+        :animate="popShown"
+        :transition="{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }"
+        :exit="{ opacity: 0, transition: { duration: 0.12 } }"
+      >
         <div class="boot-inner">
           <div class="boot-mark boot-mark--error">
             <Icon name="alert" :size="20" />
@@ -165,8 +183,8 @@ async function retryBoot() {
             <span>重试</span>
           </button>
         </div>
-      </div>
-    </Transition>
+      </motion.div>
+    </AnimatePresence>
   </div>
 </template>
 
@@ -219,7 +237,6 @@ async function retryBoot() {
   width: 56px;
   height: 56px;
   transform: scale(1);
-  animation: mark-in var(--dur-4) var(--ease-out) both;
 }
 .boot-mark img {
   width: 100%;
@@ -234,13 +251,11 @@ async function retryBoot() {
 .boot-mark--error :deep(.icon) {
   animation: none;
 }
-/* Boot mark: opacity only. A `scale()`/`rotate()` here ends on `transform: none`,
-   which tears the layer down and repaints — the same flicker class as the rest
-   of the UI (docs/tauri-webkitgtk-flicker.md). */
-@keyframes mark-in {
-  from {
-    opacity: 0;
-  }
+/* The boot mark is a `motion.div` now (spring scale-in). Keep the resting
+   transform at `scale(1)` rather than `none` so the layer is not torn down and
+   repainted when the animation ends — same reason as `.stage > .view`. */
+.boot-mark {
+  transform: scale(1);
 }
 .boot-name {
   font-size: 13px;

@@ -11,6 +11,8 @@ import {
 } from "vue";
 import { onFileDrop, pickFiles } from "@/lib/host";
 
+import { AnimatePresence, motion } from "motion-v";
+import { rowEnter } from "@/lib/motion";
 import Icon from "@/components/Icon.vue";
 import FileIcon from "@/components/FileIcon.vue";
 import FileThumb from "@/components/FileThumb.vue";
@@ -24,7 +26,7 @@ import { api } from "@/lib/backend";
 import { copyText } from "@/lib/clipboard";
 import { storageKey } from "@/lib/brand";
 import type { DirListing, EntryDto, PathNode, SearchHit, ShareCreated } from "@/lib/types";
-import { formatDate, formatFullDate, formatSize, fileKind, kindLabel } from "@/lib/format";
+import { errText, formatDate, formatFullDate, formatSize, fileKind, kindLabel } from "@/lib/format";
 import {
   app,
   activeProviderState,
@@ -150,6 +152,21 @@ async function pickDrive(provider: ProviderId) {
 /** The drive the on-screen listing belongs to; `null` before the first load. */
 let loadedProvider: string | null = null;
 
+/**
+ * Guards against out-of-order responses.
+ *
+ * At startup this view mounts before `bootstrap()` has restored the remembered
+ * drive, so it fires a request for the default (`quark:0`) and then one for the
+ * restored drive. Whichever answered last won — usually the default, which is
+ * why a 天翼云盘 session opened on 夸克's files until the user toggled drives.
+ * Only the newest call may touch `listing`.
+ */
+let loadSeq = 0;
+
+/** The request currently on the wire, so a switch that trips two watchers at
+ *  once only fetches once. See the note at the top of `load`. */
+let pending: { key: string; seq: number } | null = null;
+
 async function load(fid: string, crumbs2?: PathNode[]) {
   loadedProvider = app.activeProvider;
   // An unlogged drive cannot be listed: asking anyway produces a "登录已过期"
@@ -174,10 +191,26 @@ async function load(fid: string, crumbs2?: PathNode[]) {
   // rename and delete never flash the loading spinner over existing content.
   const sameDir = listing.value?.pdirFid === fid;
   if (!sameDir) listing.value = null;
+  // Switching drives trips two watchers at once — `filesToken` (bumped by
+  // `setActiveProvider`) and `activeProvider` itself — and both used to issue a
+  // request. The sequence guard threw the first answer away, but the two calls
+  // also cleared `listing` twice, so the rows unmounted, remounted and
+  // staggered in again: exactly what reads as "loaded twice". A request already
+  // in flight for this exact target is the answer we would get anyway, so let
+  // it finish and drop the duplicate.
+  const key = `${app.activeProvider}|${fid}`;
+  if (pending?.key === key) return;
+  // Bump the sequence *after* the dedupe check: incrementing first would make
+  // the request already in flight look stale, so its answer would be dropped
+  // and its `finally` would refuse to clear `loading` — an endless spinner.
+  const seq = ++loadSeq;
+  pending = { key, seq };
   loading.value = true;
   error.value = null;
   try {
     const data = await api.listDir(fid);
+    // A newer load (drive switch, navigation) owns the view now; drop this one.
+    if (seq !== loadSeq) return;
     listing.value = data;
     selected.value = new Set();
     anchor.value = null;
@@ -188,10 +221,12 @@ async function load(fid: string, crumbs2?: PathNode[]) {
       persistDir(fid);
     }
   } catch (err) {
-    error.value = String(err);
+    if (seq !== loadSeq) return;
+    error.value = errText(err);
     listing.value = null;
   } finally {
-    loading.value = false;
+    if (seq === loadSeq) loading.value = false;
+    if (pending?.seq === seq) pending = null;
   }
 }
 
@@ -254,7 +289,7 @@ async function runSearch() {
   try {
     hits.value = await api.search(currentFid.value, keyword, 120);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
     hits.value = [];
   } finally {
     searching.value = false;
@@ -583,7 +618,7 @@ async function loadRelocate(fid: string, path: PathNode[]) {
     // Only folders can be a destination.
     state.dirs = data.entries.filter((entry) => entry.isDir);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     state.loading = false;
   }
@@ -639,7 +674,7 @@ async function confirmRelocate() {
     relocate.value = null;
     await load(currentFid.value);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     state.busy = false;
   }
@@ -662,7 +697,7 @@ async function submitPrompt() {
     prompt.value = null;
     await load(currentFid.value);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     busy.value = false;
   }
@@ -687,7 +722,7 @@ async function doDelete(entries: EntryDto[]) {
     // Deleted bytes free capacity; refetch instead of leaving a stale bar.
     void loadQuota(app.activeProvider, true);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     busy.value = false;
   }
@@ -724,7 +759,7 @@ async function confirmDownload() {
     downloadPrompt.value = null;
     app.view = "transfers";
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     downloading.value = false;
   }
@@ -769,17 +804,30 @@ const shareNeedsCode = computed(() => app.activeProvider === "baidu");
 /** 139 accepts the field but mints its own code; the value typed here is not used. */
 const shareCodeAuto = computed(() => app.activeProvider === "yun139");
 
+/** 天翼云盘 ignores the field too, and always hands out a 4-character code. */
+const shareCodeForced = computed(
+  () => app.activeProvider === "cloud189" || app.activeProvider === "pan115",
+);
+
+/** 天翼云盘 has no working multi-file endpoint, so it shares one entry at a time. */
+const shareSingleOnly = computed(() => app.activeProvider === "cloud189");
+
 const shareCodeHint = computed(() => {
   if (shareNeedsCode.value) return `${driveName.value}必须设置 4 位提取码`;
   if (shareCodeAuto.value) return "填 4 位则由 139 生成提取码（不能自定义），留空则无提取码";
+  if (shareCodeForced.value) return `${driveName.value}总是自己生成 4 位访问码，这里填什么都不会生效`;
   return "留空则生成不需要提取码的链接";
 });
 
 const shareDays = computed(() => Number(shareDialog.value?.days ?? 7));
 
 function openShare() {
-  const entries = selectedEntries.value;
+  let entries = selectedEntries.value;
   if (entries.length === 0) return;
+  if (shareSingleOnly.value && entries.length > 1) {
+    toast(`${driveName.value}一次只能分享一个文件或文件夹，已选中第一项`, "info");
+    entries = entries.slice(0, 1);
+  }
   shareDialog.value = {
     entries,
     title:
@@ -796,7 +844,8 @@ function openShare() {
 async function submitShare() {
   const dialog = shareDialog.value;
   if (!dialog || dialog.busy) return;
-  const code = dialog.passcode.trim();
+  // 天翼云盘 mints its own 4-character code and ignores anything sent here.
+  const code = shareCodeForced.value ? "" : dialog.passcode.trim();
   if (code && code.length !== 4) {
     toast("提取码需要 4 位，留空则由网盘决定", "error");
     return;
@@ -812,7 +861,7 @@ async function submitShare() {
     );
     toast("已创建分享链接", "success");
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     dialog.busy = false;
   }
@@ -845,7 +894,7 @@ async function revokeShare() {
     toast("已取消分享", "success");
     shareDialog.value = null;
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     if (shareDialog.value) shareDialog.value.busy = false;
   }
@@ -874,7 +923,7 @@ async function upload(paths: string[]) {
     await load(currentFid.value);
     void loadQuota(app.activeProvider, true);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   } finally {
     uploading.value = false;
   }
@@ -920,6 +969,14 @@ onMounted(async () => {
 // parked, and a stale (or empty) listing was the m03508 complaint.
 let seenToken = app.filesToken;
 let activated = false;
+/**
+ * Set when the drive changes while this view is parked.
+ *
+ * The listing is cleared in that case, so `loadedProvider` alone cannot tell
+ * "nothing loaded yet" from "loaded for a drive that is no longer active" —
+ * and the screen came back showing the previous drive's rows.
+ */
+let driveChangedWhileParked = false;
 
 function syncIfStale() {
   // Switching to a drive (or finishing its login) does not always bump the
@@ -927,9 +984,11 @@ function syncIfStale() {
   // already selected — so compare the listing's own drive too. Without this the
   // screen kept showing the previous drive's rows, which read as "logged into
   // 123 云盘 but the file list is empty".
-  const staleDrive = loadedProvider !== null && loadedProvider !== app.activeProvider;
+  const staleDrive =
+    driveChangedWhileParked || (loadedProvider !== null && loadedProvider !== app.activeProvider);
   if (seenToken === app.filesToken && !staleDrive) return;
   seenToken = app.filesToken;
+  driveChangedWhileParked = false;
   if (staleDrive) {
     crumbs.value = [rootNode()];
     query.value = "";
@@ -957,6 +1016,7 @@ watch(
     // While parked, `syncIfStale` handles it on the next activation.
     if (!activated) {
       loadedProvider = null;
+      driveChangedWhileParked = true;
       return;
     }
     // Reset the view state: crumbs, selection, and the search field belong to
@@ -1215,16 +1275,12 @@ defineExpose({ refresh });
           />
         </div>
 
-        <TransitionGroup
-          v-else-if="viewMode === 'grid'"
-          name="row"
-          tag="div"
-          class="grid"
-        >
-          <div
-            v-for="row in visibleRows"
+        <div v-else-if="viewMode === 'grid'" class="grid">
+          <motion.div
+            v-for="(row, i) in visibleRows"
             :key="row.entry.fid"
             class="card"
+            v-bind="rowEnter(i)"
             :class="{ 'card--selected': isSelected(row.entry.fid) }"
             @click="onRowClick($event, row.entry)"
             @dblclick="row.entry.isDir ? enter(row.entry) : downloadOne(row.entry)"
@@ -1246,14 +1302,15 @@ defineExpose({ refresh });
             <button class="card-more mini-btn" title="更多" @click.stop="openMenu($event, row.entry)">
               <Icon name="more" :size="14" />
             </button>
-          </div>
-        </TransitionGroup>
+          </motion.div>
+        </div>
 
-        <TransitionGroup v-else name="row" tag="div" class="rows">
-          <div
-            v-for="row in visibleRows"
+        <div v-else class="rows">
+          <motion.div
+            v-for="(row, i) in visibleRows"
             :key="row.entry.fid"
             class="row"
+            v-bind="rowEnter(i)"
             :class="{
               [density]: true,
               'row--selected': isSelected(row.entry.fid),
@@ -1298,8 +1355,8 @@ defineExpose({ refresh });
             <div class="cell cell--date" :title="formatFullDate(row.entry.updatedAt)">
               {{ formatDate(row.entry.updatedAt) }}
             </div>
-          </div>
-        </TransitionGroup>
+          </motion.div>
+        </div>
       </div>
 
       <footer class="list-foot">
@@ -1313,14 +1370,21 @@ defineExpose({ refresh });
         </span>
       </footer>
 
-      <Transition name="fade">
-        <div v-if="dragOver" class="drop-hint">
+      <AnimatePresence>
+        <motion.div
+          v-if="dragOver"
+          class="drop-hint"
+          :initial="{ opacity: 0 }"
+          :animate="{ opacity: 1 }"
+          :exit="{ opacity: 0 }"
+          :transition="{ duration: 0.12 }"
+        >
           <div class="drop-card">
             <Icon name="upload" :size="22" />
             <span>松开以上传文件</span>
           </div>
-        </div>
-      </Transition>
+        </motion.div>
+      </AnimatePresence>
     </div>
 
     <ContextMenu
@@ -1498,7 +1562,14 @@ defineExpose({ refresh });
               v-model="shareDialog.passcode"
               class="input mono"
               maxlength="4"
-              :placeholder="shareNeedsCode ? '必填，4 位' : '留空则不需要提取码'"
+              :placeholder="
+                shareNeedsCode
+                  ? '必填，4 位'
+                  : shareCodeForced
+                    ? '由网盘自动生成'
+                    : '留空则不需要提取码'
+              "
+              :disabled="shareCodeForced"
             />
             <span class="field-hint">{{ shareCodeHint }}</span>
           </label>
@@ -2254,22 +2325,14 @@ defineExpose({ refresh });
 }
 
 /* ------------------------------ row motion ------------------------------ */
-.row-move {
-  transition: transform var(--dur-3) var(--ease-out);
-}
-.row-enter-active {
-  transition: opacity var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
-}
-.row-leave-active {
-  transition: opacity var(--dur-1) var(--ease-out);
-  position: absolute;
-  width: calc(100% - 10px);
-}
-.row-enter-from {
-  opacity: 0;
-  transform: translateY(-4px);
-}
-.row-leave-to {
-  opacity: 0;
+/* Rows are `motion.div`s now — the enter animation and the layout move are both
+   driven by motion-v (see `rowHidden`/`rowShown` in src/lib/motion.ts). No CSS
+   transition classes are needed, and no leave animation: a row that is removed
+   should be gone immediately, because keeping it around while it fades means the
+   list is briefly taller than it should be. */
+:where(.row, .card) {
+  /* Rest on an identity transform, not `none`: WebKitGTK tears the compositing
+     layer down when the animated transform disappears. */
+  transform: translateY(0);
 }
 </style>

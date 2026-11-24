@@ -24,12 +24,16 @@ pub const LOGIN_LABEL: &str = "quark-login";
 pub const LOGIN_LABEL_139: &str = "yun139-login";
 /// 百度网盘 login window.
 pub const LOGIN_LABEL_BAIDU: &str = "baidu-login";
+/// Separate window label for the 115 web login.
+pub const LOGIN_LABEL_115: &str = "pan115-login";
 /// Emitted with a [`LoginEvent`] payload once the flow ends, either way.
 pub const EVENT_LOGIN: &str = "auth://web-login";
 /// Same shape as [`EVENT_LOGIN`], but for the 139 window.
 pub const EVENT_LOGIN_139: &str = "auth://yun139-web-login";
 /// Same shape as [`EVENT_LOGIN`], but for the 百度网盘 window.
 pub const EVENT_LOGIN_BAIDU: &str = "auth://baidu-web-login";
+/// Same shape as [`EVENT_LOGIN`], but for the 115 window.
+pub const EVENT_LOGIN_115: &str = "auth://pan115-web-login";
 
 /// The drive web app itself: it renders the login sheet when signed out and
 /// lands on "all files" once signed in, so the user only ever sees one screen.
@@ -44,6 +48,7 @@ const START_URL_139: &str = "https://yun.139.com/w/";
 /// 百度网盘 web drive. Its session lives in the `BDUSS` / `STOKEN` cookies on
 /// `pan.baidu.com`, which is what the harvest lifts out.
 const START_URL_BAIDU: &str = "https://pan.baidu.com/disk/main";
+const START_URL_115: &str = "https://115.com/";
 
 /// WebKitGTK's default UA is easily mistaken for an unsupported browser, which
 /// makes Quark serve a stripped-down page. Present as desktop Chrome instead.
@@ -188,6 +193,53 @@ fn cookie_header_baidu(cookies: &[Cookie<'static>]) -> String {
         "baidu login: harvested {count} cookie(s), {} bytes",
         header.len()
     );
+    header
+}
+
+
+/// 115 only ever needs these four cookies, and it wants them verbatim.
+fn cookie_header_115(cookies: &[Cookie<'static>]) -> String {
+    let mut uid = String::new();
+    let mut cid = String::new();
+    let mut seid = String::new();
+    let mut kid = String::new();
+    for cookie in cookies {
+        let domain = cookie.domain().unwrap_or_default();
+        if !domain.is_empty() && !domain.ends_with("115.com") {
+            continue;
+        }
+        let value = cookie.value().to_string();
+        if value.trim().is_empty() {
+            continue;
+        }
+        match cookie.name() {
+            // `.115.com` beats the host-only copy that `115.com` sets first.
+            "UID" if uid.is_empty() || domain.starts_with('.') => uid = value,
+            "CID" if cid.is_empty() || domain.starts_with('.') => cid = value,
+            "SEID" if seid.is_empty() || domain.starts_with('.') => seid = value,
+            "KID" if kid.is_empty() || domain.starts_with('.') => kid = value,
+            _ => {}
+        }
+    }
+    // `UID` appears the moment the QR lands, but `SEID` (the actual session)
+    // arrives a beat later; harvesting in between yields a cookie the drive
+    // rejects with "请先登录".
+    if uid.is_empty() || seid.is_empty() {
+        crate::ylog!(
+            "pan115 login: waiting (uid={} seid={} cid={} kid={})",
+            !uid.is_empty(),
+            !seid.is_empty(),
+            !cid.is_empty(),
+            !kid.is_empty()
+        );
+        return String::new();
+    }
+    let mut pairs = vec![format!("UID={uid}"), format!("CID={cid}"), format!("SEID={seid}")];
+    if !kid.is_empty() {
+        pairs.push(format!("KID={kid}"));
+    }
+    let header = pairs.join("; ");
+    crate::ylog!("pan115 login: harvested cookie, {} bytes", header.len());
     header
 }
 
@@ -646,3 +698,38 @@ mod tests {
     }
 }
 
+/// Opens the 115 web login window and watches it until `SEID` shows up.
+#[tauri::command]
+pub async fn open_web_login_115(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> AppResult<()> {
+    spawn_login_watch(
+        app.clone(),
+        Arc::clone(&state),
+        LOGIN_LABEL_115,
+        "登录 115 网盘账号",
+        Url::parse(START_URL_115)
+            .map_err(|err| AppError::new(format!("地址解析失败：{err}")))?,
+        login_size().0,
+        login_size().1,
+        |cookies| Some(cookie_header_115(cookies)).filter(|v| !v.is_empty()),
+        |state, cookie| {
+            Box::pin(async move {
+                let dir = state.paths.config_dir.clone();
+                let drive = crate::providers::Pan115Provider::save_cookie(&dir, &cookie)?;
+                if let Err(err) = drive.list("0").await {
+                    let _ = drive.logout().await;
+                    state.invalidate_providers().await;
+                    return Err(AppError::new(format!(
+                        "已取得登录凭据，但 115 网盘拒绝了它：{err}"
+                    )));
+                }
+                state.invalidate_providers().await;
+                Ok(())
+            })
+        },
+        EVENT_LOGIN_115,
+    )
+    .await
+}

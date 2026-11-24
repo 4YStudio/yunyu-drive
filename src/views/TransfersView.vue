@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, ref } from "vue";
 
+import { motion } from "motion-v";
+import { barTransition, rowEnter } from "@/lib/motion";
 import Icon from "@/components/Icon.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import Segmented from "@/components/Segmented.vue";
 import { api } from "@/lib/backend";
 import { openFile, revealPath } from "@/lib/host";
 import { PROVIDERS, type TransferTask } from "@/lib/types";
-import { formatSize, formatSpeed, formatEta } from "@/lib/format";
+import { errText, formatSize, formatSpeed, formatEta } from "@/lib/format";
 import { app, refreshTransfers, toast } from "@/store/app";
 
 /**
@@ -129,7 +131,7 @@ async function pause(task: TransferTask) {
   try {
     await api.transferPause(task.id);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   }
 }
 
@@ -137,7 +139,7 @@ async function cancel(task: TransferTask) {
   try {
     await api.transferCancel(task.id);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   }
 }
 
@@ -145,7 +147,7 @@ async function remove(task: TransferTask) {
   try {
     await api.transferRemove(task.id);
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   }
 }
 
@@ -154,7 +156,7 @@ async function retry(task: TransferTask) {
     await api.transferRetry(task.id);
     toast("已重新开始，接着上次的进度继续", "success");
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   }
 }
 
@@ -163,7 +165,7 @@ async function clearFinished() {
     await api.transferClear();
     toast("已清除完成的传输", "success");
   } catch (err) {
-    toast(String(err), "error");
+    toast(errText(err), "error");
   }
 }
 
@@ -235,8 +237,14 @@ onActivated(() => {
         />
       </div>
 
-      <TransitionGroup v-else name="task" tag="div" class="tasks">
-        <article v-for="task in visible" :key="task.id" class="task" :class="`task--${task.status}`">
+      <div v-else class="tasks">
+        <motion.article
+          v-for="(task, i) in visible"
+          :key="task.id"
+          class="task"
+          :class="`task--${task.status}`"
+          v-bind="rowEnter(i)"
+        >
           <div class="task-glyph">
             <Icon
               :name="isCross(task) ? 'arrow-up-down' : task.kind === 'download' ? 'download' : 'upload'"
@@ -261,10 +269,11 @@ onActivated(() => {
             </div>
 
             <div class="task-bar">
-              <div
+              <motion.div
                 class="task-bar-fill"
                 :class="{ 'task-bar-fill--prep': task.status === 'hashing' }"
-                :style="{ width: `${percent(task)}%` }"
+                :animate="{ width: `${percent(task)}%` }"
+                :transition="barTransition"
               />
             </div>
 
@@ -340,8 +349,8 @@ onActivated(() => {
               <Icon name="trash" :size="14" />
             </button>
           </div>
-        </article>
-      </TransitionGroup>
+        </motion.article>
+      </div>
     </div>
   </section>
 </template>
@@ -466,7 +475,7 @@ onActivated(() => {
   height: 100%;
   border-radius: inherit;
   background: var(--fill);
-  transition: width var(--dur-3) var(--ease-out);
+  /* Width is animated by motion-v (`barTransition`). */
 }
 /* Reading the file (hashing) is a separate stage: the bar refills from 0 once
    bytes really go up, so the dimmer fill makes that restart read as a new phase
@@ -519,22 +528,8 @@ onActivated(() => {
   color: var(--text-2);
 }
 
-.task-move,
-.task-enter-active,
-.task-leave-active {
-  transition: opacity var(--dur-2) var(--ease-out),
-    transform var(--dur-2) var(--ease-out);
-}
-.task-enter-from {
-  opacity: 0;
-  transform: translateY(-6px);
-}
-.task-leave-to {
-  opacity: 0;
-  transform: translateY(-6px);
-}
-.task-leave-active {
-  position: absolute;
-  width: 100%;
+:where(.task) {
+  /* `motion.article` — see src/lib/motion.ts. */
+  transform: translateY(0);
 }
 </style>

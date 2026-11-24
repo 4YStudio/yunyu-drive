@@ -320,7 +320,7 @@ function mockStates(): ProviderAuthState[] {
     },
     // The other drives exist but are not logged in yet, so the switcher shows a
     // login hint for them — same as a real build without their credentials.
-    ...(["yun139", "aliyun", "pan123", "baidu"] as ProviderId[]).map((provider) => ({
+    ...(["yun139", "aliyun", "pan123", "baidu", "cloud189"] as ProviderId[]).map((provider) => ({
       provider,
       authenticated: loggedIn.has(provider),
       source: "file" as const,
@@ -428,6 +428,9 @@ export const mockApi = {
 
   aliyunQrStart: async () => ({ content: "mock-qr-content", t: 1, ck: "mock-ck" }),
   aliyunQrPoll: async () => ({ state: "new", authenticated: false, message: null }),
+
+  cloud189QrStart: async () => ({ content: "mock-qr-content", t: 1, ck: "mock-ck" }),
+  cloud189QrPoll: async () => ({ state: "new", authenticated: false, message: null }),
 
   providerLogin: async (
     provider: string,

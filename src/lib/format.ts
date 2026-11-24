@@ -107,3 +107,38 @@ export function kindLabel(kind: FileKind): string {
   };
   return map[kind];
 }
+
+/**
+ * Turns anything a rejected IPC call can hand back into one readable line.
+ *
+ * Tauri rejects with the serialised `AppError`, i.e. a plain string, but a
+ * transport failure arrives as `Error("...")` or even as a bare object, and a
+ * raw `reqwest` error would surface as English ("error sending request for
+ * url (...)") which reads as nonsense in the UI. Everything that is not a
+ * clean Chinese message gets a short Chinese prefix instead of leaking that.
+ */
+export function errText(err: unknown): string {
+  const raw =
+    typeof err === "string"
+      ? err
+      : err instanceof Error
+        ? err.message
+        : typeof err === "object" && err !== null && "message" in err
+          ? String((err as { message: unknown }).message)
+          : String(err ?? "");
+  const text = shorten(raw.trim().replace(/^(Error:\s*)+/i, ""), 120);
+  if (!text) return "操作失败，请稍后重试";
+  // A backend message we wrote ourselves is always Chinese; anything with an
+  // ASCII letter in the first few words came from a library, not from us.
+  if (/^[\x00-\x7f]*$/.test(text.slice(0, 24))) {
+    if (/timeout|timed out/i.test(text)) return `网络超时，请检查网络后重试（${text}）`;
+    if (/connect|dns|network|request/i.test(text)) return `网络请求失败，请检查网络后重试（${text}）`;
+    return `操作失败（${text}）`;
+  }
+  return text;
+}
+
+/** Clips a long raw message so a toast stays one readable line. */
+function shorten(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}

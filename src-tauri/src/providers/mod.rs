@@ -32,6 +32,8 @@ use crate::error::{AppError, AppResult};
 
 pub use aliyun::AliyunProvider;
 pub use baidu::BaiduProvider;
+pub use cloud189::Cloud189Provider;
+pub use pan115::Pan115Provider;
 pub use pan123::Pan123Provider;
 pub use quark::QuarkProvider;
 pub use yun139::Yun139Provider;
@@ -39,7 +41,12 @@ pub use yun139::Yun139Provider;
 pub mod aliyun;
 pub mod aliyun_qr;
 pub mod baidu;
+pub mod cloud189;
+pub mod cloud189_qr;
 pub mod dto;
+pub mod pan115;
+pub mod pan115_crypto;
+pub mod pan115_ec;
 pub mod pan123;
 pub mod quark;
 pub mod yun139;
@@ -58,10 +65,14 @@ pub enum ProviderId {
     Yun139,
     /// 阿里云盘
     Aliyun,
+    /// 115 网盘
+    Pan115,
     /// 123 云盘
     Pan123,
     /// 百度网盘
     Baidu,
+    /// 天翼云盘 (189)
+    Cloud189,
 }
 
 impl ProviderId {
@@ -71,8 +82,10 @@ impl ProviderId {
             ProviderId::Quark => "quark",
             ProviderId::Yun139 => "yun139",
             ProviderId::Aliyun => "aliyun",
+            ProviderId::Pan115 => "pan115",
             ProviderId::Pan123 => "pan123",
             ProviderId::Baidu => "baidu",
+            ProviderId::Cloud189 => "cloud189",
         }
     }
 
@@ -82,8 +95,10 @@ impl ProviderId {
             ProviderId::Quark => "夸克网盘",
             ProviderId::Yun139 => "中国移动云盘",
             ProviderId::Aliyun => "阿里云盘",
+            ProviderId::Pan115 => "115 网盘",
             ProviderId::Pan123 => "123 云盘",
             ProviderId::Baidu => "百度网盘",
+            ProviderId::Cloud189 => "天翼云盘",
         }
     }
 
@@ -92,20 +107,24 @@ impl ProviderId {
             "quark" => Some(ProviderId::Quark),
             "yun139" | "139" | "cloud139" => Some(ProviderId::Yun139),
             "aliyun" | "aliyundrive" | "alipan" => Some(ProviderId::Aliyun),
+            "pan115" | "115" | "115pan" => Some(ProviderId::Pan115),
             "pan123" | "123pan" | "123" => Some(ProviderId::Pan123),
             "baidu" | "baidupan" | "pan_baidu" | "bdpan" => Some(ProviderId::Baidu),
+            "cloud189" | "189" | "tianyi" | "ctyun" => Some(ProviderId::Cloud189),
             _ => None,
         }
     }
 
     /// Every drive, in the order the UI lists them.
-    pub fn all() -> [ProviderId; 5] {
+    pub fn all() -> [ProviderId; 7] {
         [
             ProviderId::Quark,
             ProviderId::Yun139,
             ProviderId::Aliyun,
             ProviderId::Pan123,
             ProviderId::Baidu,
+            ProviderId::Cloud189,
+            ProviderId::Pan115,
         ]
     }
 }

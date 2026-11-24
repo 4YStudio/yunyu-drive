@@ -247,11 +247,154 @@ pub async fn provider_login(
             }
             Ok(auth)
         }
+        ProviderId::Pan115 => {
+            let dir = state.paths.config_dir.clone();
+            let drive = crate::providers::Pan115Provider::save_cookie(&dir, &credential)?;
+            state.invalidate_providers().await;
+            let mut auth = drive.auth_state().await;
+            if drive.list("0").await.is_err() {
+                auth.authenticated = false;
+            }
+            Ok(auth)
+        }
+        ProviderId::Cloud189 => {
+            // The QR flow writes the file itself; here we accept a pasted
+            // `session_key\u{1f}session_secret` pair (what the web client
+            // keeps) so the drive is usable without the webview.
+            let (key, secret) = credential
+                .trim()
+                .split_once('\u{1f}')
+                .ok_or_else(|| {
+                    AppError::new("天翼云盘需要 sessionKey 与 sessionSecret（用扫码登录更简单）")
+                })?;
+            let creds = crate::providers::cloud189::Cloud189Credentials {
+                session_key: key.trim().to_string(),
+                session_secret: secret.trim().to_string(),
+                ..Default::default()
+            };
+            let drive = crate::providers::Cloud189Provider::save_session(
+                &state.paths.config_dir,
+                creds,
+            )?;
+            state.invalidate_providers().await;
+            let mut auth = drive.auth_state().await;
+            // Prove the session signs correctly before claiming success.
+            match drive.list("0").await {
+                Ok(listing) => crate::ylog!(
+                    "login: cloud189 root listing ok, {} entries",
+                    listing.entries.len()
+                ),
+                Err(err) => {
+                    crate::ylog!("login: cloud189 root listing failed: {err}");
+                    auth.authenticated = false;
+                }
+            }
+            Ok(auth)
+        }
         _ => Err(AppError::new(format!(
             "{} 还没有实现登录",
             id.display_name()
         ))),
     }
+}
+
+/// Starts a 天翼云盘 QR login and returns the code to render.
+#[tauri::command]
+pub async fn cloud189_qr_start(
+    state: State<'_, Arc<AppState>>,
+) -> AppResult<crate::providers::cloud189_qr::QrCode> {
+    let session = Arc::new(crate::providers::cloud189_qr::Cloud189QrSession::new()?);
+    let qr = session.generate().await?;
+    *state.cloud189_qr.write().await = Some(Arc::clone(&session));
+    Ok(qr)
+}
+
+/// Polls the 天翼云盘 QR login.
+#[tauri::command]
+pub async fn cloud189_qr_poll(
+    state: State<'_, Arc<AppState>>,
+) -> AppResult<crate::providers::cloud189_qr::QrPollResult> {
+    let session = state
+        .cloud189_qr
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| AppError::new("没有进行中的扫码，请重新获取二维码"))?;
+
+    // A confirmed scan spends the code, so finish the exchange instead of
+    // polling again — and keep the payload so a failure is retryable.
+    if let Some(redirect) = session.confirmed_payload().await {
+        return finish_cloud189_login(&state, &session, &redirect).await;
+    }
+
+    let qr = crate::providers::cloud189_qr::QrCode::from_parts(
+        String::new(),
+        chrono::Utc::now().timestamp_millis(),
+        String::new(),
+    );
+    let (scan, redirect) = session.poll(&qr).await?;
+    let mut result = crate::providers::cloud189_qr::QrPollResult::from_state(&scan);
+    match scan {
+        crate::providers::cloud189_qr::ScanState::Confirmed => {
+            let redirect = redirect
+                .ok_or_else(|| AppError::new("扫码已确认但没有返回跳转地址"))?;
+            session.remember_confirmed(&redirect).await;
+            finish_cloud189_login(&state, &session, &redirect).await
+        }
+        crate::providers::cloud189_qr::ScanState::Expired
+        | crate::providers::cloud189_qr::ScanState::Failed(_) => {
+            *state.cloud189_qr.write().await = None;
+            result.authenticated = false;
+            Ok(result)
+        }
+        _ => Ok(result),
+    }
+}
+
+/// Exchanges a confirmed `redirectUrl` for the signed session and primes it.
+async fn finish_cloud189_login(
+    state: &State<'_, Arc<AppState>>,
+    session: &crate::providers::cloud189_qr::Cloud189QrSession,
+    redirect: &str,
+) -> AppResult<crate::providers::cloud189_qr::QrPollResult> {
+    let creds = match session.exchange(redirect).await {
+        Ok(creds) => creds,
+        Err(err) => {
+            // The code is spent; report the real reason and keep the payload so
+            // the next poll retries instead of showing "已过期".
+            crate::ylog!("cloud189 qr: exchange failed: {err}");
+            let mut result = crate::providers::cloud189_qr::QrPollResult::from_state(
+                &crate::providers::cloud189_qr::ScanState::Confirmed,
+            );
+            result.message = Some(format!("换取登录凭据失败：{err}"));
+            return Ok(result);
+        }
+    };
+    let drive = crate::providers::Cloud189Provider::save_session(&state.paths.config_dir, creds)?;
+    state.invalidate_providers().await;
+    *state.cloud189_qr.write().await = None;
+
+    let mut result = crate::providers::cloud189_qr::QrPollResult::from_state(
+        &crate::providers::cloud189_qr::ScanState::Confirmed,
+    );
+    // Listing the root proves the signature works while the user is still
+    // looking at the QR code, so a failure surfaces here instead of later.
+    match drive.list("0").await {
+        Ok(listing) => {
+            crate::ylog!(
+                "cloud189 qr: login ok, {} entries at root",
+                listing.entries.len()
+            );
+            result.authenticated = true;
+            result.message = Some("登录成功".to_string());
+        }
+        Err(err) => {
+            crate::ylog!("cloud189 qr: prime failed: {err}");
+            result.authenticated = false;
+            result.message = Some(format!("登录失败：{err}"));
+        }
+    }
+    Ok(result)
 }
 
 /// Starts a 阿里云盘 QR login and returns the code to render.
@@ -1096,6 +1239,24 @@ pub async fn inline_image(url: String) -> AppResult<Option<String>> {
     }
     let client = crate::share::http()?;
     Ok(crate::share::fetch_image(&client, &url, None).await)
+}
+
+/// Frame-accurate UI probe, debug builds only.
+///
+/// The drive-switcher popup and the view swap are driven through the Web
+/// Animations API because WebKitGTK steps a CSS `transition` badly, but there is
+/// no way to see what the compositor actually painted from inside the webview.
+/// This command lets `src/lib/probe.ts` hand each animation sample (opacity,
+/// transform, layer state, time since the first sample) to the native side,
+/// which writes it to `app.log` — one line per sample, so a flash or a stall
+/// shows up as a gap in the timestamps instead of a mystery.
+///
+/// Compiled out of release builds on purpose: it must never ship.
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub async fn debug_probe(tag: String, sample: String) -> AppResult<()> {
+    crate::ylog!("probe {tag} {sample}");
+    Ok(())
 }
 
 /// Lists a drive's recycle bin.

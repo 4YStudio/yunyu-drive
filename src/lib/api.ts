@@ -41,6 +41,14 @@ export const api = {
       "aliyun_qr_poll_with",
       { t: qr.t, ck: qr.ck, content: qr.content },
     ),
+  /** Starts a 天翼云盘 QR login; the code is the `uuid` the app scans. */
+  cloud189QrStart: () =>
+    invoke<{ content: string; t: number; ck: string }>("cloud189_qr_start"),
+  /** Polls the 天翼云盘 QR login; the session lives in the backend. */
+  cloud189QrPoll: () =>
+    invoke<{ state: string; authenticated: boolean; message: string | null }>(
+      "cloud189_qr_poll",
+    ),
   /** Logs in a drive that takes a pasted credential (139 today). */
   providerLogin: (provider: string, credential: string) =>
     invoke<ProviderAuthState>("provider_login", { provider, credential }),
@@ -69,6 +77,7 @@ export const api = {
   openWebLogin139: () => invoke<void>("open_web_login_139"),
   /** 百度网盘 web login: harvested from `pan.baidu.com` (`BDUSS`/`STOKEN`). */
   openWebLoginBaidu: () => invoke<void>("open_web_login_baidu"),
+  openWebLogin115: () => invoke<void>("open_web_login_115"),
   closeWebLogin: () => invoke<void>("close_web_login"),
 
   listDir: (pdirFid: string) => invoke<DirListing>("list_dir", { pdirFid }),
@@ -216,6 +225,8 @@ export const events = {
     listen<WebLoginEvent>("auth://web-login", (e) => cb(e.payload)),
   onWebLogin139: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
     listen<WebLoginEvent>("auth://yun139-web-login", (e) => cb(e.payload)),
+  onWebLogin115: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
+    listen<WebLoginEvent>("auth://pan115-web-login", (e) => cb(e.payload)),
   onWebLoginBaidu: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
     listen<WebLoginEvent>("auth://baidu-web-login", (e) => cb(e.payload)),
   onDeeplink: (cb: (link: string) => void): Promise<UnlistenFn> =>

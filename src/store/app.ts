@@ -1,6 +1,7 @@
 import { computed, reactive, watch } from "vue";
 import { hostSetTheme, hostSystemTheme, onSystemThemeChange } from "@/lib/host";
 import { api, events } from "@/lib/backend";
+import { errText } from "@/lib/format";
 import { storageKey } from "@/lib/brand";
 import type {
   AccountInfo,
@@ -373,7 +374,7 @@ export async function bootstrap() {
     // `?theme=` jump to a screen without hunting for it.
     if (import.meta.env.VITE_MOCK === "1") await watchDevScreen();
   } catch (err) {
-    app.bootError = String(err);
+    app.bootError = errText(err);
     app.view = "login";
   } finally {
     app.ready = true;
