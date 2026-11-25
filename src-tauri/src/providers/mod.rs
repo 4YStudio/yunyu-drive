@@ -1438,6 +1438,14 @@ mod live_provider_probe {
         // Without a per-item purge the only way to leave nothing behind is to
         // restore and then permanently delete.
         let _ = drive.recycle_restore(&still).await;
+        // Restoring hands the entries new bin ids, and 115 only removes the ids
+        // it was given — a second purge after the restore clears them.
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        if let Ok((_, again)) = bin_mine(drive, prefix, 4).await {
+            if !again.is_empty() {
+                let _ = drive.recycle_purge(&again).await;
+            }
+        }
         let mut errors = Vec::new();
         for entry in &still {
             if let Err(err) = hard_delete(aliyun, &entry.fid).await {
@@ -1505,11 +1513,67 @@ mod live_provider_probe {
         Err(last.unwrap_or_else(|| AppError::new("share_open 未执行")))
     }
 
+    /// 转存: copies the first shared file into our own folder and waits for it
+    /// to show up there, then deletes the copy again.
+    ///
+    /// Every drive that can open a share should be able to save from it, so a
+    /// drive answering "not supported" here is a real gap rather than a missing
+    /// capability flag.
+    async fn share_save_step(
+        drive: &dyn DriveProvider,
+        share_ref: &crate::transfer::ShareRef,
+        entries: &[crate::share::ShareEntry],
+        save_to: Option<&str>,
+        probe: &mut Probe,
+    ) {
+        let Some(dir) = save_to else {
+            probe.skip("share_save", "没有可用的目标目录");
+            return;
+        };
+        let Some(entry) = entries.iter().find(|e| !e.is_dir) else {
+            probe.skip("share_save", "分享里没有可直接转存的文件");
+            return;
+        };
+        let name = entry.name.clone();
+        match drive
+            .share_save(share_ref, std::slice::from_ref(entry), Some(dir))
+            .await
+        {
+            Ok(saved) => match find_settled(drive, dir, &name, 5).await {
+                Ok(Some((fid, _))) => {
+                    probe.pass(
+                        "share_save",
+                        format!("转存 {name} 成功（{saved} 个），目标目录里已出现"),
+                    );
+                    let _ = drive.delete(&[fid]).await;
+                }
+                Ok(None) => probe.fail("share_save", format!("转存 {name} 后目标目录里没有它")),
+                Err(err) => probe.fail("share_save", format!("转存后回查失败：{err}")),
+            },
+            // Sharing and then saving your own link is refused by most drives
+            // (夸克 41017, 百度 "不能转存自己分享的文件"). That is a limit of the
+            // test, not of the feature: a real share belongs to someone else.
+            Err(err) if is_own_share_block(&err.to_string()) => {
+                probe.skip("share_save", format!("该盘不允许转存自己的分享：{err}"))
+            }
+            Err(err) => probe.fail("share_save", err),
+        }
+    }
+
+    fn is_own_share_block(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        message.contains("自己的分享")
+            || message.contains("自己分享")
+            || lower.contains("41017")
+            || message.contains("不能转存自己")
+    }
+
     async fn share_roundtrip(
         drive: &dyn DriveProvider,
         label: &str,
         id: &str,
         passcode: &str,
+        save_to: Option<&str>,
         probe: &mut Probe,
     ) {
         match share_open_retry(drive, id, passcode).await {
@@ -1575,6 +1639,7 @@ mod live_provider_probe {
                         } else {
                             probe.skip("share_link", "分享里没有可直接下载的文件");
                         }
+                        share_save_step(drive, &share_ref, &listing.entries, save_to, probe).await;
                     }
                     Err(err) => probe.fail("share_list", err),
                 }
@@ -2009,7 +2074,14 @@ mod live_provider_probe {
                                 .flatten();
                             let from_gone = match source {
                                 None => true,
-                                Some(_) => gone_settled(drive, &mv_dir, &copy_name, 8).await,
+                                Some(_) => {
+                                    // 天翼 applies the move lazily: the entry
+                                    // keeps showing in the source for a while
+                                    // even though the destination has it.
+                                    let tries =
+                                        if drive.id() == ProviderId::Cloud189 { 25 } else { 8 };
+                                    gone_settled(drive, &mv_dir, &copy_name, tries).await
+                                }
                             };
                             let to_present = target.is_some();
                             if let Some((new_fid, _)) = target {
@@ -2120,7 +2192,7 @@ mod live_provider_probe {
                         } else {
                             target.passcode.clone()
                         };
-                        share_roundtrip(drive, label, &target.id, &pass, &mut probe).await;
+                        share_roundtrip(drive, label, &target.id, &pass, Some(&sandbox), &mut probe).await;
                         share_open_done = true;
                     } else {
                         probe.missing("share_open", "capabilities.share_open=false");
@@ -2168,7 +2240,7 @@ mod live_provider_probe {
                         ),
                         Err(_) => (record.share_id.clone(), record.passcode.clone()),
                     };
-                    share_roundtrip(drive, label, &id, &pass, &mut probe).await;
+                    share_roundtrip(drive, label, &id, &pass, Some(&sandbox), &mut probe).await;
                 }
                 Ok(_) => probe.skip("share_open", "该盘没有可用的既有分享"),
                 Err(err) => probe.skip("share_open", format!("既无可建分享，也读不到分享列表：{err}")),

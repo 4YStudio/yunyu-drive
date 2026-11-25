@@ -350,6 +350,10 @@ impl Yun139Provider {
             serde_json::from_slice::<serde_json::Value>(&plain)
                 .map_err(|_| AppError::new("139 分享响应不是合法 JSON"))?
         };
+        #[cfg(test)]
+        if std::env::var("YUN139_DUMP").is_ok() {
+            eprintln!("[139 raw] {path} -> {value}");
+        }
         let code = value
             .get("resultCode")
             .or_else(|| value.get("code"))
@@ -370,10 +374,6 @@ impl Yun139Provider {
                 _ => format!("139 分享接口返回异常（code={code}）"),
             };
             return Err(AppError::new(message));
-        }
-        #[cfg(test)]
-        if std::env::var("YUN139_DUMP").is_ok() {
-            eprintln!("[139 raw] {value}");
         }
         Ok(value.get("data").cloned().unwrap_or(serde_json::Value::Null))
     }
@@ -593,11 +593,11 @@ impl Yun139Provider {
     }
 
     /// Waits for a share-save batch task to finish.
-    async fn poll_share_task(&self, account: &str, task: &str) -> AppResult<()> {
+    async fn poll_share_task(&self, account: &str, task: &str, domain: &str) -> AppResult<()> {
         for _ in 0..80 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             let body = serde_json::json!({
-                "queryBatchOprTaskDetailReq": { "taskID": task, "msisdn": account }
+                "queryBatchOprTaskDetailReq": { "taskID": task, "msisdn": account, "userDomainId": domain }
             });
             let Ok(data) = self
                 .share_post("/IBatchOprTask/queryBatchOprTaskDetail", &body)
@@ -1389,18 +1389,26 @@ impl DriveProvider for Yun139Provider {
         if entries.is_empty() {
             return Err(AppError::new("请先选择要转存的内容"));
         }
-        // 139 can only save whole folders/files by id; the destination is a
-        // path, and "/" is its root.
+        let config = self.config().await;
+        // `newCatalogID` is a *file id*, not a path: sending "/a/b" answers
+        // `参数错误（01000001）`, which says nothing about the real problem.
         let target = match to {
-            Some(id) if !id.is_empty() && id != ROOT => self.path_of(id).await,
+            Some(id) if !id.is_empty() && id != ROOT => {
+                let path = self.path_of(id).await;
+                let id = resolve_file_id(&config, &path).await?;
+                if id.is_empty() { "/".to_string() } else { id }
+            }
             _ => "/".to_string(),
         };
-        let config = self.config().await;
+        // Same trap as `share_link`: the share host refuses the batch task with
+        // `200000401` when `userDomainId` is missing.
+        let domain = self.user_domain_id().await?;
         let ids: Vec<String> = entries.iter().map(|e| e.fid.clone()).collect();
         let body = serde_json::json!({
             "createOuterLinkBatchOprTaskReq": {
                 "msisdn": config.account,
                 "ownerAccount": config.account,
+                "userDomainId": domain,
                 "taskType": 3,
                 "actionType": 310,
                 "linkID": share.pwd_id,
@@ -1422,7 +1430,7 @@ impl DriveProvider for Yun139Provider {
         if task.is_empty() {
             return Ok(entries.len() as u64);
         }
-        self.poll_share_task(&config.account, &task).await?;
+        self.poll_share_task(&config.account, &task, &domain).await?;
         Ok(entries.len() as u64)
     }
 
@@ -1478,12 +1486,17 @@ impl DriveProvider for Yun139Provider {
         fid: &str,
     ) -> AppResult<ShareLink> {
         let config = self.config().await;
+        // `userDomainId` is as load-bearing here as it is for `getOutLink`:
+        // without it the share host answers `200000401 IP鉴权失败、用户账号鉴权
+        // 失败`, which reads like an expired login but is really a missing field.
+        let domain = self.user_domain_id().await?;
         let body = serde_json::json!({
             "dlFromOutLinkReqV3": {
                 "account": config.account,
                 "linkID": share.pwd_id,
                 "passwd": share.passcode,
                 "coIDLst": { "item": [fid] },
+                "userDomainId": domain,
             }
         });
         let value = self.share_post("/IOutLink/dlFromOutLinkV3", &body).await?;

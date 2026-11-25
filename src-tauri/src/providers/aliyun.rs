@@ -977,6 +977,13 @@ impl AliyunProvider {
                     .and_then(|b| b.get("message"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("批量操作失败");
+                // Deleting something that is already in the bin is not a failure
+                // for the user: the intent ("this file should not be here") is
+                // satisfied. It also happens for real — the bin entry can be
+                // created by another device a second earlier.
+                if message.contains("had been trashed already") {
+                    continue;
+                }
                 return Err(AppError::new(format!("阿里云盘：{message}")));
             }
         }
@@ -984,11 +991,23 @@ impl AliyunProvider {
     }
 }
 
+/// Whether an error means "this thing is already gone".
+fn is_gone(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not found")
+        || lower.contains("already")
+        || lower.contains("does not exist")
+}
+
 /// Parses a response body, surfacing the API's own error message.
 ///
 /// The web API reports business failures with HTTP 200 and `{code, message}`, so
 /// the body itself has to be inspected.
 fn parse_body(text: &str) -> AppResult<Value> {
+    // A successful delete answers with an empty body, which is not JSON.
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
     let value: Value = serde_json::from_str(text).unwrap_or_else(|_| {
         let snippet: String = text.chars().take(180).collect();
         json!({ "code": "PARSE_ERROR", "message": format!("响应解析失败：{snippet}") })
@@ -1326,7 +1345,12 @@ impl DriveProvider for AliyunProvider {
             return Err(AppError::new("未选择任何文件"));
         }
         let drive = self.drive().await?;
-        self.batch("/recyclebin/trash", &drive, fids).await
+        match self.batch("/recyclebin/trash", &drive, fids).await {
+            Ok(()) => Ok(()),
+            // Already gone (removed from another device): the intent is met.
+            Err(err) if is_gone(&err.to_string()) => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 
     async fn transfer_entries(&self, fids: &[String], to: &str, copy: bool) -> AppResult<usize> {
@@ -1783,10 +1807,32 @@ impl DriveProvider for AliyunProvider {
         Ok(entries.len() as u32)
     }
 
+    async fn recycle_purge(&self, entries: &[RecycleEntry]) -> AppResult<u32> {
+        // The bin has no delete endpoint of its own (`/v2/recyclebin/delete` and
+        // the batch variants all 404), but the ordinary file API still accepts a
+        // trashed id and removes it for good — that is what the web client's
+        // 「彻底删除」ends up calling.
+        if entries.is_empty() {
+            return Err(AppError::new("请先选择要彻底删除的内容"));
+        }
+        let drive = self.drive().await?;
+        let mut purged = 0u32;
+        for entry in entries {
+            let fid = super::native_of(&entry.fid);
+            let body = json!({ "drive_id": drive, "file_id": fid });
+            match self.call("/v2/file/delete", body).await {
+                Ok(_) => purged += 1,
+                // Already gone (another device, or a retry): the intent is met.
+                Err(err) if is_gone(&err.to_string()) => purged += 1,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(purged)
+    }
+
     async fn recycle_clear(&self) -> AppResult<()> {
-        // Per-item purge is not exposed by the API at all (`/v2/recyclebin/delete`
-        // and the batch variant both 404/400), but emptying the bin is — and it
-        // lives under `/v2/`, not `/adrive/v2/`.
+        // Emptying the whole bin does have an endpoint — under `/v2/`, not
+        // `/adrive/v2/`.
         let drive = self.drive().await?;
         let token = self.token().await?;
         self.raw_post_as(

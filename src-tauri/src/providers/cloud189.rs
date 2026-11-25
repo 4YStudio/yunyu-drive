@@ -1249,7 +1249,7 @@ impl DriveProvider for Cloud189Provider {
         if fids.is_empty() {
             return Ok(());
         }
-        let infos = self.task_infos(fids).await?;
+        let infos = self.task_infos(fids, false).await?;
         self.batch("DELETE", None, infos).await
     }
 
@@ -1257,9 +1257,11 @@ impl DriveProvider for Cloud189Provider {
         if fids.is_empty() {
             return Ok(0);
         }
-        let infos = self.task_infos(fids).await?;
-        let count = infos.len();
         let kind = if copy { "COPY" } else { "MOVE" };
+        // A MOVE without `srcParentId` is silently a COPY on 189: the source
+        // keeps its entry (verified live — plain MOVE left the file in place).
+        let infos = self.task_infos(fids, !copy).await?;
+        let count = infos.len();
         let target = api_id(to);
         let target = if target.is_empty() {
             None
@@ -1704,12 +1706,36 @@ impl DriveProvider for Cloud189Provider {
                 } else {
                     err
                 }
-            })?;
+            });
+        // "已经转存过" leaves the account in exactly the state the caller asked
+        // for, so it is not a failure — just nothing left to do.
+        let value = match value {
+            Ok(value) => value,
+            Err(err) if err.to_string().contains("已经转存过") => {
+                crate::ylog!("cloud189: share {} already saved: {err}", share.stoken);
+                return Ok(count);
+            }
+            Err(err) => return Err(err),
+        };
         let task = num_text(value.get("taskId"));
         if task.is_empty() {
             return Err(AppError::new("转存失败：没有拿到任务号"));
         }
-        self.wait_open_task("SHARE_SAVE", &task).await?;
+        if let Err(err) = self.wait_open_task("SHARE_SAVE", &task).await {
+            // The batch task can outlive our polling budget (it keeps running on
+            // the server). Verify against the target folder before reporting a
+            // failure — a save that did land is not an error.
+            let dir = to.unwrap_or("0");
+            let landed = match self.list(dir).await {
+                Ok(listing) => entries
+                    .iter()
+                    .all(|entry| listing.entries.iter().any(|row| row.name == entry.name)),
+                Err(_) => false,
+            };
+            if !landed {
+                return Err(err);
+            }
+        }
         Ok(count)
     }
 
@@ -2040,6 +2066,7 @@ impl Cloud189Provider {
     /// do not accept ids for.
     /// Polls an `open/batch` task to completion.
     async fn wait_open_task(&self, kind: &str, task: &str) -> AppResult<()> {
+        let mut last = Value::Null;
         for _ in 0..120 {
             let value = self
                 .open_post(
@@ -2051,6 +2078,7 @@ impl Cloud189Provider {
                 )
                 .await?;
             let state = value.get("taskStatus").and_then(Value::as_i64).unwrap_or(0);
+            last = value.clone();
             if state == 4 {
                 let failed = value.get("failedCount").and_then(Value::as_i64).unwrap_or(0);
                 if failed > 0 {
@@ -2062,10 +2090,12 @@ impl Cloud189Provider {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        Err(AppError::new("转存任务超时，请稍后在网页版确认"))
+        Err(AppError::new(format!(
+            "转存任务超时，请稍后在网页版确认（taskId={task}，最后一次状态：{last}）"
+        )))
     }
 
-    async fn task_infos(&self, fids: &[String]) -> AppResult<Vec<Value>> {
+    async fn task_infos(&self, fids: &[String], with_src: bool) -> AppResult<Vec<Value>> {
         let mut infos = Vec::new();
         for fid in fids {
             let native = native_of(fid);
@@ -2077,11 +2107,20 @@ impl Cloud189Provider {
                 .call_with("GET", "/getFileInfo.action", None, &[("fileId", &native)])
                 .await?;
             let is_folder = value.get("mediaType").is_none();
-            infos.push(json!({
+            let mut info = json!({
                 "fileId": native,
                 "fileName": name_of(&value),
                 "isFolder": if is_folder { 1 } else { 0 },
-            }));
+            });
+            if with_src {
+                // `getFileInfo` carries the current parent; the batch MOVE needs
+                // it or the server copies instead of moving.
+                info["srcParentId"] = json!(value
+                    .get("parentId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default());
+            }
+            infos.push(info);
         }
         Ok(infos)
     }

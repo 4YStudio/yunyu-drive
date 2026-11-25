@@ -5649,14 +5649,38 @@ mod live_upload_folder_probe {
 
         // Clean up *before* asserting: a failed assertion used to leave the
         // probe folder behind and those leftovers piled up between runs.
-        drive
-            .delete(std::slice::from_ref(&remote_root))
-            .await
-            .expect("delete remote tree");
-        let _ = drive.recycle_clear().await;
+        // Sweep every `yunyu-probe-uf*` root entry, not just this run's: an
+        // earlier aborted run leaves its own folder behind and the leftover
+        // check below counts them.
+        if let Ok(root_page) = drive.list("0").await {
+            for entry in root_page.entries {
+                if entry.name.starts_with("yunyu-probe-uf") {
+                    let _ = drive.delete(&[native_of(&entry.fid)]).await;
+                }
+            }
+        }
+        let _ = drive.delete(std::slice::from_ref(&remote_root)).await;
+        // Never `recycle_clear()` here: it empties the *account's* bin, which is
+        // somebody's real data. Delete settles lazily on 夸克, so poll instead.
+        let mut leftover: Vec<String> = Vec::new();
+        for attempt in 0..12 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+            let page = drive.list("0").await.expect("list root");
+            leftover = page
+                .entries
+                .iter()
+                .filter(|e| e.name.starts_with("yunyu-probe-uf"))
+                .map(|e| e.name.clone())
+                .collect();
+            if leftover.is_empty() {
+                break;
+            }
+        }
         let _ = std::fs::remove_dir_all(&sandbox);
         let page = drive.list("0").await.expect("list root");
-        let leftover: Vec<_> = page
+        let _unused: Vec<_> = page
             .entries
             .iter()
             .filter(|e| e.name.starts_with("yunyu-probe-uf"))
@@ -5705,7 +5729,7 @@ mod probe_cleanup {
                 }
             }
         }
-        let _ = drive.recycle_clear().await;
+        // Deliberately no `recycle_clear()`: it would empty the user's bin.
         let left = drive.list("0").await.expect("list root");
         let others: Vec<_> = left
             .entries
