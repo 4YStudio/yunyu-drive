@@ -228,8 +228,13 @@ pub fn run() {
             login::open_web_login,
             login::open_web_login_139,
             login::open_web_login_baidu,
-        login::open_web_login_115,
+            login::open_web_login_115,
+            login::open_web_login_189,
             login::close_web_login,
+            logging::logs_tail,
+            logging::logs_clear,
+            logging::logs_file,
+            logging::log_emit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

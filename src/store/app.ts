@@ -18,6 +18,7 @@ export type View =
   | "myShares"
   | "transfers"
   | "settings"
+  | "logs"
   | "login"
   | "share";
 export type ThemeMode = "light" | "dark" | "system";

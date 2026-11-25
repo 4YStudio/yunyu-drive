@@ -291,3 +291,15 @@ export interface ShareRecord {
   /** Qualified ids the share covers, when the drive reports them. */
   fids: string[];
 }
+
+/** One line of the in-app console (backend `ylog!` or a frontend event). */
+export interface LogEntry {
+  seq: number;
+  /** `HH:MM:SS.mmm`, local time. */
+  at: string;
+  /** `log` | `ok` | `warn` | `error` | `invoke`. */
+  level: string;
+  /** Module name, `console`, or the Tauri command that was called. */
+  target: string;
+  message: string;
+}

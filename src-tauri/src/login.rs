@@ -26,13 +26,18 @@ pub const LOGIN_LABEL_139: &str = "yun139-login";
 pub const LOGIN_LABEL_BAIDU: &str = "baidu-login";
 /// Separate window label for the 115 web login.
 pub const LOGIN_LABEL_115: &str = "pan115-login";
+/// 天翼云盘 web login. Its client session comes from the in-app QR flow, but
+/// the recycle bin only answers on `cloud.189.cn`, which needs web cookies —
+/// this window is where they are harvested.
+pub const LOGIN_LABEL_189: &str = "cloud189-login";
 /// Every label the login windows use. Maintenance actions (clearing the
 /// webview store) walk this list so the frontend never has to know the labels.
-pub const LOGIN_LABELS: [&str; 4] = [
+pub const LOGIN_LABELS: [&str; 5] = [
     LOGIN_LABEL,
     LOGIN_LABEL_139,
     LOGIN_LABEL_BAIDU,
     LOGIN_LABEL_115,
+    LOGIN_LABEL_189,
 ];
 
 /// What "clear the built-in browser data" actually removed.
@@ -159,6 +164,8 @@ pub const EVENT_LOGIN_139: &str = "auth://yun139-web-login";
 pub const EVENT_LOGIN_BAIDU: &str = "auth://baidu-web-login";
 /// Same shape as [`EVENT_LOGIN`], but for the 115 window.
 pub const EVENT_LOGIN_115: &str = "auth://pan115-web-login";
+/// Same shape as [`EVENT_LOGIN`], but for the 天翼云盘 web window.
+pub const EVENT_LOGIN_189: &str = "auth://cloud189-web-login";
 
 /// The drive web app itself: it renders the login sheet when signed out and
 /// lands on "all files" once signed in, so the user only ever sees one screen.
@@ -174,6 +181,9 @@ const START_URL_139: &str = "https://yun.139.com/w/";
 /// `pan.baidu.com`, which is what the harvest lifts out.
 const START_URL_BAIDU: &str = "https://pan.baidu.com/disk/main";
 const START_URL_115: &str = "https://115.com/";
+/// 天翼云盘 web drive. The recycle bin lives behind this site's cookie auth,
+/// so this is where the one-off harvest happens.
+const START_URL_189: &str = "https://cloud.189.cn/web/login.html";
 
 /// WebKitGTK's default UA is easily mistaken for an unsupported browser, which
 /// makes Quark serve a stripped-down page. Present as desktop Chrome instead.
@@ -365,6 +375,45 @@ fn cookie_header_115(cookies: &[Cookie<'static>]) -> String {
     }
     let header = pairs.join("; ");
     crate::ylog!("pan115 login: harvested cookie, {} bytes", header.len());
+    header
+}
+
+/// 天翼云盘 wants the whole `cloud.189.cn` jar (its web API reads a handful of
+/// `COOKIE_*` cookies), and `COOKIE_LOGIN_USER` is the one that proves the
+/// session is real — the rest are noise the API ignores.
+fn cookie_header_189(cookies: &[Cookie<'static>]) -> String {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for cookie in cookies {
+        let domain = cookie.domain().unwrap_or_default();
+        // `cloud.189.cn` sets host-only cookies, so an empty domain is normal.
+        if !domain.is_empty() && !domain.ends_with("189.cn") {
+            continue;
+        }
+        let value = cookie.value().trim().to_string();
+        if value.is_empty() {
+            continue;
+        }
+        let name = cookie.name().to_string();
+        // The same name can live on several 189 hosts; the `.189.cn` copy wins.
+        match pairs.iter_mut().find(|pair| pair.0 == name) {
+            Some(existing) if domain.starts_with('.') => existing.1 = value,
+            Some(_) => {}
+            None => pairs.push((name, value)),
+        }
+    }
+    let signed_in = pairs
+        .iter()
+        .any(|(name, value)| name == "COOKIE_LOGIN_USER" && value.len() > 20);
+    if !signed_in {
+        crate::ylog!("cloud189 login: waiting for COOKIE_LOGIN_USER");
+        return String::new();
+    }
+    let header = pairs
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    crate::ylog!("cloud189 login: harvested cookie, {} bytes", header.len());
     header
 }
 
@@ -661,7 +710,13 @@ fn cookie_value_139(cookies: &[Cookie<'static>]) -> String {
 /// gone and reports it as cancelled).
 #[tauri::command]
 pub async fn close_web_login(app: AppHandle) -> AppResult<()> {
-    for label in [LOGIN_LABEL, LOGIN_LABEL_139, LOGIN_LABEL_BAIDU] {
+    for label in [
+        LOGIN_LABEL,
+        LOGIN_LABEL_139,
+        LOGIN_LABEL_BAIDU,
+        LOGIN_LABEL_115,
+        LOGIN_LABEL_189,
+    ] {
         if let Some(window) = app.get_webview_window(label) {
             let _ = window.close();
         }
@@ -858,6 +913,49 @@ pub async fn open_web_login_115(
     )
     .await
 
+}
+
+/// Opens the 天翼云盘 web login window and watches it for `COOKIE_LOGIN_USER`.
+///
+/// This is a *second*, optional login: the QR flow already provides the signed
+/// client session that everything except the recycle bin uses. The recycle bin
+/// lives on `cloud.189.cn`, which only accepts web cookies, and the client
+/// token can no longer be bridged into one (`ssoLoginByAccessToken` now needs a
+/// web session first). So the user signs in here once and we keep the jar.
+#[tauri::command]
+pub async fn open_web_login_189(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> AppResult<()> {
+    spawn_login_watch(
+        app.clone(),
+        Arc::clone(&state),
+        LOGIN_LABEL_189,
+        "登录天翼云盘网页版（回收站需要）",
+        Url::parse(START_URL_189)
+            .map_err(|err| AppError::new(format!("地址解析失败：{err}")))?,
+        login_size().0,
+        login_size().1,
+        |cookies| Some(cookie_header_189(cookies)).filter(|v| !v.is_empty()),
+        |state, cookie| {
+            Box::pin(async move {
+                let dir = state.paths.config_dir.clone();
+                let drive = crate::providers::Cloud189Provider::save_web_cookie(&dir, &cookie)
+                    .await?;
+                // Prove the cookie before reporting success: otherwise the user
+                // sees "logged in" and the recycle bin still refuses.
+                if let Err(err) = drive.recycle_list(0, 1).await {
+                    return Err(AppError::new(format!(
+                        "已取得网页凭据，但回收站拒绝了它：{err}"
+                    )));
+                }
+                state.invalidate_providers().await;
+                Ok(())
+            })
+        },
+        EVENT_LOGIN_189,
+    )
+    .await
 }
 
 #[cfg(test)]

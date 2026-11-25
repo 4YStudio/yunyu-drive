@@ -10,6 +10,7 @@ import type {
   AccountInfo,
   AppInfo,
   AuthStatus,
+  LogEntry,
   DirListing,
   EntryDto,
   PathNode,
@@ -445,6 +446,20 @@ export const mockApi = {
     cookiePath: "/home/henvei/.config/yunyu-drive/cookie.txt",
   }),
   authStates: async (): Promise<ProviderAuthState[]> => mockStates(),
+  /** A few scripted lines so the 日志 view can be looked at without a backend. */
+  logsTail: async (since: number, limit = 500): Promise<LogEntry[]> => {
+    const lines: LogEntry[] = [
+      { seq: 1, at: "10:24:01.812", level: "log", target: "app", message: "app start, version 0.4.1, mock build" },
+      { seq: 2, at: "10:24:01.905", level: "invoke", target: "auth_states", message: "ok · 3 ms" },
+      { seq: 3, at: "10:24:02.140", level: "invoke", target: "files_list", message: "ok · 128 ms" },
+      { seq: 4, at: "10:24:03.001", level: "warn", target: "engine", message: "第 3 个分片超时，重试一次" },
+      { seq: 5, at: "10:24:04.552", level: "error", target: "recycle_list", message: "天翼云盘网页会话没有返回登录凭据，请重新登录 · 41 ms" },
+      { seq: 6, at: "10:24:05.010", level: "ok", target: "upload", message: "上传完成 · 52428800 字节 · 12.4 MB/s" },
+    ];
+    return lines.filter((line) => line.seq > since).slice(0, limit);
+  },
+  logsClear: async (): Promise<void> => {},
+  logsFile: async (): Promise<string | null> => "/home/henvei/.local/share/yunyu-drive/logs/app.log",
   recycleList: async (provider: string): Promise<RecycleEntry[]> => {
     const stamp = Date.now() - 3600_000;
     return [
@@ -519,6 +534,8 @@ export const mockApi = {
   openWebLogin: async () => {},
   openWebLogin139: async () => {},
   openWebLoginBaidu: async () => {},
+  openWebLogin115: async () => {},
+  openWebLogin189: async () => {},
   closeWebLogin: async () => {},
   systemTheme: async (): Promise<"light" | "dark"> => "dark",
 
@@ -942,6 +959,7 @@ export const mockEvents = {
   onWebLogin: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onWebLogin139: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onWebLoginBaidu: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
+  onWebLogin189: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onTransfersBatch: async (cb: (tasks: TransferTask[]) => void): Promise<() => void> => {
     batchListeners.add(cb);
     return () => {

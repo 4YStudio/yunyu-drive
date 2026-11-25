@@ -143,6 +143,31 @@ impl Cloud189Provider {
         Ok(Self::new(creds, path.to_string_lossy().to_string()))
     }
 
+    /// Installs a web session harvested from the login window.
+    ///
+    /// The recycle bin only exists on `cloud.189.cn`, which authenticates with
+    /// the browser cookies (`COOKIE_LOGIN_USER`) instead of the signed client
+    /// session. The bridge that used to mint those cookies from the client
+    /// token (`open/ssoLoginByAccessToken`) now demands a web session first, so
+    /// a one-off web login is the only way in.
+    pub async fn save_web_cookie(own_dir: &Path, cookie: &str) -> AppResult<Self> {
+        let drive = Self::load(own_dir)?;
+        let cookie = cookie.trim().to_string();
+        if !cookie.contains("COOKIE_LOGIN_USER") {
+            return Err(AppError::new("天翼云盘网页版还没有登录完成"));
+        }
+        {
+            let mut creds = drive.creds.write().await;
+            creds.web_cookie = cookie.clone();
+        }
+        drive.persist().await;
+        crate::ylog!(
+            "cloud189 web: harvested {} cookies from the login window",
+            cookie.matches('=').count()
+        );
+        Ok(drive)
+    }
+
     fn http(&self) -> AppResult<reqwest::Client> {
         if let Some(client) = self.client.get() {
             return Ok(client.clone());
@@ -243,15 +268,34 @@ impl Cloud189Provider {
             request = request.form(&[("", "")][..0]);
         }
 
-        let res = request
-            .send()
-            .await
-            .map_err(|e| net_error(&format!("天翼云盘请求 {path}"), &e))?;
+        let started = std::time::Instant::now();
+        let res = match request.send().await {
+            Ok(res) => res,
+            Err(e) => {
+                crate::logging::http(
+                    "cloud189",
+                    method,
+                    &url,
+                    None,
+                    started.elapsed().as_millis(),
+                    0,
+                );
+                return Err(net_error(&format!("天翼云盘请求 {path}"), &e));
+            }
+        };
         let status = res.status().as_u16();
         let body = res
             .text()
             .await
             .map_err(|e| net_error("读取天翼云盘响应", &e))?;
+        crate::logging::http(
+            "cloud189",
+            method,
+            &url,
+            Some(status),
+            started.elapsed().as_millis(),
+            body.len(),
+        );
         if status >= 400 {
             crate::ylog!(
                 "cloud189: {method} {path} HTTP {status} head={}",
@@ -764,6 +808,7 @@ impl Cloud189Provider {
             .map_err(|e| net_error(&format!("天翼云盘请求 {path}"), &e))?;
         let status = res.status().as_u16();
         let body = res.text().await.unwrap_or_default();
+        crate::logging::http("cloud189", "POST", &format!("{API}{path}"), Some(status), 0, body.len());
         // Every `open/*` failure so far has been diagnosable from the path and
         // the body alone; the form values are never logged because one of them
         // is the access token.
@@ -2023,17 +2068,24 @@ impl DriveProvider for Cloud189Provider {
                     &[],
                 )
                 .await?;
-            let rows = value
-                .get("fileList")
-                .or_else(|| value.get("fileListAO").and_then(|v| v.get("fileList")))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
+            // The web endpoint splits the two kinds into separate arrays:
+            // files land in `fileList`, folders in `folderList` (which is why
+            // a folder-only bin used to look empty).
+            let mut rows: Vec<(Value, bool)> = Vec::new();
+            for key in ["fileList", "folderList"] {
+                let is_dir = key == "folderList";
+                let list = value
+                    .get(key)
+                    .or_else(|| value.get("fileListAO").and_then(|v| v.get(key)))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                rows.extend(list.into_iter().map(|row| (row, is_dir)));
+            }
             if rows.is_empty() {
                 break;
             }
-            let total = rows.len();
-            for item in rows.into_iter().skip(skip as usize) {
+            for (item, is_dir) in rows.into_iter().skip(skip as usize) {
                 let native = id_of(&item);
                 if native.is_empty() {
                     continue;
@@ -2041,10 +2093,7 @@ impl DriveProvider for Cloud189Provider {
                 out.push(RecycleEntry {
                     fid: qualify(ProviderId::Cloud189, &native),
                     name: name_of(&item),
-                    is_dir: match item.get("isFolder").and_then(Value::as_bool) {
-                        Some(flag) => flag,
-                        None => item.get("isFolder").and_then(Value::as_i64).unwrap_or(0) == 1,
-                    },
+                    is_dir,
                     size: item.get("size").and_then(Value::as_u64).unwrap_or_default(),
                     deleted_at: item
                         .get("lastOpTime")
@@ -2059,10 +2108,13 @@ impl DriveProvider for Cloud189Provider {
                 }
             }
             skip = 0;
-            if total < page_size as usize {
+            // A page holds up to `pageSize` files *and* `pageSize` folders, so a
+            // short page does not mean the end; only an empty one does. The cap
+            // keeps a misbehaving server from looping us forever.
+            page += 1;
+            if page > 500 {
                 break;
             }
-            page += 1;
         }
         Ok(out)
     }

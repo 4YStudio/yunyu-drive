@@ -1,7 +1,9 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as rawInvoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { logLine } from "@/lib/logbus";
 
 export * from "@/lib/types";
+
 import type {
   AccountInfo,
   AppInfo,
@@ -19,10 +21,39 @@ import type {
   ShareCreated,
   ShareRecord,
   TransferTask,
+  LogEntry,
 } from "@/lib/types";
+
+/**
+ * Every Tauri command goes through here so the 日志 view can show what the UI
+ * asked for, how long it took and what the backend answered. Logging is
+ * fire-and-forget, so a failed send never breaks the call itself.
+ */
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const started = performance.now();
+  try {
+    const out = await rawInvoke<T>(cmd, args);
+    logLine("invoke", cmd, `ok · ${Math.round(performance.now() - started)} ms`);
+    return out;
+  } catch (err) {
+    const ms = Math.round(performance.now() - started);
+    logLine("error", cmd, `${String(err)} · ${ms} ms`);
+    throw err;
+  }
+}
 
 export const api = {
   authStatus: () => invoke<AuthStatus>("auth_status"),
+  /**
+   * In-app console: lines newer than `since` (a sequence number).
+   *
+   * Uses `rawInvoke` on purpose — the polling would otherwise flood the log it
+   * is reading.
+   */
+  logsTail: (since: number, limit = 500) =>
+    rawInvoke<LogEntry[]>("logs_tail", { since, limit }),
+  logsClear: () => rawInvoke<void>("logs_clear"),
+  logsFile: () => rawInvoke<string | null>("logs_file"),
   /** Login state of every drive, for the sidebar switcher. */
   authStates: () => invoke<ProviderAuthState[]>("auth_states"),
   /**
@@ -85,6 +116,8 @@ export const api = {
   /** 百度网盘 web login: harvested from `pan.baidu.com` (`BDUSS`/`STOKEN`). */
   openWebLoginBaidu: () => invoke<void>("open_web_login_baidu"),
   openWebLogin115: () => invoke<void>("open_web_login_115"),
+  /** Second, optional login: mints the web cookies the 天翼 recycle bin needs. */
+  openWebLogin189: () => invoke<void>("open_web_login_189"),
   closeWebLogin: () => invoke<void>("close_web_login"),
 
   listDir: (pdirFid: string) => invoke<DirListing>("list_dir", { pdirFid }),
@@ -261,6 +294,9 @@ export const events = {
     listen<WebLoginEvent>("auth://pan115-web-login", (e) => cb(e.payload)),
   onWebLoginBaidu: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
     listen<WebLoginEvent>("auth://baidu-web-login", (e) => cb(e.payload)),
+  /** 天翼云盘 web-session harvest (recycle bin). */
+  onWebLogin189: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
+    listen<WebLoginEvent>("auth://cloud189-web-login", (e) => cb(e.payload)),
   onDeeplink: (cb: (link: string) => void): Promise<UnlistenFn> =>
     listen<string>("deeplink://open", (e) => cb(e.payload)),
   /** Tray menu asking for a screen change (`"transfers"`). */

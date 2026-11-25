@@ -12,6 +12,7 @@ import RecycleView from "@/views/RecycleView.vue";
 import MySharesView from "@/views/MySharesView.vue";
 import TransfersView from "@/views/TransfersView.vue";
 import SettingsView from "@/views/SettingsView.vue";
+import LogsView from "@/views/LogsView.vue";
 import ShareView from "@/views/ShareView.vue";
 import LoginView from "@/views/LoginView.vue";
 import { BRAND } from "@/lib/brand";
@@ -31,6 +32,7 @@ const currentView = computed(() => {
     share: ShareView,
     transfers: TransfersView,
     settings: SettingsView,
+    logs: LogsView,
     login: LoginView,
   } as const;
   return map[app.view];

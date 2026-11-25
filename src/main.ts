@@ -1,6 +1,11 @@
 import { createApp } from "vue";
 import App from "@/App.vue";
+import { installConsoleCapture } from "@/lib/logbus";
 import "@/styles/global.css";
+
+// Before anything else mounts: every console line and uncaught error from here
+// on also lands in the in-app 日志 view.
+installConsoleCapture();
 
 createApp(App).mount("#app");
 
