@@ -173,6 +173,14 @@ pub enum ResumeState {
 /// Without this, a download interrupted between the preallocation and the last
 /// segment would look finished on the next attempt and the sparse file would be
 /// renamed into place.
+/// How much of a partial is really on disk, according to its plan.
+///
+/// The file itself is pre-allocated, so its length is the size of the *whole*
+/// file from the first moment. Only the plan knows what has been written.
+pub fn plan_bytes(part: &Path) -> u64 {
+    meta::Progress::load(part).map(|plan| plan.bytes()).unwrap_or(0)
+}
+
 pub fn resume_state(part: &Path, size: u64, source: &str) -> ResumeState {
     match meta::Progress::load(part).filter(|saved| saved.belongs_to(size, source)) {
         Some(saved) if saved.finished() => ResumeState::Finished,
@@ -328,7 +336,10 @@ impl Drop for LeaveGuard {
 /// True when the partial file and its sidecar can be trusted to continue.
 fn reused_is_partial(part: &Path, progress: &meta::Progress) -> bool {
     match std::fs::metadata(part) {
-        Ok(meta) => meta.len() == progress.total && progress.completed() > 0,
+        // `bytes()` and not `completed()`: a single-connection run may not have
+        // finished a single segment yet, and its partially written segment is
+        // exactly what a resume must keep.
+        Ok(meta) => meta.len() == progress.total && progress.bytes() > 0,
         Err(_) => false,
     }
 }
@@ -380,7 +391,7 @@ async fn run_shared(
     progress.save(part)?;
     let sink = worker::Sink::open(part, size)?;
     // Bytes already on disk count towards progress from the first tick.
-    let already = progress.completed();
+    let already = progress.bytes();
     done.store(base + already, Ordering::Relaxed);
 
     let limiter = Arc::new(worker::Limiter::new());
@@ -579,6 +590,14 @@ async fn run_shared(
             state.remaining()
         };
         let workers = budget_now.min(pending).max(1);
+        let taps: Arc<Vec<std::sync::atomic::AtomicU64>> = {
+            let state = progress.lock().await;
+            Arc::new(
+                (0..state.segments.len())
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            )
+        };
         crate::ylog!(
             "download: round {round} over {workers} connections ({pending} segments left)"
         );
@@ -648,6 +667,7 @@ async fn run_shared(
             let part = part.to_path_buf();
             let control = control.clone();
             let stats = stats.clone();
+            let tap_bytes = Arc::clone(&taps);
 
             handles.push(tokio::spawn(async move {
                 // Stagger the first connections. A whole round starting at once
@@ -709,7 +729,18 @@ async fn run_shared(
                     };
 
                     match worker::run_segment(
-                        &source, segment, &sink, &limiter, &done, &round_token, &control,
+                        &source,
+                        segment,
+                        &sink,
+                        &limiter,
+                        &done,
+                        &round_token,
+                        &control,
+                        Some(&worker::Tap {
+                            index,
+                            base: segment.start,
+                            bytes: tap_bytes.clone(),
+                        }),
                     )
                     .await
                     {
@@ -768,6 +799,12 @@ async fn run_shared(
         // round's work survives.
         {
             let mut state = progress.lock().await;
+            // Fold the workers' live counters into the plan *before* saving:
+            // this save is what a pause leaves behind, and it has to include
+            // the segment that was still in flight.
+            for (index, seen) in taps.iter().enumerate() {
+                state.extend(index, seen.load(Ordering::Relaxed));
+            }
             let _ = state.save(part);
         }
 

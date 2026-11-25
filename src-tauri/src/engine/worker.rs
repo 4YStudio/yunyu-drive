@@ -373,6 +373,18 @@ pub struct Control {
 /// `reported` receives the bytes this call moved, so the caller can attribute
 /// progress. `done` is bumped in place as bytes land.
 #[allow(clippy::too_many_arguments)]
+/// Where a worker reports how far it has written a segment.
+///
+/// The plan is only persisted between rounds, so without a live counter a pause
+/// inside a round would forget every byte of the segment in flight.
+pub struct Tap {
+    pub index: usize,
+    /// Segment start as the worker first saw it; reported bytes are relative.
+    pub base: u64,
+    pub bytes: Arc<Vec<std::sync::atomic::AtomicU64>>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_segment(
     source: &Arc<dyn Source>,
     segment: Segment,
@@ -381,6 +393,7 @@ pub async fn run_segment(
     done: &std::sync::atomic::AtomicU64,
     token: &CancellationToken,
     control: &Control,
+    tap: Option<&Tap>,
 ) -> Result<(), FetchError> {
     let mut cursor = segment.start;
     let mut threshold = control.slow_threshold;
@@ -408,6 +421,7 @@ pub async fn run_segment(
                     handle,
                     segment,
                     &mut cursor,
+                    tap,
                     sink,
                     limiter,
                     done,
@@ -486,6 +500,7 @@ async fn drain(
     handle: crate::providers::DownloadHandle,
     segment: Segment,
     cursor: &mut u64,
+    tap: Option<&Tap>,
     sink: &Sink,
     limiter: &Limiter,
     done: &std::sync::atomic::AtomicU64,
@@ -541,6 +556,7 @@ async fn drain(
         buffer: &mut Vec<u8>,
         buffer_at: u64,
         cursor: &mut u64,
+        tap: Option<&Tap>,
         sink: &Sink,
         limiter: &Limiter,
         done: &std::sync::atomic::AtomicU64,
@@ -554,6 +570,9 @@ async fn drain(
             .await
             .map_err(FetchError::Failed)?;
         *cursor += flushed;
+        if let Some(tap) = tap {
+            tap.bytes[tap.index].store(*cursor - tap.base, Ordering::Relaxed);
+        }
         done.fetch_add(flushed, Ordering::Relaxed);
         limiter.acquire(flushed).await;
         Ok(())
@@ -608,7 +627,7 @@ async fn drain(
         window_bytes += take as u64;
 
         if buffer.len() >= FLUSH_BYTES {
-            flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
+            flush(&mut buffer, buffer_at, cursor, tap, sink, limiter, done).await?;
         }
 
         // Judged on arrival, so a connection that is too slow to fill a flush
@@ -623,7 +642,7 @@ async fn drain(
             // flush buffer: `done` is what the UI turns into a speed, and a
             // segment smaller than `FLUSH_BYTES` would otherwise hold its
             // bytes back until the whole segment landed.
-            flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
+            flush(&mut buffer, buffer_at, cursor, tap, sink, limiter, done).await?;
             // The short first window is a report, not a verdict: it is too
             // brief to tell a burst from a healthy connection, and a
             // reconnect here would churn the whole pool at start.
@@ -659,7 +678,7 @@ async fn drain(
                     // Whatever is buffered belongs to this segment and is about
                     // to be fetched again by the next connection: write it so
                     // the reopen starts from the true offset.
-                    flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
+                    flush(&mut buffer, buffer_at, cursor, tap, sink, limiter, done).await?;
                     return Err(FetchError::Slow { bps });
                 }
             }
@@ -674,7 +693,7 @@ async fn drain(
         }
     }
 
-    flush(&mut buffer, buffer_at, cursor, sink, limiter, done).await?;
+    flush(&mut buffer, buffer_at, cursor, tap, sink, limiter, done).await?;
 
     if *cursor < segment.end {
         return Err(FetchError::Short {
@@ -911,6 +930,7 @@ mod tests {
             handle,
             segment,
             &mut cursor,
+            None,
             &sink,
             &Limiter::new(),
             &done,
@@ -1009,6 +1029,7 @@ mod tests {
                     handle,
                     segment,
                     &mut cursor,
+                    None,
                     &sink,
                     &Limiter::new(),
                     &done,

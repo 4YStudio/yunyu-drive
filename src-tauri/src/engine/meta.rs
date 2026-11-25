@@ -46,6 +46,13 @@ pub struct Progress {
     /// fetch it — the pool would serialise onto one segment instead of fanning
     /// out, and the extra copies would write the same bytes concurrently.
     claimed: Vec<bool>,
+    /// Bytes already written into a segment that is *not* finished yet.
+    ///
+    /// Without this a pause only saved the segments that had completed: with a
+    /// single connection the file is one huge segment, so a pause after 500 MB
+    /// recorded almost nothing and the next attempt started over — the "8 MB
+    /// resume" users saw was just the fine head pieces that had finished.
+    written: Vec<u64>,
     /// Set when a segment finished since the last successful write.
     dirty: bool,
 }
@@ -62,12 +69,14 @@ impl Progress {
     pub fn with_source(total: u64, segments: Vec<Segment>, source: String) -> Self {
         let done = vec![false; segments.len()];
         let claimed = vec![false; segments.len()];
+        let written = vec![0; segments.len()];
         Self {
             total,
             source,
             segments,
             done,
             claimed,
+            written,
             dirty: true,
         }
     }
@@ -133,17 +142,58 @@ impl Progress {
         let bits = value.get("done").and_then(|v| v.as_str()).unwrap_or("");
         let done = decode_bits(bits, segments.len());
         let claimed = vec![false; segments.len()];
+        let mut written: Vec<u64> = value
+            .get("written")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(|v| v.as_u64().unwrap_or(0)).collect())
+            .unwrap_or_default();
+        written.resize(segments.len(), 0);
+        for (bytes, seg) in written.iter_mut().zip(segments.iter()) {
+            *bytes = (*bytes).min(seg.len());
+        }
         Some(Self {
             total,
             source,
             segments,
             done,
             claimed,
+            written,
             dirty: false,
         })
     }
 
     /// Bytes confirmed complete so far.
+    /// Bytes on disk for this file: finished segments plus whatever the
+    /// running ones have already written.
+    pub fn bytes(&self) -> u64 {
+        self.segments
+            .iter()
+            .enumerate()
+            .map(|(index, seg)| {
+                if self.is_done(index) {
+                    seg.len()
+                } else {
+                    self.written.get(index).copied().unwrap_or(0)
+                }
+            })
+            .sum()
+    }
+
+    /// Adds the bytes a worker wrote into `index` since the round began.
+    pub fn extend(&mut self, index: usize, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(slot) = self.written.get_mut(index) {
+            let cap = self.segments[index].len();
+            let next = (*slot + bytes).min(cap);
+            if next != *slot {
+                *slot = next;
+                self.dirty = true;
+            }
+        }
+    }
+
     pub fn completed(&self) -> u64 {
         self.segments
             .iter()
@@ -169,7 +219,17 @@ impl Progress {
                 continue;
             }
             self.claimed[index] = true;
-            return Some((index, self.segments[index]));
+            // Continue from where the last attempt stopped instead of
+            // re-fetching bytes that are already on disk.
+            let seg = self.segments[index];
+            let done_here = self.written[index].min(seg.len());
+            return Some((
+                index,
+                Segment {
+                    start: seg.start + done_here,
+                    end: seg.end,
+                },
+            ));
         }
         None
     }
@@ -197,6 +257,9 @@ impl Progress {
         if let Some(flag) = self.claimed.get_mut(index) {
             *flag = false;
         }
+        if let Some(bytes) = self.written.get_mut(index) {
+            *bytes = 0;
+        }
         self.completed()
     }
 
@@ -223,7 +286,7 @@ impl Progress {
             // A claimed segment is being written right now: cutting it would
             // leave the worker writing past its new end, which is the race
             // that produces a file of the right length with holes in it.
-            if self.is_done(index) || self.claimed[index] {
+            if self.is_done(index) || self.claimed[index] || self.written[index] > 0 {
                 continue;
             }
             let len = seg.len();
@@ -252,6 +315,7 @@ impl Progress {
         );
         self.done.insert(index + 1, false);
         self.claimed.insert(index + 1, false);
+        self.written.insert(index + 1, 0);
         self.dirty = true;
         true
     }
@@ -277,6 +341,7 @@ impl Progress {
             "source": self.source,
             "segments": segments,
             "done": encode_bits(&self.done),
+            "written": self.written,
         });
         let text = serde_json::to_string(&value).unwrap_or_default();
         // Written to a temporary name and renamed into place. A plain write
@@ -379,6 +444,31 @@ mod tests {
         progress.mark(2);
         assert!(progress.finished());
         assert_eq!(progress.completed(), 35);
+    }
+
+    /// A pause must keep the bytes of the segment that was still in flight —
+    /// the "resume always restarts at the 8 MB head" bug was exactly this: only
+    /// finished segments were saved.
+    #[test]
+    fn a_partial_segment_resumes_from_the_bytes_it_wrote() {
+        let dir = std::env::temp_dir().join(format!("yyparts-half-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("file.bin.part");
+
+        let mut progress = Progress::new(35, segs());
+        progress.mark(0);
+        progress.save(&part).unwrap();
+        progress.extend(1, 12);
+        progress.save(&part).unwrap();
+        assert_eq!(progress.bytes(), 10 + 12);
+
+        let mut loaded = Progress::load(&part).expect("sidecar should load");
+        assert_eq!(loaded.bytes(), 22, "the partially written segment counts");
+        let (index, segment) = loaded.claim().unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(segment.start, 22, "continue inside the interrupted segment");
+        assert_eq!(segment.end, 30);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

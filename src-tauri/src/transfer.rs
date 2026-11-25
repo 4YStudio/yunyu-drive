@@ -805,11 +805,12 @@ impl TransferManager {
             part_path = resume_path;
         }
         // Bytes already on disk count immediately, otherwise the progress bar
-        // jumps from 0 to a large number on the first tick.
-        let start = tokio::fs::metadata(&part_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        // jumps from 0 to a large number on the first tick. The part file is
+        // pre-allocated, so its length is the *whole* file from the start; the
+        // plan is the only thing that knows how much of it is real. Seeding
+        // from the length made the bar show the full size and then drop back
+        // the moment the engine reported the truth.
+        let start = crate::engine::plan_bytes(&part_path);
 
         let task = TransferTask {
             id: id.clone(),
