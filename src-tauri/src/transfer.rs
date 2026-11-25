@@ -1060,12 +1060,19 @@ impl TransferManager {
             });
         }
 
-        let mut live: Vec<String> = Vec::new();
+        // Bytes are kept per file and never decrease. A file that was half
+        // downloaded, paused and then resumed used to be counted once for the
+        // half and again for the whole, which is why "已下载" jumped after every
+        // pause; keying by file makes the number monotonic.
+        let mut stored: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut done_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut failed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // (child id, file key): the key is what ties a child back to its file.
+        let mut live: Vec<(String, String)> = Vec::new();
         let mut walking = true;
         let mut made_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        let mut bytes_finished = 0u64;
-        let mut done = 0u64;
-        let mut failed = 0u64;
+        let mut bytes_total = 0u64;
+        let (mut done, mut failed) = (0u64, 0u64);
         let mut first_error: Option<String> = None;
 
         loop {
@@ -1075,14 +1082,16 @@ impl TransferManager {
             if !self.folder_is_current(&id, generation).await {
                 // A newer run took the folder over. Hand its children back and
                 // leave the row alone: the new loop is the one reporting now.
-                self.drop_children(&live, "canceled").await;
+                let ids: Vec<String> = live.iter().map(|(cid, _)| cid.clone()).collect();
+                self.drop_children(&ids, "canceled").await;
                 return;
             }
             let can_take = walking && live.len() < FOLDER_WINDOW;
             tokio::select! {
                 biased;
                 _ = token.cancelled() => {
-                    self.drop_children(&live, "canceled").await;
+                    let ids: Vec<String> = live.iter().map(|(cid, _)| cid.clone()).collect();
+                self.drop_children(&ids, "canceled").await;
                     // The command that cancelled us already set the status; only
                     // the folder-specific fields are ours to clear.
                     self.patch(&id, &app, |t| {
@@ -1106,13 +1115,14 @@ impl TransferManager {
                         } else {
                             crate::paths::safe_join(&root, &file.relative_dir)
                         };
+                        let key = file_key(&file.relative_dir, &file.name);
                         if file_complete(&dir.join(&file.name), file.size).await {
-                            done += 1;
-                            bytes_finished += file.size;
+                            stored.insert(key.clone(), file.size);
+                            done_files.insert(key);
                         } else if made_dirs.insert(dir.clone())
                             && tokio::fs::create_dir_all(&dir).await.is_err()
                         {
-                            failed += 1;
+                            failed_files.insert(key);
                         } else {
                             let job = DownloadJob {
                                 fid: crate::providers::qualify(provider, &file.fid),
@@ -1139,10 +1149,10 @@ impl TransferManager {
                                         t.parent = Some(id.clone());
                                     })
                                     .await;
-                                    live.push(cid);
+                                    live.push((cid, key));
                                 }
                                 Err(err) => {
-                                    failed += 1;
+                                    failed_files.insert(key);
                                     first_error.get_or_insert_with(|| err.to_string());
                                 }
                             }
@@ -1162,42 +1172,66 @@ impl TransferManager {
             let states = {
                 let tasks = self.tasks.read().await;
                 live.iter()
-                    .filter_map(|cid| {
+                    .filter_map(|(cid, key)| {
                         tasks.get(cid).map(|t| {
-                            (cid.clone(), t.status.clone(), t.transferred, t.size, t.error.clone())
+                            (
+                                cid.clone(),
+                                key.clone(),
+                                t.status.clone(),
+                                t.transferred,
+                                t.size,
+                                t.error.clone(),
+                            )
                         })
                     })
                     .collect::<Vec<_>>()
             };
-            for (cid, status, transferred, size, error) in states {
+            for (cid, key, status, transferred, size, error) in states {
                 match status.as_str() {
                     "done" => {
-                        done += 1;
-                        bytes_finished += size;
+                        stored.insert(key.clone(), size.max(transferred));
+                        done_files.insert(key.clone());
+                        failed_files.remove(&key);
                     }
+                    // A cancelled or failed attempt keeps the bytes it did
+                    // write: the file is retried later, but those bytes are
+                    // already on disk and must not be added twice.
                     "failed" | "canceled" => {
-                        failed += 1;
-                        bytes_finished += transferred;
-                        if let Some(err) = error.filter(|e| !e.is_empty()) {
-                            first_error.get_or_insert(err);
+                        let known = stored.get(&key).copied().unwrap_or(0);
+                        stored.insert(key.clone(), known.max(transferred));
+                        if status == "failed" {
+                            failed_files.insert(key.clone());
+                            if let Some(err) = error.filter(|e| !e.is_empty()) {
+                                first_error.get_or_insert(err);
+                            }
                         }
                     }
                     _ => continue,
                 }
                 self.tasks.write().await.remove(&cid);
-                live.retain(|x| x != &cid);
+                live.retain(|(x, _)| x != &cid);
             }
 
-            // Announce the folder's own numbers, not its children's.
-            let (live_bytes, live_speed) = {
+            // Announce the folder's own numbers, not its children's. A child
+            // that resumes a half-done file only adds the difference between
+            // what it has now and what was already counted.
+            let (live_speed, live_pairs) = {
                 let tasks = self.tasks.read().await;
-                live.iter().filter_map(|cid| tasks.get(cid)).fold(
-                    (0u64, 0f64),
-                    |(bytes, speed), t| (bytes + t.transferred, speed + t.speed),
-                )
+                let mut speed = 0.0;
+                let mut pairs = Vec::new();
+                for (cid, key) in &live {
+                    if let Some(t) = tasks.get(cid) {
+                        speed += t.speed;
+                        pairs.push((key.clone(), t.transferred));
+                    }
+                }
+                (speed, pairs)
             };
-            let transferred = bytes_finished + live_bytes;
+            let transferred = folder_bytes(&stored, &live_pairs);
+            bytes_total = transferred;
             let size = bytes_found.max(transferred);
+            done = done_files.len() as u64;
+            failed = failed_files.len() as u64;
             let listing = walking;
             self.patch(&id, &app, move |t| {
                 t.transferred = transferred;
@@ -1236,8 +1270,8 @@ impl TransferManager {
             t.children_total = total;
             t.children_done = done;
             t.children_failed = failed;
-            t.transferred = bytes_finished;
-            t.size = bytes_found.max(bytes_finished);
+            t.transferred = bytes_total;
+            t.size = bytes_found.max(bytes_total);
         })
         .await;
     }
@@ -2011,6 +2045,26 @@ async fn walk_folder(
             append_dir_record(path, &fid, &subs).await;
         }
     }
+}
+
+/// Bytes the folder really has on disk.
+///
+/// `stored` holds what each file reached in a settled attempt, `live` what the
+/// running children report. Taking the larger of the two is what keeps a
+/// resumed file from being counted twice — once for the bytes it had when it
+/// was paused and again for the whole file now.
+fn folder_bytes(
+    stored: &std::collections::HashMap<String, u64>,
+    live: &[(String, u64)],
+) -> u64 {
+    let mut bytes: u64 = stored.values().sum();
+    for (key, transferred) in live {
+        let known = stored.get(key).copied().unwrap_or(0);
+        if *transferred > known {
+            bytes += transferred - known;
+        }
+    }
+    bytes
 }
 
 /// Identity of a file inside the folder: two records with the same key are the
@@ -3076,6 +3130,23 @@ mod tests {
         ) -> AppResult<Option<String>> {
             Err(AppError::new("不支持"))
         }
+    }
+
+    /// Pausing and resuming a file must not add its bytes twice: the user saw
+    /// "已下载" jump by hundreds of MB every time they hit continue.
+    #[test]
+    fn folder_bytes_never_double_counts_a_resumed_file() {
+        let mut stored = std::collections::HashMap::new();
+        stored.insert("a.mp4".to_string(), 70_000_000u64);
+        stored.insert("b.mp4".to_string(), 5_000_000u64);
+        // "a" is running again from 70 MB; "b" finished at its full size.
+        let live = vec![("a.mp4".to_string(), 70_000_000u64), ("b.mp4".to_string(), 10_000_000u64)];
+        assert_eq!(folder_bytes(&stored, &live), 80_000_000);
+        // Fresh progress from a restarted download counts once, as a delta.
+        let live = vec![("a.mp4".to_string(), 12_000_000u64)];
+        assert_eq!(folder_bytes(&stored, &live), 75_000_000);
+        // Nothing running: the settled numbers stand.
+        assert_eq!(folder_bytes(&stored, &[]), 75_000_000);
     }
 
     /// A directory the sidecar already recorded is walked from memory: the
