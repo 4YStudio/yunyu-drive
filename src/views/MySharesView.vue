@@ -2,12 +2,14 @@
 import { computed, onActivated, ref, watch } from "vue";
 
 import Icon from "@/components/Icon.vue";
+import ChunkFooter from "@/components/ChunkFooter.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import DriveLoader from "@/components/DriveLoader.vue";
 import Modal from "@/components/Modal.vue";
 import { api } from "@/lib/backend";
 import { copyText } from "@/lib/clipboard";
 import { errText, formatFullDate } from "@/lib/format";
+import { useChunkedRows } from "@/lib/progressive";
 import { PROVIDERS, type ShareRecord } from "@/lib/types";
 import { app, activeProviderState, toast } from "@/store/app";
 
@@ -50,6 +52,26 @@ const supported = computed(() => state.value?.capabilities.shareCreate !== false
 const live = computed(() => rows.value.filter((row) => !row.expired));
 const dead = computed(() => rows.value.filter((row) => row.expired));
 
+/**
+ * Cards are mounted in chunks: an account that shares a lot ends up with a list
+ * long enough to stall the window while WebKit lays it out.
+ */
+const {
+  rows: pagedLive,
+  rest: liveRest,
+  more: liveMore,
+  reset: resetLive,
+  onScroll,
+} = useChunkedRows(live, { resetKey: () => app.activeProvider });
+
+/** Expired shares sit in a collapsed `<details>`, so they page on click only. */
+const {
+  rows: pagedDead,
+  rest: deadRest,
+  more: deadMore,
+  reset: resetDead,
+} = useChunkedRows(dead, { chunk: 50, resetKey: () => app.activeProvider });
+
 function reset() {
   rows.value = [];
   error.value = null;
@@ -67,6 +89,8 @@ async function load() {
   try {
     const records = await api.shareRecords(app.activeProvider);
     rows.value = records.filter((row) => !revoked.has(row.shareId));
+    resetLive();
+    resetDead();
   } catch (err) {
     error.value = errText(err);
     rows.value = [];
@@ -159,7 +183,7 @@ watch(
       </button>
     </header>
 
-    <div class="body">
+    <div class="body" @scroll.passive="onScroll">
       <div v-if="loading && !rows.length" class="state">
         <DriveLoader :provider="app.activeProvider" caption="正在读取分享列表" />
       </div>
@@ -197,7 +221,7 @@ watch(
       <template v-else>
         <div class="list">
           <article
-            v-for="row in live"
+            v-for="row in pagedLive"
             :key="row.shareId"
             class="card"
           >
@@ -238,12 +262,14 @@ watch(
               </button>
             </div>
           </article>
+
+          <ChunkFooter :mounted="pagedLive.length" :rest="liveRest" noun="条分享" @more="liveMore()" />
         </div>
 
         <details v-if="dead.length" class="expired">
           <summary>已过期的分享（{{ dead.length }}）</summary>
           <div class="list">
-            <article v-for="row in dead" :key="row.shareId" class="card card--dead">
+            <article v-for="row in pagedDead" :key="row.shareId" class="card card--dead">
               <div class="card-main">
                 <div class="card-head">
                   <span class="card-title truncate" :title="row.title">{{ row.title }}</span>
@@ -260,6 +286,8 @@ watch(
                 </button>
               </div>
             </article>
+
+            <ChunkFooter :mounted="pagedDead.length" :rest="deadRest" noun="条" @more="deadMore()" />
           </div>
         </details>
       </template>

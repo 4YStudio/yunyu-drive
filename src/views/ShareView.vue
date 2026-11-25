@@ -7,12 +7,14 @@ import { rowEnter, rowTransition } from "@/lib/motion";
 import Icon from "@/components/Icon.vue";
 import Avatar from "@/components/Avatar.vue";
 import FileIcon from "@/components/FileIcon.vue";
+import ChunkFooter from "@/components/ChunkFooter.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import { api } from "@/lib/backend";
 import { errText } from "@/lib/format";
 import { PROVIDERS } from "@/lib/types";
 import type { ShareEntry, ShareListing, ShareSession } from "@/lib/types";
 import { formatDate, formatSize, fileKind, kindLabel } from "@/lib/format";
+import { useChunkedRows } from "@/lib/progressive";
 import { app, refreshQuota, requestFilesRefresh, toast } from "@/store/app";
 
 const link = ref("");
@@ -24,6 +26,7 @@ const error = ref<string | null>(null);
 const session = ref<ShareSession | null>(null);
 const listing = ref<ShareListing | null>(null);
 const crumbs = ref<{ fid: string; name: string }[]>([]);
+
 const selected = ref<Set<string>>(new Set());
 const saving = ref(false);
 const downloading = ref(false);
@@ -32,6 +35,16 @@ const provider = computed(
   () => PROVIDERS.find((p) => p.id === session.value?.provider) ?? null,
 );
 const rows = computed(() => listing.value?.entries ?? []);
+/**
+ * A share can hold the same thousands of entries as a drive folder, and the
+ * listing is read all at once, so the rows are mounted in chunks too.
+ */
+const {
+  rows: pagedRows,
+  rest,
+  more,
+  onScroll,
+} = useChunkedRows(rows, { resetKey: () => crumbs.value.map((c) => c.fid).join(">") });
 const selectedEntries = computed(() =>
   rows.value.filter((entry) => selected.value.has(entry.fid)),
 );
@@ -397,13 +410,13 @@ watch(
           <span class="col col--date">修改时间</span>
         </div>
 
-        <div class="list-body">
+        <div class="list-body" @scroll.passive="onScroll">
           <div v-if="!rows.length" class="state">
             <EmptyState icon="folder" title="这个文件夹是空的" description="分享内容可能还在上传中。" />
           </div>
           <div v-else class="rows">
             <motion.div
-              v-for="(entry, i) in rows"
+              v-for="(entry, i) in pagedRows"
               :key="entry.fid"
               class="row"
               :class="{ 'row--selected': selected.has(entry.fid) }"
@@ -435,6 +448,8 @@ watch(
               </div>
               <div class="cell cell--date">{{ formatDate(entry.updatedAt) }}</div>
             </motion.div>
+
+            <ChunkFooter :mounted="pagedRows.length" :rest="rest" noun="文件" @more="more()" />
           </div>
         </div>
 

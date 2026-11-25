@@ -18,6 +18,26 @@ use crate::paths::unique_path;
 
 pub const EVENT_TRANSFER: &str = "transfer://update";
 pub const EVENT_REMOVED: &str = "transfer://removed";
+/// Many tasks at once.
+///
+/// Downloading a folder that holds thousands of files used to announce every
+/// task with its own event: the renderer then inserted them one by one into a
+/// list that re-rendered each time, which is what made the window freeze after
+/// "已加入下载队列 2999 项". One payload per batch keeps that cost linear.
+pub const EVENT_TRANSFERS: &str = "transfer://batch";
+/// Many removals at once, same reason.
+pub const EVENT_REMOVED_MANY: &str = "transfer://removed-many";
+/// Progress while a folder is being walked before its tasks appear.
+pub const EVENT_SCAN: &str = "transfer://scan";
+
+/// Payload of [`EVENT_SCAN`]: the folder being expanded and how many files have
+/// been found so far.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    pub name: String,
+    pub found: usize,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +150,10 @@ pub struct TransferManager {
     /// Where finished tasks are remembered between launches.
     store: Option<PathBuf>,
 }
+
+/// Upper bound on tasks written to `transfers.json`. Bounds the file at a few
+/// hundred KiB while still keeping a whole large queue alive across restarts.
+const PERSIST_LIMIT: usize = 4000;
 
 /// Process-wide speed cap in bytes per second (0 = unlimited).
 ///
@@ -307,8 +331,17 @@ impl TransferManager {
             let tasks = self.tasks.read().await;
             let mut all: Vec<TransferTask> = tasks.values().cloned().collect();
             all.sort_by_key(|t| std::cmp::Reverse(t.created_at));
-            all.truncate(100);
-            all
+            // Unfinished work must survive a restart: its `.part` file is on
+            // disk and the record is the only way back to it. Truncating the
+            // whole list at 100 used to silently drop 2899 of a 3000-file folder
+            // download. History keeps the most recent handful instead.
+            let (unfinished, finished): (Vec<TransferTask>, Vec<TransferTask>) = all
+                .into_iter()
+                .partition(|t| !matches!(t.status.as_str(), "done" | "failed" | "canceled"));
+            let mut keep = unfinished;
+            keep.extend(finished.into_iter().take(100));
+            keep.truncate(PERSIST_LIMIT);
+            keep
         };
         if let Ok(text) = serde_json::to_string(&snapshot) {
             // Write through a temp file so a crash mid-write cannot leave a
@@ -368,7 +401,10 @@ impl TransferManager {
                 biased;
                 _ = token.cancelled() => return None,
                 _ = self.notify.notified() => {}
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                // A fallback only: the notify above is what actually frees a
+                // waiter. Polling every 250ms meant a 3000-file folder woke
+                // every parked task 12000 times a second.
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
     }
@@ -454,6 +490,97 @@ impl TransferManager {
         Ok(())
     }
 
+    /// Pauses many tasks at once, returning the ones that changed.
+    ///
+    /// The caller announces the whole batch with one event: pausing a 3000-file
+    /// queue used to send 3000 updates, each re-rendering the list.
+    pub async fn pause_many(&self, ids: &[String]) -> Vec<TransferTask> {
+        for id in ids {
+            self.cancel(id).await;
+        }
+        let changed = {
+            let mut tasks = self.tasks.write().await;
+            let mut changed = Vec::new();
+            for id in ids {
+                if let Some(task) = tasks.get_mut(id) {
+                    if matches!(task.status.as_str(), "queued" | "running" | "hashing") {
+                        task.status = "paused".to_string();
+                        task.error = None;
+                        task.speed = 0.0;
+                        task.updated_at = now_millis();
+                        changed.push(task.clone());
+                    }
+                }
+            }
+            changed
+        };
+        if !changed.is_empty() {
+            self.persist().await;
+        }
+        changed
+    }
+
+    /// Cancels many tasks at once, returning the ones that changed.
+    pub async fn cancel_many(&self, ids: &[String]) -> Vec<TransferTask> {
+        for id in ids {
+            self.cancel(id).await;
+        }
+        let changed = {
+            let mut tasks = self.tasks.write().await;
+            let mut changed = Vec::new();
+            for id in ids {
+                if let Some(task) = tasks.get_mut(id) {
+                    if matches!(task.status.as_str(), "queued" | "running" | "hashing") {
+                        task.status = "canceled".to_string();
+                        task.speed = 0.0;
+                        task.updated_at = now_millis();
+                        changed.push(task.clone());
+                    }
+                }
+            }
+            changed
+        };
+        if !changed.is_empty() {
+            self.persist().await;
+        }
+        changed
+    }
+
+    /// Drops many task records (and their partial files), returning the ids that
+    /// actually existed.
+    pub async fn remove_many(&self, ids: &[String]) -> Vec<String> {
+        let mut removed = Vec::new();
+        let mut discarded = Vec::new();
+        let mut stopped = false;
+        for id in ids {
+            if self.cancel(id).await {
+                stopped = true;
+            }
+        }
+        // Same beat as `remove`: let the workers close their handles first — but
+        // one beat for the whole batch, not one per task, or removing a thousand
+        // running downloads would take two minutes.
+        if stopped {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        {
+            let mut tasks = self.tasks.write().await;
+            for id in ids {
+                if let Some(task) = tasks.remove(id) {
+                    removed.push(id.clone());
+                    discarded.push(task);
+                }
+            }
+        }
+        for task in discarded {
+            discard_partial(&task).await;
+        }
+        if !removed.is_empty() {
+            self.persist().await;
+        }
+        removed
+    }
+
     /// Cancels a running worker. Returns whether one was actually running.
     async fn cancel(&self, id: &str) -> bool {
         match self.cancels.lock().await.remove(id) {
@@ -497,6 +624,30 @@ impl TransferManager {
         app: AppHandle,
         ctx: DownloadCtx,
         job: DownloadJob,
+    ) -> AppResult<TransferTask> {
+        self.start_download_task(app, ctx, job, true).await
+    }
+
+    /// Starts a download without sending its own event.
+    ///
+    /// A folder download expands into one task per file; announcing each of them
+    /// separately is what flooded the renderer. The caller collects the tasks
+    /// and sends a single [`EVENT_TRANSFERS`] instead.
+    pub async fn start_download_quiet(
+        self: &Arc<Self>,
+        app: AppHandle,
+        ctx: DownloadCtx,
+        job: DownloadJob,
+    ) -> AppResult<TransferTask> {
+        self.start_download_task(app, ctx, job, false).await
+    }
+
+    async fn start_download_task(
+        self: &Arc<Self>,
+        app: AppHandle,
+        ctx: DownloadCtx,
+        job: DownloadJob,
+        announce: bool,
     ) -> AppResult<TransferTask> {
         let id = self.next_id().await;
         let target_dir = PathBuf::from(&job.dir);
@@ -543,7 +694,9 @@ impl TransferManager {
             cross: None,
         };
         let task = self.insert(task).await;
-        task.emit(&app);
+        if announce {
+            task.emit(&app);
+        }
 
         self.spawn_download(
             app,

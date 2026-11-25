@@ -4,11 +4,13 @@ import { computed, onActivated, ref, watch } from "vue";
 import { motion } from "motion-v";
 import { rowEnter } from "@/lib/motion";
 import Icon from "@/components/Icon.vue";
+import ChunkFooter from "@/components/ChunkFooter.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import DriveLoader from "@/components/DriveLoader.vue";
 import Modal from "@/components/Modal.vue";
 import { api } from "@/lib/backend";
 import { errText, formatFullDate, formatSize } from "@/lib/format";
+import { useChunkedRows } from "@/lib/progressive";
 import { PROVIDERS, type RecycleEntry } from "@/lib/types";
 import { app, activeProviderState, refreshQuota, requestFilesRefresh, toast } from "@/store/app";
 
@@ -27,6 +29,20 @@ const busy = ref(false);
 const error = ref<string | null>(null);
 const selected = ref<Set<string>>(new Set());
 const confirmClear = ref(false);
+
+/** Entries fetched per request; the bin is read incrementally. */
+const PAGE = 100;
+const hasMore = ref(true);
+const loadingMore = ref(false);
+
+/** Mounted rows are chunked too: a few hundred bin entries already stall WebKit. */
+const {
+  rows: pagedRows,
+  rest,
+  more,
+  reset: resetWindow,
+  onScroll,
+} = useChunkedRows(rows, { resetKey: () => app.activeProvider });
 
 const provider = computed(
   () => PROVIDERS.find((p) => p.id === app.activeProvider) ?? PROVIDERS[0],
@@ -59,13 +75,40 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    rows.value = await api.recycleList(app.activeProvider, 0, 200);
+    rows.value = await api.recycleList(app.activeProvider, 0, PAGE);
+    hasMore.value = rows.value.length >= PAGE;
     selected.value = new Set();
+    resetWindow();
   } catch (err) {
     error.value = errText(err);
     rows.value = [];
+    hasMore.value = false;
   } finally {
     loading.value = false;
+  }
+}
+
+/**
+ * Appends the next page.
+ *
+ * The bin can hold tens of thousands of entries and used to be asked for 200 in
+ * one shot — everything past that simply never appeared.
+ */
+async function loadMore() {
+  if (!hasMore.value || loadingMore.value) return;
+  loadingMore.value = true;
+  try {
+    const next = await api.recycleList(app.activeProvider, rows.value.length, PAGE);
+    if (next.length === 0) hasMore.value = false;
+    else {
+      rows.value = [...rows.value, ...next];
+      hasMore.value = next.length >= PAGE;
+    }
+  } catch (err) {
+    toast(errText(err), "error");
+    hasMore.value = false;
+  } finally {
+    loadingMore.value = false;
   }
 }
 
@@ -202,7 +245,7 @@ watch(
       </div>
     </div>
 
-    <div class="body">
+    <div class="body" @scroll.passive="onScroll">
       <div v-if="loading && !rows.length" class="state">
         <DriveLoader :provider="app.activeProvider" caption="正在读取回收站" />
       </div>
@@ -239,7 +282,7 @@ watch(
 
       <div v-else class="rows">
         <motion.button
-          v-for="(row, i) in rows"
+          v-for="(row, i) in pagedRows"
           :key="row.fid"
           class="row"
           :class="{ 'row--on': selected.has(row.fid) }"
@@ -254,6 +297,16 @@ watch(
           <span class="row-size mono">{{ row.isDir ? "—" : formatSize(row.size) }}</span>
           <span class="row-time mono">{{ formatFullDate(row.deletedAt) }}</span>
         </motion.button>
+
+        <ChunkFooter :mounted="pagedRows.length" :rest="rest" noun="项" @more="more()" />
+        <button
+          v-if="hasMore"
+          class="more-bin"
+          :disabled="loadingMore"
+          @click="loadMore"
+        >
+          {{ loadingMore ? "正在读取…" : "加载更多回收站条目" }}
+        </button>
       </div>
     </div>
 
@@ -319,6 +372,21 @@ watch(
 }
 .actions-right {
   flex-wrap: nowrap;
+}
+.more-bin {
+  align-self: center;
+  margin: 10px 0 4px;
+  padding: 6px 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--bg-sunken);
+  box-shadow: inset 0 0 0 1px var(--line);
+  font-size: 11.5px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.more-bin:hover {
+  color: var(--text-1);
 }
 .body {
   flex: 1;

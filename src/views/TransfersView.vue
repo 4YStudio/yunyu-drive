@@ -4,13 +4,15 @@ import { computed, onActivated, onMounted, ref } from "vue";
 import { motion } from "motion-v";
 import { barTransition, rowEnter } from "@/lib/motion";
 import Icon from "@/components/Icon.vue";
+import ChunkFooter from "@/components/ChunkFooter.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import Segmented from "@/components/Segmented.vue";
 import { api } from "@/lib/backend";
 import { openFile, revealPath } from "@/lib/host";
 import { PROVIDERS, type TransferTask } from "@/lib/types";
 import { errText, formatSize, formatSpeed, formatEta } from "@/lib/format";
-import { app, refreshTransfers, toast } from "@/store/app";
+import { useChunkedRows } from "@/lib/progressive";
+import { app, forgetTransfers, refreshTransfers, toast } from "@/store/app";
 
 /**
  * Two independent axes, as two rows of tabs:
@@ -37,6 +39,91 @@ const visible = computed(() => {
     return true;
   });
 });
+
+/**
+ * Only the first chunk is mounted; a folder download can add thousands of rows
+ * in one go and WebKitGTK stalls laying them all out at once.
+ */
+const {
+  rows: pagedRows,
+  rest,
+  more,
+  onScroll,
+} = useChunkedRows(visible, {
+  resetKey: () => `${kindFilter.value}|${statusFilter.value}`,
+});
+
+/** Ids ticked for a batch action. */
+const selected = ref<Set<string>>(new Set());
+const picked = computed(() => visible.value.filter((task) => selected.value.has(task.id)));
+const selectedAll = computed(
+  () => visible.value.length > 0 && picked.value.length === visible.value.length,
+);
+
+function toggleSelect(task: TransferTask) {
+  const next = new Set(selected.value);
+  if (next.has(task.id)) next.delete(task.id);
+  else next.add(task.id);
+  selected.value = next;
+}
+
+function toggleSelectAll() {
+  selected.value = selectedAll.value ? new Set() : new Set(visible.value.map((t) => t.id));
+}
+
+function clearSelection() {
+  selected.value = new Set();
+}
+
+/** Only downloads and cross-drive jobs can pick up where they stopped. */
+function canResume(task: TransferTask) {
+  return isDownload(task) || isCross(task);
+}
+
+const bulkBusy = ref(false);
+
+/**
+ * One IPC call for the whole selection.
+ *
+ * Doing it per task meant thousands of round trips and thousands of events; the
+ * backend pauses/cancels in one pass and announces the batch once.
+ */
+async function bulk(action: "pause" | "cancel" | "remove" | "resume") {
+  const list = picked.value;
+  if (!list.length || bulkBusy.value) return;
+  bulkBusy.value = true;
+  try {
+    if (action === "resume") {
+      const runnable = list.filter(canResume).map((t) => t.id);
+      const skipped = list.length - runnable.length;
+      if (!runnable.length) {
+        toast("选中的任务都不能续传，上传任务需要重新上传", "error");
+        return;
+      }
+      const n = await api.transferBulk(runnable, "resume");
+      toast(
+        `已继续 ${n} 项${skipped ? `，另有 ${skipped} 项不支持续传` : ""}`,
+        "success",
+      );
+      return;
+    }
+    const ids = list.map((t) => t.id);
+    const n = await api.transferBulk(ids, action);
+    if (action === "remove") {
+      forgetTransfers(ids);
+      clearSelection();
+      toast(`已移除 ${n} 条记录`, "success");
+    } else if (action === "pause") {
+      toast(n ? `已暂停 ${n} 项` : "选中的任务当前都不在运行", "success");
+    } else {
+      toast(n ? `已取消 ${n} 项` : "选中的任务当前都不在运行", "success");
+    }
+  } catch (err) {
+    toast(errText(err), "error");
+  } finally {
+    bulkBusy.value = false;
+  }
+}
 
 const counts = computed(() => ({
   active: all.value.filter((t) => ACTIVE.includes(t.status)).length,
@@ -226,9 +313,30 @@ onActivated(() => {
           { value: 'finished', label: '已完成' },
         ]"
       />
+      <label v-if="visible.length" class="pick pick--all">
+        <input type="checkbox" :checked="selectedAll" @change="toggleSelectAll" />
+        <span>全选 {{ visible.length }} 项</span>
+      </label>
     </div>
 
-    <div class="body">
+    <div v-if="picked.length" class="bulk">
+      <span class="bulk-count">已选 {{ picked.length }} 项</span>
+      <button class="btn btn--ghost bulk-btn" :disabled="bulkBusy" @click="bulk('pause')">
+        暂停
+      </button>
+      <button class="btn btn--ghost bulk-btn" :disabled="bulkBusy" @click="bulk('resume')">
+        继续
+      </button>
+      <button class="btn btn--ghost bulk-btn" :disabled="bulkBusy" @click="bulk('cancel')">
+        取消
+      </button>
+      <button class="btn btn--ghost bulk-btn" :disabled="bulkBusy" @click="bulk('remove')">
+        移除记录
+      </button>
+      <button class="btn btn--ghost bulk-btn" @click="clearSelection">取消选择</button>
+    </div>
+
+    <div class="body" @scroll.passive="onScroll">
       <div v-if="!visible.length" class="state">
         <EmptyState
           icon="arrow-down"
@@ -239,12 +347,19 @@ onActivated(() => {
 
       <div v-else class="tasks">
         <motion.article
-          v-for="(task, i) in visible"
+          v-for="(task, i) in pagedRows"
           :key="task.id"
           class="task"
           :class="`task--${task.status}`"
           v-bind="rowEnter(i)"
         >
+          <label class="pick" @click.stop>
+            <input
+              type="checkbox"
+              :checked="selected.has(task.id)"
+              @change="toggleSelect(task)"
+            />
+          </label>
           <div class="task-glyph">
             <Icon
               :name="isCross(task) ? 'arrow-up-down' : task.kind === 'download' ? 'download' : 'upload'"
@@ -350,6 +465,8 @@ onActivated(() => {
             </button>
           </div>
         </motion.article>
+
+        <ChunkFooter :mounted="pagedRows.length" :rest="rest" noun="传输" @more="more()" />
       </div>
     </div>
   </section>
@@ -393,6 +510,49 @@ onActivated(() => {
   min-height: 0;
   overflow-y: auto;
   padding: 0 24px 24px;
+}
+/* Selection is a mode, so it gets its own strip above the list instead of
+   living in a menu: the actions have to be one click away when a batch of a
+   thousand rows is selected. */
+.bulk {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin: 0 24px 10px;
+  padding: 6px 8px 6px 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.bulk-count {
+  margin-right: 6px;
+  font-size: 11.5px;
+  font-weight: 560;
+  color: var(--text-2);
+}
+.bulk-btn {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11.5px;
+}
+.pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  cursor: pointer;
+}
+.pick input {
+  width: 13px;
+  height: 13px;
+  accent-color: var(--fill);
+  cursor: pointer;
+}
+.pick--all {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-3);
 }
 .state {
   display: grid;

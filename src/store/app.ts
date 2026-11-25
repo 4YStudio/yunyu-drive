@@ -48,6 +48,11 @@ interface AppStore {
   account: AccountInfo | null;
   /** Bumped whenever the file list should refetch (login, share saved, …). */
   filesToken: number;
+  /**
+   * Folder expansion progress: a big folder is walked before its download tasks
+   * exist, and this is what the dialog shows meanwhile.
+   */
+  scan: { name: string; found: number } | null;
   /** A deep-linked share queued for the share view. */
   shareLink: string | null;
   shareNonce: number;
@@ -87,6 +92,7 @@ export const app = reactive<AppStore>({
   sidebarOpen: true,
   account: null,
   filesToken: 0,
+  scan: null,
   shareLink: null,
   shareNonce: 0,
   activeProvider: "quark",
@@ -228,20 +234,78 @@ export async function loadAccount(force = false) {
   }
 }
 
+/**
+ * Progress updates waiting to be merged.
+ *
+ * A folder download once created 2999 tasks at once; ingesting those one by one
+ * meant 2999 passes over a 2999-element reactive array (each pass re-rendering
+ * the list), which froze the window. Everything that arrives within one frame is
+ * merged here and applied as a single update.
+ */
+const pendingTransfers = new Map<string, TransferTask>();
+let flushQueued = false;
+
 export function applyTransfer(task: TransferTask) {
-  const index = app.transfers.findIndex((t) => t.id === task.id);
-  const before = index >= 0 ? app.transfers[index]?.status : undefined;
-  if (index >= 0) app.transfers[index] = task;
-  else app.transfers.unshift(task);
-  // Bytes only hit the drive when a job finishes, and the file list was loaded
-  // before the new entry existed — so both the capacity bar and the listing are
-  // stale the moment this fires. Progress events arrive every few hundred ms,
-  // hence the transition check instead of "status === done".
-  if (task.status === "done" && before !== "done") {
-    // Downloads do not touch the remote side; the other three do.
-    if (task.kind !== "download") refreshQuota(app.activeProvider);
-    requestFilesRefresh();
+  pendingTransfers.set(task.id, task);
+  if (flushQueued) return;
+  flushQueued = true;
+  // `requestAnimationFrame` is what keeps a burst to one update per frame; the
+  // timeout is only a fallback for a hidden window, where rAF never fires.
+  const fire = () => flushTransfers();
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(fire);
+  else setTimeout(fire, 32);
+}
+
+function flushTransfers() {
+  flushQueued = false;
+  if (pendingTransfers.size === 0) return;
+  const batch = [...pendingTransfers.values()];
+  pendingTransfers.clear();
+
+  const index = new Map<string, number>();
+  app.transfers.forEach((task, i) => index.set(task.id, i));
+  const fresh: TransferTask[] = [];
+  let quotaDirty = false;
+  let filesDirty = false;
+
+  for (const task of batch) {
+    const at = index.get(task.id);
+    const before = at === undefined ? undefined : app.transfers[at]?.status;
+    if (at === undefined) {
+      fresh.push(task);
+      // Reserve a slot so a repeated id in the same batch is not added twice.
+      index.set(task.id, -1);
+    } else if (at >= 0) {
+      app.transfers[at] = task;
+    }
+    // Bytes only hit the drive when a job finishes, and the file list was loaded
+    // before the new entry existed — so both the capacity bar and the listing are
+    // stale the moment this fires. Progress events arrive every few hundred ms,
+    // hence the transition check instead of "status === done".
+    if (task.status === "done" && before !== "done") {
+      // Downloads do not touch the remote side; the other three do.
+      if (task.kind !== "download") quotaDirty = true;
+      filesDirty = true;
+    }
   }
+
+  // Newest first, matching the order single inserts used to produce.
+  if (fresh.length) app.transfers.unshift(...fresh.reverse());
+  if (quotaDirty) refreshQuota(app.activeProvider);
+  if (filesDirty) requestFilesRefresh();
+}
+
+/** Applies a batch that the backend announced in one event. */
+export function applyTransfers(tasks: TransferTask[]) {
+  for (const task of tasks) pendingTransfers.set(task.id, task);
+  flushTransfers();
+}
+
+/** Drops many tasks at once (bulk remove). */
+export function forgetTransfers(ids: string[]) {
+  if (ids.length === 0) return;
+  const gone = new Set(ids);
+  app.transfers = app.transfers.filter((task) => !gone.has(task.id));
 }
 
 export async function refreshTransfers() {
@@ -439,6 +503,11 @@ export async function bootstrap() {
   await events.onTransferRemoved((id) => {
     const index = app.transfers.findIndex((t) => t.id === id);
     if (index >= 0) app.transfers.splice(index, 1);
+  });
+  await events.onTransfersBatch(applyTransfers);
+  await events.onTransfersRemovedMany(forgetTransfers);
+  await events.onScan((progress) => {
+    app.scan = progress;
   });
   await events.onDeeplink((link) => openShareLink(link));
   // The tray's "传输列表" item switches screens from outside the UI.

@@ -119,6 +119,14 @@ export const api = {
   transferRemove: (id: string) => invoke<void>("transfer_remove", { id }),
   transferClear: () => invoke<void>("transfer_clear"),
   transferRetry: (id: string) => invoke<TransferTask>("transfer_retry", { id }),
+  /**
+   * One call for a whole selection.
+   *
+   * Looping `transferPause` over 3000 ids meant 3000 IPC round trips and 3000
+   * events; the backend does it in one pass and announces the batch once.
+   */
+  transferBulk: (ids: string[], action: "pause" | "cancel" | "remove" | "resume") =>
+    invoke<number>("transfers_bulk", { ids, action }),
 
   settingsGet: () => invoke<Settings>("settings_get"),
   settingsSet: (settings: Settings) =>
@@ -221,6 +229,15 @@ export const events = {
     listen<TransferTask>("transfer://update", (e) => cb(e.payload)),
   onTransferRemoved: (cb: (id: string) => void): Promise<UnlistenFn> =>
     listen<string>("transfer://removed", (e) => cb(e.payload)),
+  /** Many tasks at once — a folder download expanded into its files. */
+  onTransfersBatch: (cb: (tasks: TransferTask[]) => void): Promise<UnlistenFn> =>
+    listen<TransferTask[]>("transfer://batch", (e) => cb(e.payload)),
+  /** Many removals at once. */
+  onTransfersRemovedMany: (cb: (ids: string[]) => void): Promise<UnlistenFn> =>
+    listen<string[]>("transfer://removed-many", (e) => cb(e.payload)),
+  /** How many files a folder walk has found so far, before any task exists. */
+  onScan: (cb: (progress: { name: string; found: number }) => void): Promise<UnlistenFn> =>
+    listen<{ name: string; found: number }>("transfer://scan", (e) => cb(e.payload)),
   onWebLogin: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
     listen<WebLoginEvent>("auth://web-login", (e) => cb(e.payload)),
   onWebLogin139: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>

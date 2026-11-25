@@ -183,6 +183,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let transfers: TransferTask[] = [];
 const transferListeners = new Set<(t: TransferTask) => void>();
 const removedListeners = new Set<(id: string) => void>();
+const removedManyListeners = new Set<(ids: string[]) => void>();
 
 function emit(task: TransferTask) {
   const index = transfers.findIndex((t) => t.id === task.id);
@@ -802,6 +803,28 @@ export const mockApi = {
     return next;
   },
 
+  transferBulk: async (ids: string[], action: "pause" | "cancel" | "remove" | "resume") => {
+    let changed = 0;
+    for (const id of ids) {
+      const task = transfers.find((t) => t.id === id);
+      if (!task) continue;
+      changed += 1;
+      if (action === "remove") continue;
+      if (action === "resume") {
+        emit({ ...task, status: "running", error: null, speed: 1_200_000 });
+      } else if (action === "pause") {
+        emit({ ...task, status: "paused", speed: 0 });
+      } else {
+        emit({ ...task, status: "canceled", speed: 0 });
+      }
+    }
+    if (action === "remove") {
+      transfers = transfers.filter((t) => !ids.includes(t.id));
+      for (const id of ids) for (const cb of removedListeners) cb(id);
+    }
+    return changed;
+  },
+
   transferClear: async () => {
     const removed = transfers.filter((t) => ["done", "failed", "canceled"].includes(t.status));
     transfers = transfers.filter((t) => !removed.includes(t));
@@ -841,6 +864,19 @@ export const mockEvents = {
   onWebLogin: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onWebLogin139: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onWebLoginBaidu: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
+  onTransfersBatch: async (cb: (tasks: TransferTask[]) => void): Promise<() => void> => {
+    transferListeners.add(cb as unknown as (task: TransferTask) => void);
+    return () => {
+      transferListeners.delete(cb as unknown as (task: TransferTask) => void);
+    };
+  },
+  onTransfersRemovedMany: async (cb: (ids: string[]) => void): Promise<() => void> => {
+    removedManyListeners.add(cb);
+    return () => {
+      removedManyListeners.delete(cb);
+    };
+  },
+  onScan: async (_cb: (progress: { name: string; found: number }) => void) => () => {},
   onDeeplink: async (_cb: (link: string) => void) => () => {},
   onNavigate: async (_cb: (view: string) => void) => () => {},
 };

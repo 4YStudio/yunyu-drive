@@ -5,12 +5,12 @@
 //! forwarded. The only drive-specific pieces left in this file are the Quark
 //! cookie lives in `state.rs` and the share endpoints in `share.rs`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::config::{self, Settings};
 use crate::error::{AppError, AppResult};
@@ -661,7 +661,7 @@ async fn start_cross_drive(
         // Folders: rebuild the tree below the target and remember each folder
         // id so siblings do not list the same parent over and over.
         let root = cross_dir(&to, &mut dirs, &target.native, &entry.name).await?;
-        let walked = collect_remote_files(&from, &id.native).await?;
+        let walked = collect_remote_files(&from, &id.native, |_| {}).await?;
         for file in walked {
             let mut parent = root.clone();
             if let Some(dir) = file.relative.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -766,6 +766,7 @@ struct RemoteFile {
 async fn collect_remote_files(
     drive: &Arc<dyn DriveProvider>,
     dir: &str,
+    mut progress: impl FnMut(usize),
 ) -> AppResult<Vec<RemoteFile>> {
     const MAX_FILES: usize = 5000;
     const MAX_DEPTH: usize = 12;
@@ -807,6 +808,7 @@ async fn collect_remote_files(
             "有 {skipped} 个目录超过 {MAX_DEPTH} 层，未找到可下载的文件"
         )));
     }
+    progress(out.len());
     Ok(out)
 }
 
@@ -828,6 +830,8 @@ pub async fn download_entries(
         return Err(AppError::new("请先在设置中选择下载目录"));
     }
     let mut tasks = Vec::new();
+    // Tasks that were started silently, to be announced in one event.
+    let mut batched: Vec<TransferTask> = Vec::new();
     for item in items {
         let id = crate::providers::EntryId::parse(&item.fid)?;
         let drive = state.drive_of(id.provider).await?;
@@ -855,10 +859,29 @@ pub async fn download_entries(
             &PathBuf::from(&target).join(crate::paths::safe_component(&item.name)),
         );
         tokio::fs::create_dir_all(&root).await?;
-        let files = collect_remote_files(&drive, &id.native).await?;
+        // Walking a big folder takes a while and used to be invisible: the
+        // dialog sat on "正在加入队列…" for minutes with no sign of progress.
+        let watcher = app.clone();
+        let label = item.name.clone();
+        let mut last_report = std::time::Instant::now();
+        let files = collect_remote_files(&drive, &id.native, |found| {
+            if last_report.elapsed() < std::time::Duration::from_millis(400) {
+                return;
+            }
+            last_report = std::time::Instant::now();
+            let _ = watcher.emit(
+                crate::transfer::EVENT_SCAN,
+                crate::transfer::ScanProgress {
+                    name: label.clone(),
+                    found,
+                },
+            );
+        })
+        .await?;
         if files.is_empty() {
             return Err(AppError::new(format!("「{}」中没有可下载的文件", item.name)));
         }
+        let mut made_dirs: HashSet<PathBuf> = HashSet::new();
         for file in files {
             let dir = match file.relative.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => {
@@ -866,7 +889,11 @@ pub async fn download_entries(
                 }
                 _ => root.clone(),
             };
-            tokio::fs::create_dir_all(&dir).await?;
+            // One syscall per distinct subfolder, not per file: a flat folder of
+            // 3000 files asked the kernel the same question 3000 times.
+            if made_dirs.insert(dir.clone()) {
+                tokio::fs::create_dir_all(&dir).await?;
+            }
             let job = DownloadJob {
                 fid: qualify(id.provider, &file.fid),
                 name: file.name,
@@ -875,16 +902,20 @@ pub async fn download_entries(
                 share: None,
                 provider: id.provider.as_str().to_string(),
             };
-            tasks.push(
-                state
-                    .transfers
-                    .start_download(app.clone(), arc_ctx(Arc::clone(&drive)), job)
-                    .await?,
-            );
+            // Quiet: the whole batch is announced once, below.
+            let task = state
+                .transfers
+                .start_download_quiet(app.clone(), arc_ctx(Arc::clone(&drive)), job)
+                .await?;
+            batched.push(task.clone());
+            tasks.push(task);
         }
     }
     if tasks.is_empty() {
         return Err(AppError::new("没有可下载的内容"));
+    }
+    if !batched.is_empty() {
+        let _ = app.emit(crate::transfer::EVENT_TRANSFERS, &batched);
     }
     Ok(tasks)
 }
@@ -1142,6 +1173,73 @@ pub async fn transfer_retry(
     app: AppHandle,
     id: String,
 ) -> AppResult<TransferTask> {
+    retry_task(state.inner(), app, &id).await
+}
+
+/// Batch pause / cancel / remove / resume for a multi-selection.
+///
+/// Pausing a 3000-file queue one command at a time meant 3000 IPC round trips
+/// and 3000 events; this does the work in one pass and announces the result
+/// once.
+#[tauri::command]
+pub async fn transfers_bulk(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    ids: Vec<String>,
+    action: String,
+) -> AppResult<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    match action.as_str() {
+        "pause" => {
+            let changed = state.transfers.pause_many(&ids).await;
+            if !changed.is_empty() {
+                let _ = app.emit(crate::transfer::EVENT_TRANSFERS, &changed);
+            }
+            Ok(changed.len())
+        }
+        "cancel" => {
+            let changed = state.transfers.cancel_many(&ids).await;
+            if !changed.is_empty() {
+                let _ = app.emit(crate::transfer::EVENT_TRANSFERS, &changed);
+            }
+            Ok(changed.len())
+        }
+        "remove" => {
+            let gone = state.transfers.remove_many(&ids).await;
+            if !gone.is_empty() {
+                let _ = app.emit(crate::transfer::EVENT_REMOVED_MANY, &gone);
+            }
+            Ok(gone.len())
+        }
+        "resume" => {
+            let mut started = 0;
+            let mut first: Option<String> = None;
+            for id in &ids {
+                match retry_task(state.inner(), app.clone(), id).await {
+                    Ok(_) => started += 1,
+                    Err(err) => {
+                        if first.is_none() {
+                            first = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+            if started == 0 {
+                return Err(AppError::new(
+                    first.unwrap_or_else(|| "没有可继续的任务".to_string()),
+                ));
+            }
+            Ok(started)
+        }
+        other => Err(AppError::new(format!("未知的批量操作：{other}"))),
+    }
+}
+
+/// The single-task retry body, shared by `transfer_retry` and `transfers_bulk`.
+async fn retry_task(state: &Arc<AppState>, app: AppHandle, id: &str) -> AppResult<TransferTask> {
+    let id = id.to_string();
     let task = {
         let list = state.transfers.list().await;
         list.into_iter()

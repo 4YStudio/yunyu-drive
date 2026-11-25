@@ -194,6 +194,7 @@ pub fn run() {
             commands::transfer_remove,
             commands::transfer_clear,
             commands::transfer_retry,
+            commands::transfers_bulk,
             commands::aliyun_qr_start,
             commands::aliyun_qr_poll_with,
             commands::cloud189_qr_start,
