@@ -1312,3 +1312,442 @@ mod resume_bytes_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Live resume probe against the account this machine is signed into.
+///
+/// `cargo test --lib live_resume_probe -- --ignored --nocapture`
+///
+/// Uploads one ~84 MiB file into a throwaway folder, pauses a segmented
+/// download at ~20 MiB, prints the three counters, resumes it while sampling
+/// `done` / `plan_bytes`, checks every byte, then deletes the folder and the
+/// local files. Nothing outside `yunyu-resume-probe-<pid>` and /tmp is touched.
+#[cfg(test)]
+mod live_resume_probe {
+    use super::source::ProviderSource;
+    use super::*;
+    use crate::error::AppError;
+    use crate::providers::{Cloud189Provider, CounterSink, DriveProvider, ProviderId, UploadSink};
+    use std::io::{Read, Write};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio_util::sync::CancellationToken;
+
+    const SIZE: u64 = 84 * 1024 * 1024;
+    const PAUSE_AT: u64 = 20 * 1024 * 1024;
+    const SECOND_PAUSE: u64 = 45 * 1024 * 1024;
+    const BUF: usize = 1024 * 1024;
+
+    fn byte_at(i: u64) -> u8 {
+        (i % 251) as u8
+    }
+
+    fn write_payload(path: &Path, size: u64) -> AppResult<()> {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut buf = vec![0u8; BUF];
+        let mut at = 0u64;
+        while at < size {
+            let take = ((size - at) as usize).min(BUF);
+            for (k, slot) in buf[..take].iter_mut().enumerate() {
+                *slot = byte_at(at + k as u64);
+            }
+            out.write_all(&buf[..take])?;
+            at += take as u64;
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Bytes that are actually non-zero: the engine preallocates, so the file
+    /// length alone cannot tell written data from holes.
+    fn count_nonzero(path: &Path) -> AppResult<u64> {
+        let mut file = std::fs::File::open(path)?;
+        let mut buf = vec![0u8; BUF];
+        let mut count = 0u64;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                return Ok(count);
+            }
+            count += buf[..n].iter().filter(|b| **b != 0).count() as u64;
+        }
+    }
+
+    /// Full sequential compare against `byte_at`; returns the number of
+    /// mismatched bytes (0 = identical).
+    fn count_mismatches(path: &Path, size: u64) -> AppResult<u64> {
+        let mut file = std::fs::File::open(path)?;
+        let mut buf = vec![0u8; BUF];
+        let mut at = 0u64;
+        let mut bad = 0u64;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            for (k, got) in buf[..n].iter().enumerate() {
+                if *got != byte_at(at + k as u64) {
+                    if bad == 0 {
+                        println!("[verify] first mismatch at byte {}", at + k as u64);
+                    }
+                    bad += 1;
+                }
+            }
+            at += n as u64;
+        }
+        if at != size {
+            println!("[verify] length {} != expected {size}", at);
+            return Ok(bad.max(1));
+        }
+        Ok(bad)
+    }
+
+    fn spawn_cancel_at(done: Arc<AtomicU64>, token: CancellationToken, at: u64) {
+        tokio::spawn(async move {
+            loop {
+                if done.load(Ordering::Relaxed) >= at {
+                    token.cancel();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn engine_run(
+        drive: Arc<dyn DriveProvider>,
+        source: Arc<dyn source::Source>,
+        part: &Path,
+        size: u64,
+        provider: &str,
+        done: Arc<AtomicU64>,
+        pause_at: Option<u64>,
+        secs: u64,
+    ) -> Result<AppResult<bool>, tokio::time::error::Elapsed> {
+        let token = CancellationToken::new();
+        if let Some(at) = pause_at {
+            spawn_cancel_at(Arc::clone(&done), token.clone(), at);
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(secs),
+            super::download_with_stats(drive, source, provider, part, size, done, 0, token, None),
+        )
+        .await
+    }
+
+    /// The three numbers that decide which layer miscounts.
+    fn report(
+        tag: &str,
+        part: &Path,
+        size: u64,
+        done: u64,
+        source: &Arc<dyn source::Source>,
+    ) -> AppResult<()> {
+        let plan = super::plan_bytes(part);
+        let len = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+        let nonzero = if part.exists() { count_nonzero(part)? } else { 0 };
+        let fingerprint = source.fingerprint();
+        let state = super::resume_state(part, size, &fingerprint);
+        println!(
+            "[{tag}] plan_bytes={plan} file_len={len} done={done} nonzero_bytes={nonzero} resume_state={state:?} fingerprint={fingerprint}"
+        );
+        let side = meta::Progress::sidecar(part);
+        match std::fs::read_to_string(&side) {
+            Ok(raw) => println!(
+                "[{tag}] sidecar={} len={} head={}",
+                side.display(),
+                raw.len(),
+                &raw[..raw.len().min(200)]
+            ),
+            Err(err) => println!("[{tag}] sidecar={} unreadable: {err}", side.display()),
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn start_sampler(
+        done: Arc<AtomicU64>,
+        part: &Path,
+        initial: (u64, u64),
+    ) -> (
+        Arc<Mutex<Vec<(u64, u64)>>>,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(vec![initial]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let part = part.to_path_buf();
+        let handle = {
+            let done = Arc::clone(&done);
+            let samples = Arc::clone(&samples);
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let point = (done.load(Ordering::Relaxed), super::plan_bytes(&part));
+                    samples.lock().unwrap().push(point);
+                }
+            })
+        };
+        (samples, stop, handle)
+    }
+
+    async fn stop_sampler(stop: Arc<AtomicBool>, handle: tokio::task::JoinHandle<()>) {
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.await;
+    }
+
+    fn print_samples(tag: &str, snaps: &[(u64, u64)]) {
+        let mut points: Vec<(u64, u64)> = Vec::new();
+        for (done, plan) in snaps {
+            if points.last().is_none_or(|(d, p)| d != done || p != plan) {
+                points.push((*done, *plan));
+            }
+        }
+        println!("[{tag} samples] {} distinct (done, plan_bytes) points", points.len());
+        let head = 20.min(points.len());
+        let tail = if points.len() > 40 { 20 } else { 0 };
+        for (done, plan) in &points[..head] {
+            println!("[{tag} samples] done={done} plan={plan}");
+        }
+        if tail > 0 {
+            println!("[{tag} samples] ... {} points omitted ...", points.len() - head - tail);
+            for (done, plan) in &points[points.len() - tail..] {
+                println!("[{tag} samples] done={done} plan={plan}");
+            }
+        }
+    }
+
+    async fn probe(
+        drive: Arc<dyn DriveProvider>,
+        folder: &str,
+        local: &Path,
+        part: &Path,
+    ) -> AppResult<()> {
+        let provider = ProviderId::Cloud189.as_str();
+        let name = "probe-84m.bin";
+
+        let quota = drive.quota().await?;
+        println!("[probe] provider={provider} quota={quota:?}");
+
+        write_payload(local, SIZE)?;
+        println!(
+            "[probe] local payload {} -> {} bytes",
+            local.display(),
+            std::fs::metadata(local)?.len()
+        );
+
+        let uploaded = Arc::new(AtomicU64::new(0));
+        let sink: Arc<dyn UploadSink> = Arc::new(CounterSink::new(Arc::clone(&uploaded)));
+        let up = tokio::time::timeout(
+            std::time::Duration::from_secs(1800),
+            drive.upload(local, folder, name, sink, CancellationToken::new()),
+        )
+        .await
+        .map_err(|_| AppError::new("上传超时（1800s）"))??;
+        println!("[probe] upload reported bytes={}", uploaded.load(Ordering::Relaxed));
+
+        let fid = match up {
+            Some(fid) => fid,
+            None => {
+                let listing = drive.list(folder).await?;
+                listing
+                    .entries
+                    .iter()
+                    .find(|e| e.name == name)
+                    .map(|e| e.fid.clone())
+                    .ok_or_else(|| AppError::new("上传后在目录里找不到测试文件"))?
+            }
+        };
+        let listing = drive.list(folder).await?;
+        let entry = listing
+            .entries
+            .iter()
+            .find(|e| e.fid == fid)
+            .ok_or_else(|| AppError::new("目录里没有测试文件"))?;
+        let size = entry.size;
+        println!("[probe] uploaded fid={fid} size={size} (local {SIZE})");
+
+        let source: Arc<dyn source::Source> = Arc::new(ProviderSource {
+            drive: Arc::clone(&drive),
+            fid: fid.clone(),
+            label: part.display().to_string(),
+        });
+
+        // --- run A: pause near 20 MiB -------------------------------------
+        let done = Arc::new(AtomicU64::new(0));
+        let first = engine_run(
+            Arc::clone(&drive),
+            Arc::clone(&source),
+            part,
+            size,
+            provider,
+            Arc::clone(&done),
+            Some(PAUSE_AT),
+            900,
+        )
+        .await;
+        println!("[pause1] run -> {first:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        report("pause1", part, size, done.load(Ordering::Relaxed), &source)?;
+
+        // --- run B: resume, pause again near 45 MiB -----------------------
+        let done_b = Arc::new(AtomicU64::new(0));
+        let second = engine_run(
+            Arc::clone(&drive),
+            Arc::clone(&source),
+            part,
+            size,
+            provider,
+            Arc::clone(&done_b),
+            Some(SECOND_PAUSE),
+            900,
+        )
+        .await;
+        println!("[pause2] run -> {second:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        report("pause2", part, size, done_b.load(Ordering::Relaxed), &source)?;
+
+        // --- run C: resume to the end, sampling done/plan every 500 ms ----
+        let done_c = Arc::new(AtomicU64::new(0));
+        let (samples, stop, sampler) = start_sampler(Arc::clone(&done_c), part, (0, super::plan_bytes(part)));
+        let third = engine_run(
+            Arc::clone(&drive),
+            Arc::clone(&source),
+            part,
+            size,
+            provider,
+            Arc::clone(&done_c),
+            None,
+            1800,
+        )
+        .await;
+        stop_sampler(stop, sampler).await;
+        println!("[engine done] run -> {third:?}");
+        let final_done = done_c.load(Ordering::Relaxed);
+        let final_len = std::fs::metadata(part)?.len();
+        let snaps = samples.lock().unwrap().clone();
+        let peak = snaps.iter().map(|(d, _)| *d).max().unwrap_or(0).max(final_done);
+        println!(
+            "[engine done] final done={final_done} file_len={final_len} declared_size={size} peak_done={peak} overshoot={}",
+            peak.saturating_sub(size)
+        );
+        print_samples("engine", &snaps);
+        let bad = count_mismatches(part, size)?;
+        println!("[engine verify] mismatched_bytes={bad} (sequential compare against b[i]=(i%251))");
+        if bad != 0 {
+            return Err(AppError::new(format!("内容校验失败：{bad} 字节不一致")));
+        }
+
+        // --- aggregator phase: same pause/resume through transfer.rs ------
+        // `run_provider_download_for_test` is `run_provider_download` with base=0,
+        // i.e. exactly what `spawn_download` calls for a provider download.
+        let part2 = part.with_extension("part2");
+        let final2 = part.with_extension("agg.done");
+        let _ = std::fs::remove_file(&part2);
+        let _ = std::fs::remove_file(&final2);
+        meta::Progress::discard(&part2);
+
+        let done_e = Arc::new(AtomicU64::new(0));
+        let token_e = CancellationToken::new();
+        spawn_cancel_at(Arc::clone(&done_e), token_e.clone(), PAUSE_AT);
+        let agg_pause = tokio::time::timeout(
+            std::time::Duration::from_secs(900),
+            crate::transfer::run_provider_download_for_test(
+                &drive,
+                &fid,
+                &part2,
+                &final2,
+                size,
+                Arc::clone(&done_e),
+                token_e,
+            ),
+        )
+        .await;
+        println!("[agg pause] run -> {agg_pause:?}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let seed = std::fs::metadata(&part2).map(|m| m.len()).unwrap_or(0);
+        report("agg pause", &part2, size, done_e.load(Ordering::Relaxed), &source)?;
+        println!("[agg pause] retry_download would seed transferred={seed} (transfer.rs:1391 uses metadata.len())");
+
+        let done_f = Arc::new(AtomicU64::new(0));
+        let (samples2, stop2, sampler2) =
+            start_sampler(Arc::clone(&done_f), &part2, (0, super::plan_bytes(&part2)));
+        let agg_resume = tokio::time::timeout(
+            std::time::Duration::from_secs(1800),
+            crate::transfer::run_provider_download_for_test(
+                &drive,
+                &fid,
+                &part2,
+                &final2,
+                size,
+                Arc::clone(&done_f),
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        stop_sampler(stop2, sampler2).await;
+        println!("[agg done] run -> {agg_resume:?}");
+        let agg_done = done_f.load(Ordering::Relaxed);
+        let agg_len = std::fs::metadata(&final2).map(|m| m.len()).unwrap_or(0);
+        let snaps2 = samples2.lock().unwrap().clone();
+        let agg_peak = snaps2.iter().map(|(d, _)| *d).max().unwrap_or(0).max(agg_done);
+        println!(
+            "[agg done] final done={agg_done} final_len={agg_len} declared_size={size} peak_done={agg_peak} overshoot={}",
+            agg_peak.saturating_sub(size)
+        );
+        print_samples("agg", &snaps2);
+        let bad2 = count_mismatches(&final2, size)?;
+        println!("[agg verify] mismatched_bytes={bad2} (sequential compare against b[i]=(i%251))");
+        if bad2 != 0 {
+            return Err(AppError::new(format!("聚合层内容校验失败：{bad2} 字节不一致")));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live: uploads 84 MiB to the 189 account and resumes a paused download"]
+    async fn live_resume_probe() {
+        let pid = std::process::id();
+        let dir = crate::config::AppPaths::resolve().unwrap().config_dir;
+        let drive: Arc<dyn DriveProvider> =
+            Arc::new(Cloud189Provider::load(&dir).expect("cloud189.json"));
+        let folder_name = format!("yunyu-resume-probe-{pid}");
+        let local = std::env::temp_dir().join(format!("yunyu-resume-probe-{pid}.bin"));
+        let part = std::env::temp_dir().join(format!("yunyu-resume-probe-{pid}.part"));
+        let part2 = part.with_extension("part2");
+        let final2 = part.with_extension("agg.done");
+        let _ = std::fs::remove_file(&local);
+        let _ = std::fs::remove_file(&part);
+        meta::Progress::discard(&part);
+
+        let folder = drive.make_dir("0", &folder_name).await.expect("make_dir");
+        println!("[probe] scratch folder {folder_name} -> {folder}");
+
+        let outcome = probe(Arc::clone(&drive), &folder, &local, &part).await;
+        println!("[probe] outcome -> {outcome:?}");
+
+        let removed = drive.delete(std::slice::from_ref(&folder)).await;
+        println!("[cleanup] delete {folder_name} -> {removed:?}");
+        let still = drive
+            .list("0")
+            .await
+            .map(|l| l.entries.iter().any(|e| e.name == folder_name));
+        println!("[cleanup] folder still listed -> {still:?}");
+        for leftover in [&part, &part2, &final2] {
+            meta::Progress::discard(leftover);
+            let _ = std::fs::remove_file(leftover);
+        }
+        let _ = std::fs::remove_file(&local);
+        println!(
+            "[cleanup] local part exists={} part2 exists={} final2 exists={} payload exists={}",
+            part.exists(),
+            part2.exists(),
+            final2.exists(),
+            local.exists()
+        );
+
+        outcome.expect("probe failed");
+    }
+}

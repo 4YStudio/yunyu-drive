@@ -386,11 +386,12 @@ impl TransferManager {
                 task.status = "paused".to_string();
                 task.error = None;
                 task.speed = 0.0;
-                // Believe the partial file rather than the saved counter.
+                // Believe the partial file's plan rather than the saved
+                // counter — and not its length: the engine pre-allocates the
+                // file to its full size on the first write, so the length says
+                // nothing about how much is really there.
                 if let Some(part) = task.part_path.as_deref() {
-                    if let Ok(meta) = tokio::fs::metadata(part).await {
-                        task.transferred = meta.len();
-                    }
+                    task.transferred = crate::engine::plan_bytes(Path::new(part));
                 }
             }
             restored.push(task);
@@ -1379,10 +1380,11 @@ impl TransferManager {
             .map(PathBuf::from)
             .unwrap_or_else(|| with_suffix(&final_path, ".part"));
         let part_for_patch = part_path.to_string_lossy().to_string();
-        let start = tokio::fs::metadata(&part_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        // How much is really on disk. The `.part` file is pre-allocated to the
+        // whole size from the first byte, so `metadata().len()` would seed the
+        // task with the full file and the bar would jump to 100% the moment the
+        // user hits "resume".
+        let start = crate::engine::plan_bytes(&part_path);
         let fid = task.fid.clone().unwrap_or_default();
         self.patch(id, &app, move |t| {
             t.status = "queued".to_string();

@@ -973,7 +973,14 @@ pub async fn stream_to_file(
     use tokio::io::AsyncWriteExt;
 
     let client = http()?;
-    let start = tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0);
+    // The plan, not the length: the segmented engine pre-allocates the file to
+    // its full size, so a leftover `.part` can be "full length" with only a
+    // fraction of the bytes in it. Resuming at that offset would ask the CDN
+    // for the tail of an empty file.
+    let start = crate::engine::plan_bytes(part);
+    if start == 0 {
+        let _ = tokio::fs::File::create(part).await;
+    }
     let mut request = client.get(url);
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
