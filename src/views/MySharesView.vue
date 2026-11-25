@@ -29,6 +29,16 @@ const busy = ref(false);
 const error = ref<string | null>(null);
 const revoking = ref<ShareRecord | null>(null);
 
+/**
+ * Shares this session has already cancelled.
+ *
+ * The server keeps listing a share for a while after `revoke` returns (it is a
+ * queued job on some drives), so a plain refetch would put the row back and let
+ * the user cancel the same link again. Filtering by this set makes the list
+ * agree with what the user just did; a real reload (view remount) starts clean.
+ */
+const revoked = new Set<string>();
+
 const provider = computed(
   () => PROVIDERS.find((p) => p.id === app.activeProvider) ?? PROVIDERS[0],
 );
@@ -44,6 +54,7 @@ function reset() {
   rows.value = [];
   error.value = null;
   revoking.value = null;
+  revoked.clear();
 }
 
 async function load() {
@@ -54,7 +65,8 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    rows.value = await api.shareRecords(app.activeProvider);
+    const records = await api.shareRecords(app.activeProvider);
+    rows.value = records.filter((row) => !revoked.has(row.shareId));
   } catch (err) {
     error.value = errText(err);
     rows.value = [];
@@ -85,12 +97,19 @@ async function confirmRevoke() {
   const row = revoking.value;
   if (!row || busy.value) return;
   busy.value = true;
+  revoking.value = null;
+  // Drop the row before the request goes out: waiting for the round trip left a
+  // window where the same share could be cancelled twice.
+  const index = rows.value.findIndex((r) => r.shareId === row.shareId);
+  if (index >= 0) rows.value.splice(index, 1);
+  revoked.add(row.shareId);
   try {
     await api.shareRevoke(app.activeProvider, row.shareId, row.fids);
     toast("已取消分享", "success");
-    revoking.value = null;
-    await load();
   } catch (err) {
+    // The drive refused: put it back where it was and let the next load show it.
+    revoked.delete(row.shareId);
+    if (index >= 0) rows.value.splice(index, 0, row);
     toast(errText(err), "error");
   } finally {
     busy.value = false;

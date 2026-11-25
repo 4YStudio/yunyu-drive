@@ -33,6 +33,7 @@ import {
   goLoginFor,
   loadProviderStates,
   loadQuota,
+  refreshQuota,
   rootFid,
   saveSettings,
   toast,
@@ -673,6 +674,8 @@ async function confirmRelocate() {
     }
     relocate.value = null;
     await load(currentFid.value);
+    // 复制/移动都改容量（跨盘的还是先下载再上传），缓存里的读数不能留。
+    refreshQuota();
   } catch (err) {
     toast(errText(err), "error");
   } finally {

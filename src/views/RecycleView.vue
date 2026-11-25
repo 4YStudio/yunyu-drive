@@ -10,7 +10,7 @@ import Modal from "@/components/Modal.vue";
 import { api } from "@/lib/backend";
 import { errText, formatFullDate, formatSize } from "@/lib/format";
 import { PROVIDERS, type RecycleEntry } from "@/lib/types";
-import { app, activeProviderState, toast } from "@/store/app";
+import { app, activeProviderState, refreshQuota, requestFilesRefresh, toast } from "@/store/app";
 
 /**
  * Recycle bin of the active drive.
@@ -87,6 +87,9 @@ async function restore() {
     const count = await api.recycleRestore(app.activeProvider, picked.value);
     toast(`已恢复 ${count} 项到${provider.value.name}`, "success");
     await load();
+    // 恢复只是把字节从回收站挪回网盘，占用不变，但文件列表是旧的。
+    requestFilesRefresh();
+    refreshQuota();
   } catch (err) {
     toast(errText(err), "error");
   } finally {
@@ -101,6 +104,8 @@ async function purge() {
     const count = await api.recyclePurge(app.activeProvider, picked.value);
     toast(`已彻底删除 ${count} 项`, "success");
     await load();
+    // 回收站里的东西同样占着容量，删干净才真正释放。
+    refreshQuota();
   } catch (err) {
     toast(errText(err), "error");
   } finally {
@@ -115,6 +120,7 @@ async function clearAll() {
     toast(`已清空${provider.value.name}的回收站`, "success");
     confirmClear.value = false;
     await load();
+    refreshQuota();
   } catch (err) {
     toast(errText(err), "error");
   } finally {

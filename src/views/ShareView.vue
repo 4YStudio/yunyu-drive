@@ -13,7 +13,7 @@ import { errText } from "@/lib/format";
 import { PROVIDERS } from "@/lib/types";
 import type { ShareEntry, ShareListing, ShareSession } from "@/lib/types";
 import { formatDate, formatSize, fileKind, kindLabel } from "@/lib/format";
-import { app, requestFilesRefresh, toast } from "@/store/app";
+import { app, refreshQuota, requestFilesRefresh, toast } from "@/store/app";
 
 const link = ref("");
 /** Only needed when the link itself carries no `?pwd=`; some drives require it. */
@@ -180,6 +180,8 @@ async function save() {
     );
     toast(`已转存 ${count} 项到「我的文件」`, "success");
     requestFilesRefresh();
+    // 转存落到当前网盘，占用立刻变了。
+    refreshQuota();
   } catch (err) {
     toast(errText(err), "error");
   } finally {

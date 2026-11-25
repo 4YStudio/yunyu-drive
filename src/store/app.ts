@@ -230,8 +230,18 @@ export async function loadAccount(force = false) {
 
 export function applyTransfer(task: TransferTask) {
   const index = app.transfers.findIndex((t) => t.id === task.id);
+  const before = index >= 0 ? app.transfers[index]?.status : undefined;
   if (index >= 0) app.transfers[index] = task;
   else app.transfers.unshift(task);
+  // Bytes only hit the drive when a job finishes, and the file list was loaded
+  // before the new entry existed — so both the capacity bar and the listing are
+  // stale the moment this fires. Progress events arrive every few hundred ms,
+  // hence the transition check instead of "status === done".
+  if (task.status === "done" && before !== "done") {
+    // Downloads do not touch the remote side; the other three do.
+    if (task.kind !== "download") refreshQuota(app.activeProvider);
+    requestFilesRefresh();
+  }
 }
 
 export async function refreshTransfers() {
@@ -296,29 +306,74 @@ export async function logoutProvider(id: ProviderId) {
 /** Drives whose quota request is in flight, so a re-render cannot pile them up. */
 const quotaInFlight = new Set<ProviderId>();
 
+/** When each drive's capacity reading was taken, for the TTL below. */
+const quotaStamps = new Map<ProviderId, number>();
+
 /**
- * Fetches the active drive's capacity once per session.
+ * Drives that were asked for a fresh reading while one was already in flight.
+ *
+ * Without this a `refreshQuota` that lands mid-request is dropped, and the
+ * answer that request is about to deliver predates the change we wanted to see.
+ */
+const quotaAgain = new Set<ProviderId>();
+
+/**
+ * How long a capacity reading stays trustworthy.
+ *
+ * It used to be cached for the whole session, so anything that moved bytes
+ * behind the app's back — a transfer still running in another window, a share
+ * someone else saved — left the bar stale until a restart. Half a minute keeps
+ * the sidebar from hammering the endpoint while still catching up on its own.
+ */
+const QUOTA_TTL_MS = 30_000;
+
+/**
+ * Fetches the active drive's capacity.
  *
  * Kept out of `loadProviderStates` because it costs a round trip per drive and
  * the sidebar only ever shows one. `force` refetches after an upload/delete.
  */
 export async function loadQuota(id: ProviderId = app.activeProvider, force = false) {
-  if (!force && app.quotas[id] !== undefined) return;
-  if (quotaInFlight.has(id)) return;
+  if (!force && app.quotas[id] !== undefined) {
+    const at = quotaStamps.get(id) ?? 0;
+    if (Date.now() - at < QUOTA_TTL_MS) return;
+  }
+  if (quotaInFlight.has(id)) {
+    if (force) quotaAgain.add(id);
+    return;
+  }
   quotaInFlight.add(id);
   try {
     app.quotas[id] = await api.providerQuota(id);
+    quotaStamps.set(id, Date.now());
   } catch {
-    // A drive that cannot answer (offline, no endpoint) simply shows no bar.
-    app.quotas[id] = null;
+    // A drive that cannot answer (offline, no endpoint) simply shows no bar —
+    // but do not throw away a reading that was already on screen.
+    if (app.quotas[id] === undefined) app.quotas[id] = null;
+    quotaStamps.set(id, Date.now());
   } finally {
     quotaInFlight.delete(id);
+    // Someone asked for a fresh number while we were busy; their change may
+    // have landed after this request started, so go again (once).
+    if (quotaAgain.delete(id)) void loadQuota(id, true);
   }
+}
+
+/**
+ * Re-reads capacity right now.
+ *
+ * Every action that moves bytes (upload, delete, cross-drive copy, share save,
+ * emptying the recycle bin) has to call this: those bytes are accounted for
+ * server-side the moment the request returns, so a cached number is wrong.
+ */
+export function refreshQuota(id: ProviderId = app.activeProvider) {
+  void loadQuota(id, true);
 }
 
 /** Forgets a drive's cached capacity, e.g. after logging out of it. */
 export function forgetQuota(id: ProviderId) {
   delete app.quotas[id];
+  quotaStamps.delete(id);
 }
 
 /**
