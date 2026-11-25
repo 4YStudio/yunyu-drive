@@ -82,6 +82,16 @@ export interface QuotaInfo {
   total: number;
 }
 
+/**
+ * Monthly download allowance, for drives that meter downloads separately from
+ * storage (123 云盘 free accounts). `left` is what is still available.
+ */
+export interface TrafficInfo {
+  left: number;
+  share: number;
+  direct: number;
+}
+
 /** Nickname + avatar of one signed-in drive, from `provider_profiles`. */
 export interface ProfileInfo {
   provider: ProviderId;

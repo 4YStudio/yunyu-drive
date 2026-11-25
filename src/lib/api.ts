@@ -14,6 +14,7 @@ import type {
   ProviderAuthState,
   RecycleEntry,
   QuotaInfo,
+  TrafficInfo,
   SearchHit,
   Settings,
   ShareListing,
@@ -94,6 +95,9 @@ export const api = {
   /** Free/total space, when the drive exposes it. */
   providerQuota: (provider: string) =>
     invoke<QuotaInfo | null>("provider_quota", { provider }),
+  /** Remaining monthly download traffic, when the drive meters it. */
+  providerTraffic: (provider: string) =>
+    invoke<TrafficInfo | null>("provider_traffic", { provider }),
   recycleList: (provider: string, offset = 0, limit = 100) =>
     invoke<RecycleEntry[]>("recycle_list", { provider, offset, limit }),
   recycleRestore: (provider: string, entries: RecycleEntry[]) =>

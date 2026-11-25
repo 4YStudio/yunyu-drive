@@ -8,6 +8,7 @@ import {
   activeTransfers,
   goLoginFor,
   loadQuota,
+  loadTraffic,
   logoutProvider,
   setActiveProvider,
   setThemeMode,
@@ -178,6 +179,9 @@ const currentProvider = computed(
  * the row is hidden instead of showing a permanently empty bar.
  */
 const quota = computed(() => app.quotas[app.activeProvider] ?? null);
+
+/** Monthly download allowance of the active drive, when it meters one. */
+const traffic = computed(() => app.traffics[app.activeProvider] ?? null);
 const quotaPercent = computed(() => {
   const q = quota.value;
   if (!q || q.total <= 0) return 0;
@@ -194,7 +198,10 @@ const quotaLabel = computed(() => {
 watch(
   () => [app.activeProvider, activeProviderState.value?.authenticated],
   () => {
-    if (activeProviderState.value?.authenticated) void loadQuota();
+    if (activeProviderState.value?.authenticated) {
+      void loadQuota();
+      void loadTraffic();
+    }
   },
   { immediate: true },
 );
@@ -390,6 +397,16 @@ function pick(id: ProviderId) {
           />
         </div>
         <span class="quota-label truncate">{{ quotaLabel }}</span>
+      </div>
+      <!-- Monthly download allowance; only drives that meter downloads show it. -->
+      <div
+        v-if="traffic"
+        class="quota quota--traffic"
+        :title="`本月还能下载 ${formatSize(traffic.left)}（分享提取剩余 ${formatSize(traffic.share)}）`"
+      >
+        <span class="quota-label truncate" :class="{ 'quota-label--low': traffic.left < 1024 ** 3 }">
+          下载流量剩余 {{ formatSize(traffic.left) }}
+        </span>
       </div>
 
       <div class="account-area">
@@ -641,6 +658,14 @@ function pick(id: ProviderId) {
 }
 .quota-fill--full {
   background: #e0554f;
+}
+/* Under 1 GB left is when a download starts failing, so say it in red. */
+.quota-label--low {
+  color: #e0554f;
+}
+.quota--traffic {
+  padding-top: 0;
+  padding-bottom: 10px;
 }
 .quota-label {
   font-size: 10.4px;

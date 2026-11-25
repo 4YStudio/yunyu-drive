@@ -1187,6 +1187,46 @@ impl DriveProvider for Pan123Provider {
         }
     }
 
+    /// Monthly download allowance, from the web API.
+    ///
+    /// `/b/api/user/info` reports `SelfDownloadTraffic` (what a free account
+    /// still has this month), while the Android endpoint we use for storage
+    /// quota does not carry it at all. The web endpoint wants `App-Version: 3`
+    /// and `platform: web`; with the Android version header it answers 8006.
+    async fn traffic(&self) -> AppResult<Option<crate::providers::TrafficInfo>> {
+        let client = self.http()?;
+        let creds = self.creds.read().await.clone();
+        if creds.token.is_empty() {
+            return Ok(None);
+        }
+        let res = client
+            .get(format!("{BASE}/b/api/user/info"))
+            .header("authorization", &creds.token)
+            .header("app-version", "3")
+            .header("platform", "web")
+            .send()
+            .await
+            .map_err(|e| AppError::new(format!("查询 123 云盘下载流量失败：{e}")))?;
+        let value: Value = res
+            .json()
+            .await
+            .map_err(|e| AppError::new(format!("查询 123 云盘下载流量失败：{e}")))?;
+        let data = value.pointer("/data").unwrap_or(&Value::Null);
+        let read = |key: &str| -> u64 {
+            data.get(key)
+                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .unwrap_or(0)
+        };
+        if data.get("SelfDownloadTraffic").is_none() {
+            return Ok(None);
+        }
+        Ok(Some(crate::providers::TrafficInfo {
+            left: read("SelfDownloadTraffic"),
+            share: read("ShareTraffic"),
+            direct: read("DirectTraffic"),
+        }))
+    }
+
     // ----------------------------------------------------------- recycle ---
 
     async fn recycle_list(&self, offset: u32, limit: u32) -> AppResult<Vec<RecycleEntry>> {
@@ -2073,6 +2113,34 @@ mod live_tests {
             Ok(Some(q)) => println!("quota: used {} / total {}", q.used, q.total),
             Ok(None) => println!("quota: none"),
             Err(err) => panic!("quota failed: {err}"),
+        }
+    }
+
+    /// Monthly download allowance, the number the web UI shows as 剩余流量.
+    ///
+    /// `cargo test --lib pan123_live_traffic -- --ignored --nocapture`
+    ///
+    /// The Android endpoint behind `quota()` does not carry it; this one asks
+    /// the web endpoint (`/b/api/user/info`) with `App-Version: 3`, which is
+    /// what the Tampermonkey script on the desktop does. Read-only.
+    #[tokio::test]
+    #[ignore]
+    async fn pan123_live_traffic() {
+        let dir = crate::config::AppPaths::resolve().unwrap().config_dir;
+        let drive = Pan123Provider::load(&dir).expect("pan123.json");
+        match drive.traffic().await {
+            Ok(Some(t)) => {
+                let gib = |b: u64| format!("{:.2} GB", b as f64 / 1024f64.powi(3));
+                println!(
+                    "traffic: left {} share {} direct {}",
+                    gib(t.left),
+                    gib(t.share),
+                    gib(t.direct)
+                );
+                assert!(t.left > 0, "a free account always has some allowance left");
+            }
+            Ok(None) => panic!("no traffic field: is the account upgraded or the header wrong?"),
+            Err(err) => panic!("traffic failed: {err}"),
         }
     }
 

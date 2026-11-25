@@ -16,6 +16,7 @@ import {
   loadAccount,
   loadProviderStates,
   loadQuota,
+  loadTraffic,
   logoutProvider,
   saveSettings,
   setThemeMode,
@@ -61,7 +62,10 @@ onMounted(async () => {
   // The account card shows every drive's capacity, not just the active one.
   await loadProviderStates();
   for (const drive of app.providers) {
-    if (drive.authenticated) void loadQuota(drive.provider);
+    if (drive.authenticated) {
+      void loadQuota(drive.provider);
+      void loadTraffic(drive.provider);
+    }
   }
 });
 
@@ -139,6 +143,7 @@ const accountRows = computed(() =>
       nickname: quark ? (app.account?.nickname ?? null) : (state?.nickname ?? null),
       masked: quark ? app.maskedCookie : (state?.masked ?? null),
       quota: app.quotas[drive.id] ?? null,
+      traffic: app.traffics[drive.id] ?? null,
     };
   }),
 );
@@ -335,6 +340,9 @@ const theme = computed({
                 {{ drive.authenticated ? (drive.nickname ?? "已连接") : "未登录" }}
                 <template v-if="drive.quota">
                   · 已用 {{ formatSize(drive.quota.used) }} / {{ formatSize(drive.quota.total) }}
+                </template>
+                <template v-if="drive.traffic">
+                  · 下载流量剩余 {{ formatSize(drive.traffic.left) }}
                 </template>
               </span>
               <span v-if="drive.masked" class="row-hint mono truncate">{{ drive.masked }}</span>

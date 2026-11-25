@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::providers::aliyun_qr::QrPollResult;
 use crate::providers::{
     native_of, qualify, AuthState, Capabilities, DirListing, DownloadRequest, DriveProvider,
-    EntryDto, PathNode, ProviderId, QuotaInfo, SearchHit,
+    EntryDto, PathNode, ProviderId, QuotaInfo, SearchHit, TrafficInfo,
 };
 use crate::state::AppState;
 use crate::transfer::{DownloadJob, TransferTask, UploadJob};
@@ -1296,6 +1296,18 @@ pub async fn settings_set(
     settings: Settings,
 ) -> AppResult<Settings> {
     state.update_settings(settings).await
+}
+
+/// Monthly download allowance of one drive, when it meters one.
+#[tauri::command]
+pub async fn provider_traffic(
+    state: State<'_, Arc<AppState>>,
+    provider: String,
+) -> AppResult<Option<TrafficInfo>> {
+    let id = ProviderId::parse(&provider)
+        .ok_or_else(|| AppError::new(format!("未知的网盘：{provider}")))?;
+    let drive = state.drive_of(id).await?;
+    drive.traffic().await
 }
 
 /// Capacity of one drive, when it exposes it.

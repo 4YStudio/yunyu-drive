@@ -93,6 +93,23 @@ pub struct QuotaInfo {
     pub total: u64,
 }
 
+/// Monthly download allowance a drive meters separately from storage.
+///
+/// 123 云盘 is the only drive with one: free accounts get a monthly download
+/// quota, and once it runs out the drive refuses to hand over file bodies until
+/// the quota resets or the account is upgraded. `left` is what is still
+/// available this period, in bytes.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrafficInfo {
+    /// Remaining download allowance for the account's own files.
+    pub left: u64,
+    /// Remaining allowance for files pulled out of share links.
+    pub share: u64,
+    /// Remaining allowance for direct links.
+    pub direct: u64,
+}
+
 /// A single file to download; the UI sends these from a selection.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

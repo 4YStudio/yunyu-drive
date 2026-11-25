@@ -21,6 +21,7 @@ import type {
   RecycleEntry,
   SearchHit,
   Settings,
+  TrafficInfo,
   ShareEntry,
   ShareListing,
   ShareSession,
@@ -505,6 +506,10 @@ export const mockApi = {
 
   // All four drives report capacity, from very different endpoints; the
   // numbers differ per drive so a wrong-drive lookup is visible at a glance.
+  providerTraffic: async (provider: string): Promise<TrafficInfo | null> =>
+    provider === "pan123"
+      ? { left: 9.81 * 1024 ** 3, share: 0, direct: 0 }
+      : null,
   providerQuota: async (provider: string): Promise<QuotaInfo | null> => {
     const used = provider === "aliyun" ? 61.4 * 1024 ** 3 : 128 * 1024 ** 3;
     const total =

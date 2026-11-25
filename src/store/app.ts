@@ -9,6 +9,7 @@ import type {
   ProviderId,
   QuotaInfo,
   Settings,
+  TrafficInfo,
   TransferTask,
 } from "@/lib/types";
 
@@ -70,6 +71,8 @@ interface AppStore {
    * endpoint), `undefined` means "not asked yet".
    */
   quotas: Partial<Record<ProviderId, QuotaInfo | null>>;
+  /** Monthly download allowance, only for drives that meter downloads. */
+  traffics: Partial<Record<ProviderId, TrafficInfo | null>>;
 }
 
 export const app = reactive<AppStore>({
@@ -94,6 +97,7 @@ export const app = reactive<AppStore>({
   loginTarget: null,
   providers: [],
   quotas: {},
+  traffics: {},
 });
 
 /** Qualified root id of the active drive, e.g. `"quark:0"`. */
@@ -261,6 +265,7 @@ function flushTransfers() {
   app.transfers.forEach((task, i) => index.set(task.id, i));
   const fresh: TransferTask[] = [];
   let quotaDirty = false;
+  let trafficDirty = false;
   let filesDirty = false;
 
   for (const task of batch) {
@@ -280,6 +285,8 @@ function flushTransfers() {
     if (task.status === "done" && before !== "done") {
       // Downloads do not touch the remote side; the other three do.
       if (task.kind !== "download") quotaDirty = true;
+      // …but a download is exactly what burns a metered download allowance.
+      else trafficDirty = true;
       filesDirty = true;
     }
   }
@@ -287,6 +294,7 @@ function flushTransfers() {
   // Newest first, matching the order single inserts used to produce.
   if (fresh.length) app.transfers.unshift(...fresh.reverse());
   if (quotaDirty) refreshQuota(app.activeProvider);
+  if (trafficDirty) void loadTraffic(app.activeProvider, true);
   if (filesDirty) requestFilesRefresh();
 }
 
@@ -402,6 +410,9 @@ export async function loadQuota(id: ProviderId = app.activeProvider, force = fal
     return;
   }
   quotaInFlight.add(id);
+  // Cheap to keep in step with the capacity bar, which is refreshed far more
+  // often than the allowance actually changes.
+  void loadTraffic(id, force);
   try {
     app.quotas[id] = await api.providerQuota(id);
     quotaStamps.set(id, Date.now());
@@ -415,6 +426,44 @@ export async function loadQuota(id: ProviderId = app.activeProvider, force = fal
     // Someone asked for a fresh number while we were busy; their change may
     // have landed after this request started, so go again (once).
     if (quotaAgain.delete(id)) void loadQuota(id, true);
+  }
+}
+
+/** Drives whose download-traffic request is in flight. */
+const trafficInFlight = new Set<ProviderId>();
+
+/** When each drive's traffic reading was taken. */
+const trafficStamps = new Map<ProviderId, number>();
+
+/**
+ * How long a traffic reading stays trustworthy.
+ *
+ * The allowance only moves when this app (or the web UI) downloads something,
+ * so a minute is generous; the sidebar never blocks on it.
+ */
+const TRAFFIC_TTL_MS = 60_000 * 5;
+
+/**
+ * Fetches the monthly download allowance.
+ *
+ * Only 123 云盘 has one — everything else answers `null` and the row stays
+ * hidden. Failures are silent on purpose: not being able to show the allowance
+ * must never make the file list look broken.
+ */
+export async function loadTraffic(id: ProviderId = app.activeProvider, force = false) {
+  if (!force && app.traffics[id] !== undefined) {
+    const at = trafficStamps.get(id) ?? 0;
+    if (Date.now() - at < TRAFFIC_TTL_MS) return;
+  }
+  if (trafficInFlight.has(id)) return;
+  trafficInFlight.add(id);
+  try {
+    app.traffics[id] = await api.providerTraffic(id);
+  } catch {
+    if (app.traffics[id] === undefined) app.traffics[id] = null;
+  } finally {
+    trafficInFlight.delete(id);
+    trafficStamps.set(id, Date.now());
   }
 }
 
@@ -433,6 +482,8 @@ export function refreshQuota(id: ProviderId = app.activeProvider) {
 export function forgetQuota(id: ProviderId) {
   delete app.quotas[id];
   quotaStamps.delete(id);
+  delete app.traffics[id];
+  trafficStamps.delete(id);
 }
 
 /**

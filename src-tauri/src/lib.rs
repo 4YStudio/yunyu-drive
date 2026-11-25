@@ -203,6 +203,7 @@ pub fn run() {
             commands::provider_login,
             commands::provider_logout,
             commands::provider_quota,
+            commands::provider_traffic,
             commands::recycle_list,
             commands::recycle_restore,
             commands::recycle_purge,

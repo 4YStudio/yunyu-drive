@@ -51,7 +51,9 @@ pub mod pan123;
 pub mod quark;
 pub mod yun139;
 
-pub use dto::{DirListing, DownloadRequest, EntryDto, PathNode, QuotaInfo, RecycleEntry, SearchHit};
+pub use dto::{
+    DirListing, DownloadRequest, EntryDto, PathNode, QuotaInfo, RecycleEntry, SearchHit, TrafficInfo,
+};
 
 // ---------------------------------------------------------------- identity ---
 
@@ -583,6 +585,14 @@ pub trait DriveProvider: Send + Sync {
 
     /// Optional quota, shown in the sidebar footer when available.
     async fn quota(&self) -> AppResult<Option<QuotaInfo>> {
+        Ok(None)
+    }
+
+    /// Optional monthly download allowance, shown next to the quota.
+    ///
+    /// Only 123 云盘 meters downloads separately from storage; the rest leave
+    /// the default, and the UI hides the row.
+    async fn traffic(&self) -> AppResult<Option<TrafficInfo>> {
         Ok(None)
     }
 
