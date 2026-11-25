@@ -53,6 +53,13 @@ export const api = {
   providerLogin: (provider: string, credential: string) =>
     invoke<ProviderAuthState>("provider_login", { provider, credential }),
   providerLogout: (provider: string) => invoke<void>("provider_logout", { provider }),
+  /**
+   * Wipes the webview cookie jar, HTTP cache and per-site storage the in-app
+   * login windows leave behind, keeping the app's own origin (theme, last
+   * drive). Used when a drive's login page keeps looping on stale state.
+   */
+  clearLoginWebData: () =>
+    invoke<{ windows: number; files: number; bytes: number }>("clear_login_web_data"),
   /** Free/total space, when the drive exposes it. */
   providerQuota: (provider: string) =>
     invoke<QuotaInfo | null>("provider_quota", { provider }),

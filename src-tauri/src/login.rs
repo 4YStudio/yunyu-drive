@@ -26,6 +26,131 @@ pub const LOGIN_LABEL_139: &str = "yun139-login";
 pub const LOGIN_LABEL_BAIDU: &str = "baidu-login";
 /// Separate window label for the 115 web login.
 pub const LOGIN_LABEL_115: &str = "pan115-login";
+/// Every label the login windows use. Maintenance actions (clearing the
+/// webview store) walk this list so the frontend never has to know the labels.
+pub const LOGIN_LABELS: [&str; 4] = [
+    LOGIN_LABEL,
+    LOGIN_LABEL_139,
+    LOGIN_LABEL_BAIDU,
+    LOGIN_LABEL_115,
+];
+
+/// What "clear the built-in browser data" actually removed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearedWebData {
+    /// Login windows that had to be closed first.
+    pub windows: u32,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Per-site stores WebKit keeps next to the app data directory. Cookies and the
+/// HTTP cache are what make a stale login page loop, so they go together.
+const WEBKIT_STORES: [&str; 8] = [
+    "WebKitCache",
+    "cookies",
+    "databases",
+    "storage",
+    "CacheStorage",
+    "mediakeys",
+    "deviceidhashsalts",
+    "hsts-storage.sqlite",
+];
+
+/// Clears the webview's cookie jar, HTTP cache and per-site storage.
+///
+/// Logging into a drive opens a real webview; when that page keeps bouncing
+/// between "signed in" and the login sheet because of a stale cookie or a
+/// cached redirect, the only way out is a clean store. The app's own bucket
+/// (`localhost` in dev, `tauri://localhost` in a packaged build) is kept so
+/// the user does not lose their theme and remembered drive.
+#[tauri::command]
+pub async fn clear_login_web_data(app: AppHandle) -> AppResult<ClearedWebData> {
+    let mut windows = 0u32;
+    for label in LOGIN_LABELS {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.close();
+            windows += 1;
+        }
+    }
+    if windows > 0 {
+        // Give the platform a moment to tear the webviews down; WebKit holds
+        // the cookie store open while a window is alive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    if let Some(main) = app.get_webview_window("main") {
+        // Clears the in-memory side of the shared context (cookies, cache).
+        let _ = main.clear_all_browsing_data();
+    }
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| AppError::new(format!("找不到内置浏览器的数据目录：{err}")))?;
+    let path = root.clone();
+    let (files, bytes) = tauri::async_runtime::spawn_blocking(move || sweep_web_store(&path))
+        .await
+        .map_err(|err| AppError::new(format!("清理内置浏览器数据失败：{err}")))?;
+    crate::ylog!("cleared web store at {}: {files} files, {bytes} bytes", root.display());
+    Ok(ClearedWebData {
+        windows,
+        files,
+        bytes,
+    })
+}
+
+/// Counts a file or directory tree so the UI can report what was freed.
+fn measure(path: &std::path::Path) -> (u64, u64) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return (0, 0);
+    };
+    if !meta.is_dir() {
+        return (1, meta.len());
+    }
+    let mut acc = (0, 0);
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let (files, bytes) = measure(&entry.path());
+            acc.0 += files;
+            acc.1 += bytes;
+        }
+    }
+    acc
+}
+
+fn wipe(path: &std::path::Path, into: &mut (u64, u64)) {
+    let (files, bytes) = measure(path);
+    let removed = if path.is_dir() {
+        std::fs::remove_dir_all(path).is_ok()
+    } else {
+        std::fs::remove_file(path).is_ok()
+    };
+    if removed {
+        into.0 += files;
+        into.1 += bytes;
+    }
+}
+
+/// Deletes the WebKit stores under `root`, keeping the app's own origin.
+fn sweep_web_store(root: &std::path::Path) -> (u64, u64) {
+    let mut acc = (0, 0);
+    for name in WEBKIT_STORES {
+        wipe(&root.join(name), &mut acc);
+    }
+    // Local storage is per origin: `*localhost*` is the app window, everything
+    // else belongs to a drive's web login.
+    if let Ok(entries) = std::fs::read_dir(root.join("localstorage")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains("localhost") {
+                continue;
+            }
+            wipe(&entry.path(), &mut acc);
+        }
+    }
+    acc
+}
+
 /// Emitted with a [`LoginEvent`] payload once the flow ends, either way.
 pub const EVENT_LOGIN: &str = "auth://web-login";
 /// Same shape as [`EVENT_LOGIN`], but for the 139 window.
@@ -732,4 +857,44 @@ pub async fn open_web_login_115(
         EVENT_LOGIN_115,
     )
     .await
+
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::sweep_web_store;
+
+    /// Clearing must drop the drive sites but leave the app's own origin so the
+    /// theme and the remembered drive survive a "clear cache" request.
+    #[test]
+    fn keeps_the_app_origin_and_drops_the_drive_sites() {
+        let root = std::env::temp_dir().join(format!(
+            "yunyu-webstore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let origin = |name: &str, bytes: usize| {
+            std::fs::create_dir_all(root.join("localstorage")).unwrap();
+            std::fs::write(root.join("localstorage").join(name), vec![0u8; bytes]).unwrap();
+        };
+        origin("http_localhost_5183.localstorage", 40);
+        origin("tauri_localhost_0.localstorage", 10);
+        origin("https_pan.quark.cn_0.localstorage", 70);
+        origin("https_115.com_0.localstorage", 20);
+        std::fs::create_dir_all(root.join("cookies")).unwrap();
+        std::fs::write(root.join("cookies").join("Cookies.db"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join("hsts-storage.sqlite"), vec![0u8; 5]).unwrap();
+
+        let (files, bytes) = sweep_web_store(&root);
+        assert_eq!(files, 4, "cookies db + hsts + the two drive origins");
+        assert_eq!(bytes, 100 + 5 + 70 + 20);
+        assert!(root.join("localstorage/http_localhost_5183.localstorage").exists());
+        assert!(root.join("localstorage/tauri_localhost_0.localstorage").exists());
+        assert!(!root.join("localstorage/https_pan.quark.cn_0.localstorage").exists());
+        assert!(!root.join("cookies").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

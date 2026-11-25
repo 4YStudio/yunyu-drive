@@ -224,6 +224,7 @@ pub fn run() {
             share::share_revoke,
             share::share_records,
             share::share_download,
+            login::clear_login_web_data,
             login::open_web_login,
             login::open_web_login_139,
             login::open_web_login_baidu,

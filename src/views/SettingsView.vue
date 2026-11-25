@@ -28,6 +28,27 @@ const dirty = computed(
   () => draft.value !== null && JSON.stringify(draft.value) !== JSON.stringify(app.settings),
 );
 const saving = ref(false);
+/** Clearing the webview store takes a moment: WebKit closes its files first. */
+const clearingWeb = ref(false);
+
+async function clearWebData() {
+  if (clearingWeb.value) return;
+  clearingWeb.value = true;
+  try {
+    const res = await api.clearLoginWebData();
+    const closed = res.windows > 0 ? `，关闭了 ${res.windows} 个登录窗口` : "";
+    toast(
+      res.files > 0
+        ? `已清除 ${res.files} 个文件（${formatSize(res.bytes)}）${closed}`
+        : `没有需要清理的数据${closed}`,
+      "success",
+    );
+  } catch (err) {
+    toast(errText(err), "error");
+  } finally {
+    clearingWeb.value = false;
+  }
+}
 
 onMounted(async () => {
   try {
@@ -353,6 +374,28 @@ const theme = computed({
             hint="显示以 . 开头的文件夹"
             @update:model-value="(v) => draft && (draft.showHidden = v)"
           />
+        </div>
+      </section>
+
+      <!-- browser data: the escape hatch for a login page stuck in a loop -->
+      <section class="group">
+        <h2 class="group-title">登录与缓存</h2>
+        <div class="card">
+          <div class="row">
+            <div class="row-copy">
+              <span class="row-label">清除内置浏览器数据</span>
+              <span class="row-hint">
+                清掉网页登录窗口留下的 Cookie、缓存与站点存储。某个网盘的登录页一直来回跳、
+                提示已登录却进不去时点这里。各网盘已保存的登录状态在本地配置文件里，不受影响。
+              </span>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn--ghost" :disabled="clearingWeb" @click="clearWebData">
+                <Icon v-if="clearingWeb" name="loader" :size="13" spin />
+                <span>{{ clearingWeb ? "正在清理…" : "立即清理" }}</span>
+              </button>
+            </div>
+          </div>
         </div>
       </section>
 

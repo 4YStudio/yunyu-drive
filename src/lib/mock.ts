@@ -488,6 +488,7 @@ export const mockApi = {
   providerLogout: async (provider: string) => {
     loggedIn.delete(provider);
   },
+  clearLoginWebData: async () => ({ windows: 0, files: 12, bytes: 4096 }),
 
   // All four drives report capacity, from very different endpoints; the
   // numbers differ per drive so a wrong-drive lookup is visible at a glance.

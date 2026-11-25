@@ -25,6 +25,9 @@ const message = ref<string | null>(null);
 let hasCode = false;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let stopped = false;
+/** When the code on screen was minted, so returning to this screen can tell
+ * whether it is still worth showing (the server expires it silently). */
+let startedAt = 0;
 /** Give the user a few minutes to scan; the server expires the code sooner,
  * but `expired` offers an immediate refresh, so this only bounds the wait. */
 let deadline = 0;
@@ -56,6 +59,7 @@ async function draw(content: string) {
 async function start() {
   stopPolling();
   stopped = false;
+  startedAt = Date.now();
   failures = 0;
   exchanges = 0;
   hasCode = false;
@@ -77,6 +81,9 @@ async function start() {
 /** The login page hands out a `-106` "waiting" status; polling faster than the
  * web client risks it treating us as a bot, so stay at 2 s. */
 const POLL_MS = 2000;
+/** A QR older than this is refreshed as soon as the screen comes back; the
+ * usual case is that the user switched to another screen for a while. */
+const QR_REFRESH_MS = 60_000;
 
 function schedulePoll() {
   stopPolling();
@@ -152,7 +159,19 @@ onDeactivated(() => {
 });
 
 onActivated(() => {
-  if (status.value !== "waiting" && status.value !== "scanned") return;
+  // Coming back from another screen: the code that is still on the canvas is
+  // usually minutes old and the server has already expired it without telling
+  // us, so mint a fresh one instead of showing a dead code.
+  if (status.value !== "waiting" && status.value !== "scanned") {
+    // Expired, abandoned or already signed in: every one of those wants a new
+    // code the next time the screen is shown.
+    if (status.value !== "loading") void start();
+    return;
+  }
+  if (Date.now() - startedAt > QR_REFRESH_MS) {
+    void start();
+    return;
+  }
   stopped = false;
   schedulePoll();
 });
@@ -194,6 +213,16 @@ void start();
         <span>用天翼云盘 App 扫描二维码登录</span>
       </template>
     </p>
+
+    <button
+      class="btn btn--ghost qr-refresh"
+      :disabled="status === 'loading'"
+      title="换一张新的二维码"
+      @click="start"
+    >
+      <Icon name="refresh" :size="12.5" />
+      <span>{{ status === "loading" ? "正在获取…" : "刷新二维码" }}</span>
+    </button>
   </div>
 </template>
 
@@ -251,5 +280,9 @@ void start();
 .qr-error {
   color: #e0554f;
   line-height: 1.5;
+}
+.qr-refresh {
+  margin-top: -2px;
+  font-size: 11.8px;
 }
 </style>
