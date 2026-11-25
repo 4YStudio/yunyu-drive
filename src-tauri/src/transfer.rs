@@ -795,8 +795,13 @@ impl TransferManager {
         let mut final_path = unique_path(&target_dir.join(&job.name));
         let mut part_path = with_suffix(&final_path, ".part");
         let resume_path = with_suffix(&target_dir.join(&job.name), ".part");
-        if !final_path.exists() && resume_path.exists() {
-            final_path = target_dir.join(&job.name);
+        // A `.part` on disk *is* the file we were downloading, so it wins even
+        // when a finished file of the same name exists (a retry that clashed
+        // with an older copy). Starting a fresh `"name (2).part"` next to it
+        // threw away every byte the previous attempt had, which looked exactly
+        // like "it is not resuming, it is downloading again".
+        if resume_path.exists() {
+            final_path = unique_path(&target_dir.join(&job.name));
             part_path = resume_path;
         }
         // Bytes already on disk count immediately, otherwise the progress bar
@@ -1068,6 +1073,13 @@ impl TransferManager {
         let mut done_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut failed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         // (child id, file key): the key is what ties a child back to its file.
+        // Files that still have a `.part` next to them: "continue" has to
+        // continue one of these, not race ahead to whatever the walk offers
+        // next. Walk files that are not in this set wait in `held` until every
+        // unfinished file has been picked up again.
+        let mut resuming = pending_partials(&root).await;
+        let mut front: std::collections::VecDeque<FolderFile> = std::collections::VecDeque::new();
+        let mut held: std::collections::VecDeque<FolderFile> = std::collections::VecDeque::new();
         let mut live: Vec<(String, String)> = Vec::new();
         let mut walking = true;
         let mut made_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -1076,7 +1088,10 @@ impl TransferManager {
         let mut first_error: Option<String> = None;
 
         loop {
-            if !walking && live.is_empty() {
+            if resuming.is_empty() && !held.is_empty() {
+                front.append(&mut held);
+            }
+            if !walking && live.is_empty() && front.is_empty() {
                 break;
             }
             if !self.folder_is_current(&id, generation).await {
@@ -1101,7 +1116,12 @@ impl TransferManager {
                     .await;
                     return;
                 }
-                file = rx.recv(), if can_take => match file {
+                file = async {
+                    if let Some(file) = front.pop_front() {
+                        return Some(file);
+                    }
+                    rx.recv().await
+                }, if can_take => match file {
                     Some(file) => {
                         if seen.insert(file_key(&file.relative_dir, &file.name)) {
                             total += 1;
@@ -1116,6 +1136,12 @@ impl TransferManager {
                             crate::paths::safe_join(&root, &file.relative_dir)
                         };
                         let key = file_key(&file.relative_dir, &file.name);
+                        if !resuming.is_empty() && !resuming.contains(&key) {
+                            // Not one of the unfinished ones: park it, the walk
+                            // resumes once the queue of partials is drained.
+                            held.push_back(file);
+                            continue;
+                        }
                         if file_complete(&dir.join(&file.name), file.size).await {
                             stored.insert(key.clone(), file.size);
                             done_files.insert(key);
@@ -1189,6 +1215,7 @@ impl TransferManager {
             for (cid, key, status, transferred, size, error) in states {
                 match status.as_str() {
                     "done" => {
+                        resuming.remove(&key);
                         stored.insert(key.clone(), size.max(transferred));
                         done_files.insert(key.clone());
                         failed_files.remove(&key);
@@ -1197,6 +1224,7 @@ impl TransferManager {
                     // write: the file is retried later, but those bytes are
                     // already on disk and must not be added twice.
                     "failed" | "canceled" => {
+                        resuming.remove(&key);
                         let known = stored.get(&key).copied().unwrap_or(0);
                         stored.insert(key.clone(), known.max(transferred));
                         if status == "failed" {
@@ -2093,6 +2121,35 @@ fn folder_bytes(
 /// same target on disk.
 fn file_key(relative_dir: &Path, name: &str) -> String {
     format!("{}/{}", relative_dir.to_string_lossy(), name)
+}
+
+/// Keys of the files a previous run left half-written in `dir`.
+///
+/// A resumed folder drains these before it continues the walk, so pressing
+/// continue visibly continues the file that was downloading when it stopped.
+async fn pending_partials(dir: &Path) -> std::collections::HashSet<String> {
+    let mut keys = std::collections::HashSet::new();
+    let mut queue = vec![(dir.to_path_buf(), PathBuf::new(), 0usize)];
+    while let Some((path, relative, depth)) = queue.pop() {
+        if depth > FOLDER_MAX_DEPTH {
+            continue;
+        }
+        let Ok(mut entries) = tokio::fs::read_dir(&path).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(kind) = entry.file_type().await else {
+                continue;
+            };
+            if kind.is_dir() {
+                queue.push((entry.path(), relative.join(&name), depth + 1));
+            } else if let Some(stem) = name.strip_suffix(".part") {
+                keys.insert(file_key(&relative, stem));
+            }
+        }
+    }
+    keys
 }
 
 /// A file already sitting on disk at its final size counts as downloaded, so a
@@ -3154,6 +3211,23 @@ mod tests {
         ) -> AppResult<Option<String>> {
             Err(AppError::new("不支持"))
         }
+    }
+
+    /// The files a paused folder left half-written are the ones that must be
+    /// picked up first, wherever they sit in the tree.
+    #[tokio::test]
+    async fn pending_partials_finds_partials_in_subdirectories() {
+        let root = std::env::temp_dir().join(format!("yy-partials-{}", std::process::id()));
+        let sub = root.join("a/b");
+        tokio::fs::create_dir_all(&sub).await.unwrap();
+        tokio::fs::write(root.join("one.mp4.part"), b"x").await.unwrap();
+        tokio::fs::write(sub.join("two.mp4.part"), b"x").await.unwrap();
+        tokio::fs::write(sub.join("three.mp4"), b"done").await.unwrap();
+        let keys = pending_partials(&root).await;
+        tokio::fs::remove_dir_all(&root).await.unwrap();
+        assert!(keys.contains(&file_key(Path::new(""), "one.mp4")));
+        assert!(keys.contains(&file_key(Path::new("a/b"), "two.mp4")));
+        assert!(!keys.iter().any(|k| k.contains("three")));
     }
 
     /// Pausing and resuming a file must not add its bytes twice: the user saw
