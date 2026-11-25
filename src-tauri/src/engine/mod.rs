@@ -1162,7 +1162,6 @@ mod tests {
 mod resume_bytes_tests {
     use super::source::Source as _;
     use super::*;
-    use futures_util::StreamExt as _;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
