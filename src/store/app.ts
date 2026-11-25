@@ -48,11 +48,6 @@ interface AppStore {
   account: AccountInfo | null;
   /** Bumped whenever the file list should refetch (login, share saved, …). */
   filesToken: number;
-  /**
-   * Folder expansion progress: a big folder is walked before its download tasks
-   * exist, and this is what the dialog shows meanwhile.
-   */
-  scan: { name: string; found: number } | null;
   /** A deep-linked share queued for the share view. */
   shareLink: string | null;
   shareNonce: number;
@@ -92,7 +87,6 @@ export const app = reactive<AppStore>({
   sidebarOpen: true,
   account: null,
   filesToken: 0,
-  scan: null,
   shareLink: null,
   shareNonce: 0,
   activeProvider: "quark",
@@ -506,9 +500,6 @@ export async function bootstrap() {
   });
   await events.onTransfersBatch(applyTransfers);
   await events.onTransfersRemovedMany(forgetTransfers);
-  await events.onScan((progress) => {
-    app.scan = progress;
-  });
   await events.onDeeplink((link) => openShareLink(link));
   // The tray's "传输列表" item switches screens from outside the UI.
   await events.onNavigate((view) => {

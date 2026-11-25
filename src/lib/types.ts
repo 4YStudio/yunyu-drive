@@ -114,8 +114,14 @@ export interface AuthStatus {
 
 export interface TransferTask {
   id: string;
-  /** `copy`/`move` are cross-drive jobs: stream down, then upload. */
-  kind: "download" | "upload" | "copy" | "move";
+  /**
+   * `copy`/`move` are cross-drive jobs: stream down, then upload.
+   *
+   * `folder` is a whole folder as one row: the backend walks it and downloads
+   * the files as hidden children, so the list does not explode into thousands
+   * of rows.
+   */
+  kind: "download" | "upload" | "copy" | "move" | "folder";
   name: string;
   fid: string | null;
   localPath: string;
@@ -156,6 +162,16 @@ export interface TransferTask {
   share?: { fidToken: string; pwdId: string; stoken: string } | null;
   /** Which drive this task belongs to, for the badge in the list. */
   provider?: ProviderId | "";
+  /** Hidden children of a folder task point back at it. */
+  parent?: string | null;
+  /** Bookkeeping row the list must not show (a file inside a folder task). */
+  hidden?: boolean;
+  /** A folder task is still walking the remote tree. */
+  listing?: boolean;
+  /** How many files a folder task has found / finished / failed. */
+  childrenTotal?: number;
+  childrenDone?: number;
+  childrenFailed?: number;
   /** Present for cross-drive moves/copies; `files` shrinks as they land. */
   cross?: {
     fromProvider: ProviderId | "";

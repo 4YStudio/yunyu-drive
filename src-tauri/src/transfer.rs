@@ -27,18 +27,6 @@ pub const EVENT_REMOVED: &str = "transfer://removed";
 pub const EVENT_TRANSFERS: &str = "transfer://batch";
 /// Many removals at once, same reason.
 pub const EVENT_REMOVED_MANY: &str = "transfer://removed-many";
-/// Progress while a folder is being walked before its tasks appear.
-pub const EVENT_SCAN: &str = "transfer://scan";
-
-/// Payload of [`EVENT_SCAN`]: the folder being expanded and how many files have
-/// been found so far.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScanProgress {
-    pub name: String,
-    pub found: usize,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferTask {
@@ -94,7 +82,66 @@ pub struct TransferTask {
     /// go and how far the job got, so a retry can pick up where it stopped.
     #[serde(default)]
     pub cross: Option<CrossRef>,
+    /// Id of the folder task a hidden child belongs to.
+    ///
+    /// A folder download is one row in the list: the walker streams the files it
+    /// finds into real download tasks, but those are bookkeeping — they are not
+    /// announced, not listed and not persisted, so a 3000-file folder means one
+    /// row and one progress number instead of 3000 of each.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Never leaves the backend; see `parent`.
+    #[serde(default)]
+    pub hidden: bool,
+    /// A folder task whose walk has not finished yet. `size` keeps growing while
+    /// this is true, so the list shows "正在读取" instead of a false percentage.
+    #[serde(default)]
+    pub listing: bool,
+    /// Files found by the walk, finished, and failed — the folder task's own
+    /// progress, shown as "12 / 340 个文件".
+    #[serde(default)]
+    pub children_total: u64,
+    #[serde(default)]
+    pub children_done: u64,
+    #[serde(default)]
+    pub children_failed: u64,
+    /// Root of the folder, so a retry can walk it again after a restart without
+    /// keeping the whole file list.
+    #[serde(default)]
+    pub folder: Option<FolderRef>,
 }
+
+/// Root of a folder download.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderRef {
+    /// Which drive the folder lives on (`"quark"`, `"pan115"`, …).
+    pub provider: String,
+    /// Native id on that drive.
+    pub fid: String,
+    pub name: String,
+}
+
+/// One file found by the folder walker.
+struct FolderFile {
+    /// Native id on the folder's drive.
+    fid: String,
+    name: String,
+    /// Subfolder inside the download root (empty for the root itself).
+    relative_dir: PathBuf,
+    size: u64,
+}
+
+/// How many child downloads a folder task keeps alive at once.
+///
+/// The queue gates the real concurrency, so this is only about not creating a
+/// hundred thousand tasks up front: a window also means a cancel is instant and
+/// the memory stays flat no matter how big the folder is.
+const FOLDER_WINDOW: usize = 24;
+/// How often a folder task re-reads its children and announces its progress.
+const FOLDER_TICK_MS: u64 = 400;
+/// Depth limit for the walk; deeper trees almost always mean a symlink loop.
+const FOLDER_MAX_DEPTH: usize = 32;
 
 /// One file of a cross-drive job, already expanded out of its folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +180,10 @@ pub struct CrossJob {
 
 impl TransferTask {
     fn emit(&self, app: &AppHandle) {
+        // A hidden child of a folder task reports through its parent.
+        if self.hidden {
+            return;
+        }
         let _ = app.emit(EVENT_TRANSFER, self.clone());
     }
 }
@@ -329,7 +380,11 @@ impl TransferManager {
         };
         let snapshot: Vec<TransferTask> = {
             let tasks = self.tasks.read().await;
-            let mut all: Vec<TransferTask> = tasks.values().cloned().collect();
+            let mut all: Vec<TransferTask> = tasks
+                .values()
+                .filter(|task| !task.hidden)
+                .cloned()
+                .collect();
             all.sort_by_key(|t| std::cmp::Reverse(t.created_at));
             // Unfinished work must survive a restart: its `.part` file is on
             // disk and the record is the only way back to it. Truncating the
@@ -411,7 +466,11 @@ impl TransferManager {
 
     pub async fn list(&self) -> Vec<TransferTask> {
         let tasks = self.tasks.read().await;
-        let mut all: Vec<TransferTask> = tasks.values().cloned().collect();
+        let mut all: Vec<TransferTask> = tasks
+            .values()
+            .filter(|task| !task.hidden)
+            .cloned()
+            .collect();
         all.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         all
     }
@@ -468,6 +527,9 @@ impl TransferManager {
         if let Some(task) = removed {
             discard_partial(&task).await;
         }
+        for child in self.remove_children(id).await {
+            discard_partial(&child).await;
+        }
         let _ = app.emit(EVENT_REMOVED, id.to_string());
         self.persist().await;
         Ok(())
@@ -476,9 +538,14 @@ impl TransferManager {
     pub async fn clear_finished(&self, app: &AppHandle) -> AppResult<()> {
         let removed: Vec<TransferTask> = {
             let mut tasks = self.tasks.write().await;
-            let keep = |t: &TransferTask| !matches!(t.status.as_str(), "done" | "failed" | "canceled");
-            let removed: Vec<TransferTask> =
-                tasks.values().filter(|t| !keep(t)).cloned().collect();
+            let keep = |t: &TransferTask| {
+                t.hidden || !matches!(t.status.as_str(), "done" | "failed" | "canceled")
+            };
+            let removed: Vec<TransferTask> = tasks
+                .values()
+                .filter(|t| !keep(t))
+                .cloned()
+                .collect();
             tasks.retain(|_, t| keep(t));
             removed
         };
@@ -574,6 +641,11 @@ impl TransferManager {
         }
         for task in discarded {
             discard_partial(&task).await;
+        }
+        for id in &removed {
+            for child in self.remove_children(id).await {
+                discard_partial(&child).await;
+            }
         }
         if !removed.is_empty() {
             self.persist().await;
@@ -692,6 +764,13 @@ impl TransferManager {
             share: job.share.clone(),
             provider: job.provider.clone(),
             cross: None,
+            parent: None,
+            hidden: false,
+            listing: false,
+            children_total: 0,
+            children_done: 0,
+            children_failed: 0,
+            folder: None,
         };
         let task = self.insert(task).await;
         if announce {
@@ -708,6 +787,339 @@ impl TransferManager {
         )
         .await;
         Ok(task)
+    }
+
+    /// Starts a folder download as **one** task.
+    ///
+    /// The walk streams files into hidden child downloads instead of turning the
+    /// folder into thousands of rows: the list shows one entry with "12 / 340 个
+    /// 文件", and a cancel or a pause is a single action on it. Nothing about the
+    /// file list is kept — a resume walks the folder again and counts the files
+    /// already on disk as done.
+    pub async fn start_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        folder: FolderRef,
+        dir: PathBuf,
+    ) -> AppResult<TransferTask> {
+        let provider = crate::providers::ProviderId::parse(&folder.provider)
+            .ok_or_else(|| AppError::new(format!("未知的网盘：{}", folder.provider)))?;
+        tokio::fs::create_dir_all(&dir).await?;
+        let task = TransferTask {
+            id: self.next_id().await,
+            kind: "folder".to_string(),
+            name: folder.name.clone(),
+            fid: Some(crate::providers::qualify(provider, &folder.fid)),
+            local_path: dir.to_string_lossy().to_string(),
+            remote_dir_fid: None,
+            size: 0,
+            transferred: 0,
+            speed: 0.0,
+            status: "queued".to_string(),
+            error: None,
+            created_at: now_millis(),
+            updated_at: now_millis(),
+            rapid: false,
+            prepared: 0,
+            connections: 0,
+            segments: 0,
+            segments_done: 0,
+            part_path: None,
+            share: None,
+            provider: folder.provider.clone(),
+            cross: None,
+            parent: None,
+            hidden: false,
+            listing: true,
+            children_total: 0,
+            children_done: 0,
+            children_failed: 0,
+            folder: Some(folder),
+        };
+        let task = self.insert(task).await;
+        task.emit(&app);
+        self.spawn_folder(app, drive, task.clone());
+        Ok(task)
+    }
+
+    /// Restarts a folder task after a pause, a cancel or a restart.
+    pub async fn resume_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        id: &str,
+    ) -> AppResult<TransferTask> {
+        let mut task = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .get(id)
+                .cloned()
+                .ok_or_else(|| AppError::new("任务不存在"))?
+        };
+        if task.kind != "folder" {
+            return Err(AppError::new("该任务不是文件夹下载"));
+        }
+        if task.folder.is_none() {
+            return Err(AppError::new("任务缺少文件夹信息"));
+        }
+        task.status = "queued".to_string();
+        task.error = None;
+        task.speed = 0.0;
+        task.transferred = 0;
+        task.listing = true;
+        task.children_total = 0;
+        task.children_done = 0;
+        task.children_failed = 0;
+        task.updated_at = now_millis();
+        let task = self.insert(task).await;
+        task.emit(&app);
+        self.spawn_folder(app, drive, task.clone());
+        Ok(task)
+    }
+
+    fn spawn_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        task: TransferTask,
+    ) {
+        let id = task.id.clone();
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let token = CancellationToken::new();
+            manager.cancels.lock().await.insert(id.clone(), token.clone());
+            manager.run_folder(app, drive, task, token).await;
+            manager.cancels.lock().await.remove(&id);
+        });
+    }
+
+    /// Walks the folder, hands each file to a child download, and reports the
+    /// aggregate on the parent row.
+    async fn run_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        parent: TransferTask,
+        token: CancellationToken,
+    ) {
+        let id = parent.id.clone();
+        let Some(folder) = parent.folder.clone() else {
+            return;
+        };
+        let Some(provider) = crate::providers::ProviderId::parse(&folder.provider) else {
+            return;
+        };
+        let root = PathBuf::from(&parent.local_path);
+        self.patch(&id, &app, |t| {
+            t.status = "running".to_string();
+            t.listing = true;
+            t.error = None;
+        })
+        .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<FolderFile>(256);
+        {
+            let walker = Arc::clone(&drive);
+            let walker_token = token.clone();
+            let start = folder.fid.clone();
+            tokio::spawn(async move {
+                walk_folder(walker, start, PathBuf::new(), tx, walker_token).await;
+            });
+        }
+
+        let mut live: Vec<String> = Vec::new();
+        let mut walking = true;
+        let mut made_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut bytes_found = 0u64;
+        let mut bytes_finished = 0u64;
+        let mut total = 0u64;
+        let mut done = 0u64;
+        let mut failed = 0u64;
+        let mut first_error: Option<String> = None;
+
+        loop {
+            if !walking && live.is_empty() {
+                break;
+            }
+            let can_take = walking && live.len() < FOLDER_WINDOW;
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    self.drop_children(&live, "canceled").await;
+                    // The command that cancelled us already set the status; only
+                    // the folder-specific fields are ours to clear.
+                    self.patch(&id, &app, |t| {
+                        t.listing = false;
+                        t.speed = 0.0;
+                    })
+                    .await;
+                    return;
+                }
+                file = rx.recv(), if can_take => match file {
+                    Some(file) => {
+                        total += 1;
+                        bytes_found += file.size;
+                        let dir = if file.relative_dir.as_os_str().is_empty() {
+                            root.clone()
+                        } else {
+                            crate::paths::safe_join(&root, &file.relative_dir)
+                        };
+                        if file_complete(&dir.join(&file.name), file.size).await {
+                            done += 1;
+                            bytes_finished += file.size;
+                        } else if made_dirs.insert(dir.clone())
+                            && tokio::fs::create_dir_all(&dir).await.is_err()
+                        {
+                            failed += 1;
+                        } else {
+                            let job = DownloadJob {
+                                fid: crate::providers::qualify(provider, &file.fid),
+                                name: file.name.clone(),
+                                size: file.size,
+                                dir: dir.to_string_lossy().to_string(),
+                                share: None,
+                                provider: folder.provider.clone(),
+                            };
+                            match self
+                                .start_download_quiet(
+                                    app.clone(),
+                                    DownloadCtx::Provider(Arc::clone(&drive)),
+                                    job,
+                                )
+                                .await
+                            {
+                                Ok(child) => {
+                                    let cid = child.id.clone();
+                                    // Marked hidden *before* any event can leave,
+                                    // so the row never flashes in the list.
+                                    self.patch(&cid, &app, |t| {
+                                        t.hidden = true;
+                                        t.parent = Some(id.clone());
+                                    })
+                                    .await;
+                                    live.push(cid);
+                                }
+                                Err(err) => {
+                                    failed += 1;
+                                    first_error.get_or_insert_with(|| err.to_string());
+                                }
+                            }
+                        }
+                    }
+                    None => walking = false,
+                },
+                _ = tokio::time::sleep(Duration::from_millis(FOLDER_TICK_MS)) => {}
+            }
+
+            // Reap the children that reached a terminal state.
+            let states = {
+                let tasks = self.tasks.read().await;
+                live.iter()
+                    .filter_map(|cid| {
+                        tasks.get(cid).map(|t| {
+                            (cid.clone(), t.status.clone(), t.transferred, t.size, t.error.clone())
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (cid, status, transferred, size, error) in states {
+                match status.as_str() {
+                    "done" => {
+                        done += 1;
+                        bytes_finished += size;
+                    }
+                    "failed" | "canceled" => {
+                        failed += 1;
+                        bytes_finished += transferred;
+                        if let Some(err) = error.filter(|e| !e.is_empty()) {
+                            first_error.get_or_insert(err);
+                        }
+                    }
+                    _ => continue,
+                }
+                self.tasks.write().await.remove(&cid);
+                live.retain(|x| x != &cid);
+            }
+
+            // Announce the folder's own numbers, not its children's.
+            let (live_bytes, live_speed) = {
+                let tasks = self.tasks.read().await;
+                live.iter().filter_map(|cid| tasks.get(cid)).fold(
+                    (0u64, 0f64),
+                    |(bytes, speed), t| (bytes + t.transferred, speed + t.speed),
+                )
+            };
+            let transferred = bytes_finished + live_bytes;
+            let size = bytes_found.max(transferred);
+            let listing = walking;
+            self.patch(&id, &app, move |t| {
+                t.transferred = transferred;
+                t.size = size;
+                t.speed = live_speed;
+                t.listing = listing;
+                t.children_total = total;
+                t.children_done = done;
+                t.children_failed = failed;
+            })
+            .await;
+            if !can_take {
+                tokio::time::sleep(Duration::from_millis(FOLDER_TICK_MS)).await;
+            }
+        }
+
+        let message = if total == 0 {
+            Some("文件夹中没有可下载的文件".to_string())
+        } else if failed > 0 {
+            Some(match first_error {
+                Some(err) if !err.is_empty() => format!("{failed} 个文件失败：{err}"),
+                _ => format!("{failed} 个文件下载失败"),
+            })
+        } else {
+            None
+        };
+        let ok = message.is_none();
+        self.patch(&id, &app, move |t| {
+            t.status = if ok { "done".to_string() } else { "failed".to_string() };
+            t.listing = false;
+            t.speed = 0.0;
+            t.error = message;
+            t.children_total = total;
+            t.children_done = done;
+            t.children_failed = failed;
+            t.transferred = bytes_finished;
+            t.size = bytes_found.max(bytes_finished);
+        })
+        .await;
+    }
+
+    /// Hidden children belong to their folder task: dropping the folder drops
+    /// them too.
+    async fn remove_children(&self, parent: &str) -> Vec<TransferTask> {
+        let mut tasks = self.tasks.write().await;
+        let ids: Vec<String> = tasks
+            .values()
+            .filter(|t| t.parent.as_deref() == Some(parent))
+            .map(|t| t.id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|cid| tasks.remove(&cid))
+            .collect()
+    }
+
+    /// Stops and drops the children of a folder task.
+    async fn drop_children(&self, live: &[String], status: &str) {
+        for cid in live {
+            self.cancel(cid).await;
+        }
+        let mut tasks = self.tasks.write().await;
+        for cid in live {
+            if let Some(task) = tasks.get_mut(cid) {
+                task.status = status.to_string();
+                task.speed = 0.0;
+            }
+            tasks.remove(cid);
+        }
     }
 
     /// Respawns a download for an existing task record, reusing its paths so a
@@ -976,6 +1388,13 @@ impl TransferManager {
             share: None,
             provider: drive.id().as_str().to_string(),
             cross: None,
+            parent: None,
+            hidden: false,
+            listing: false,
+            children_total: 0,
+            children_done: 0,
+            children_failed: 0,
+            folder: None,
         };
         let task = self.insert(task).await;
         task.emit(&app);
@@ -1184,6 +1603,13 @@ impl TransferManager {
             share: None,
             provider: from.id().as_str().to_string(),
             cross: Some(cross),
+            parent: None,
+            hidden: false,
+            listing: false,
+            children_total: 0,
+            children_done: 0,
+            children_failed: 0,
+            folder: None,
         };
         let task = self.insert(task).await;
         task.emit(&app);
@@ -1321,6 +1747,67 @@ impl TransferManager {
             }
         });
     }
+}
+
+/// Walks a folder on a drive and hands every file to `tx` with its path inside
+/// the folder. Runs on its own task so the supervisor below never waits on a
+/// listing while it could be starting downloads.
+async fn walk_folder(
+    drive: Arc<dyn DriveProvider>,
+    root: String,
+    prefix: PathBuf,
+    tx: tokio::sync::mpsc::Sender<FolderFile>,
+    token: CancellationToken,
+) {
+    let mut queue: std::collections::VecDeque<(String, PathBuf, usize)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root, prefix, 0));
+    while let Some((fid, dir, depth)) = queue.pop_front() {
+        if token.is_cancelled() {
+            return;
+        }
+        let listing = match drive.list(&fid).await {
+            Ok(listing) => listing,
+            Err(err) => {
+                crate::ylog!("文件夹读取失败 {fid}：{err}");
+                continue;
+            }
+        };
+        for entry in listing.entries {
+            if token.is_cancelled() {
+                return;
+            }
+            let name = crate::paths::safe_component(&entry.name);
+            let native = crate::providers::native_of(&entry.fid);
+            if entry.is_dir {
+                if depth < FOLDER_MAX_DEPTH {
+                    queue.push_back((native, dir.join(name), depth + 1));
+                }
+                continue;
+            }
+            let file = FolderFile {
+                fid: native,
+                name,
+                relative_dir: dir.clone(),
+                size: entry.size,
+            };
+            if tx.send(file).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// A file already sitting on disk at its final size counts as downloaded, so a
+/// resumed folder skips it without asking the drive anything.
+async fn file_complete(path: &Path, size: u64) -> bool {
+    if size == 0 {
+        return false;
+    }
+    tokio::fs::metadata(path)
+        .await
+        .map(|meta| meta.len() == size)
+        .unwrap_or(false)
 }
 
 /// Test hook: runs a cross-drive batch without a Tauri app handle so the live
@@ -2050,6 +2537,159 @@ pub fn now_millis() -> i64 {
 mod tests {
     use super::*;
 
+    /// Minimal drive: a fixed tree, so the folder walk can be tested without a
+    /// network or an `AppHandle`.
+    struct FakeDrive {
+        tree: std::collections::HashMap<String, Vec<(&'static str, &'static str, bool, u64)>>,
+    }
+
+    impl FakeDrive {
+        fn new() -> Self {
+            let mut tree = std::collections::HashMap::new();
+            // (native id, name, is_dir, size)
+            tree.insert(
+                "0".to_string(),
+                vec![("a", "a.txt", false, 5), ("sub", "sub", true, 0)],
+            );
+            tree.insert("sub".to_string(), vec![("b", "b.txt", false, 3)]);
+            Self { tree }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DriveProvider for FakeDrive {
+        fn id(&self) -> crate::providers::ProviderId {
+            crate::providers::ProviderId::Quark
+        }
+        fn capabilities(&self) -> crate::providers::Capabilities {
+            crate::providers::Capabilities::BASIC
+        }
+        async fn auth_state(&self) -> crate::providers::AuthState {
+            crate::providers::AuthState {
+                provider: crate::providers::ProviderId::Quark,
+                authenticated: true,
+                source: "file".to_string(),
+                masked: None,
+                credential_path: String::new(),
+                nickname: None,
+                avatar: None,
+                capabilities: crate::providers::Capabilities::BASIC,
+            }
+        }
+        async fn logout(&self) -> AppResult<()> {
+            Ok(())
+        }
+        async fn account(&self) -> AppResult<Option<crate::share::AccountInfo>> {
+            Ok(None)
+        }
+        async fn list(&self, dir: &str) -> AppResult<crate::providers::DirListing> {
+            let native = crate::providers::native_of(dir);
+            let rows = self.tree.get(&native).cloned().unwrap_or_default();
+            let entries = rows
+                .into_iter()
+                .map(|(fid, name, is_dir, size)| crate::providers::EntryDto {
+                    fid: crate::providers::qualify(crate::providers::ProviderId::Quark, fid),
+                    name: name.to_string(),
+                    pdir_fid: dir.to_string(),
+                    size,
+                    is_dir,
+                    format_type: String::new(),
+                    updated_at: 0,
+                    created_at: 0,
+                    ext: crate::providers::EntryDto::ext_of(name),
+                    provider: "quark".to_string(),
+                    thumb: None,
+                })
+                .collect();
+            Ok(crate::providers::DirListing {
+                pdir_fid: dir.to_string(),
+                entries,
+                total: 0,
+            })
+        }
+        async fn resolve_path(&self, _dir: &str) -> AppResult<Vec<crate::providers::PathNode>> {
+            Ok(Vec::new())
+        }
+        async fn make_dir(&self, _parent: &str, _name: &str) -> AppResult<String> {
+            Err(AppError::new("不支持"))
+        }
+        async fn rename(&self, _fid: &str, _name: &str) -> AppResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _fids: &[String]) -> AppResult<()> {
+            Ok(())
+        }
+        async fn transfer_entries(
+            &self,
+            _fids: &[String],
+            _to: &str,
+            _copy: bool,
+        ) -> AppResult<usize> {
+            Ok(0)
+        }
+        async fn search(
+            &self,
+            _dir: &str,
+            _keyword: &str,
+            _limit: u32,
+        ) -> AppResult<Vec<crate::providers::SearchHit>> {
+            Ok(Vec::new())
+        }
+        async fn open_download(&self, _fid: &str, _start: u64) -> AppResult<DownloadHandle> {
+            Err(AppError::new("不需要真的下载"))
+        }
+        async fn upload(
+            &self,
+            _local: &Path,
+            _parent: &str,
+            _name: &str,
+            _sink: Arc<dyn UploadSink>,
+            _token: CancellationToken,
+        ) -> AppResult<Option<String>> {
+            Err(AppError::new("不支持"))
+        }
+    }
+
+    /// The walk must flatten a tree into files with their paths inside the
+    /// folder, because that is what the children are told to create on disk.
+    #[tokio::test]
+    async fn folder_walk_flattens_the_tree_with_relative_paths() {
+        let drive: Arc<dyn DriveProvider> = Arc::new(FakeDrive::new());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        walk_folder(drive, "0".to_string(), PathBuf::new(), tx, CancellationToken::new()).await;
+
+        let mut found: Vec<(String, String, u64)> = Vec::new();
+        while let Some(file) = rx.recv().await {
+            found.push((
+                file.relative_dir.to_string_lossy().to_string(),
+                file.name,
+                file.size,
+            ));
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                (String::new(), "a.txt".to_string(), 5),
+                ("sub".to_string(), "b.txt".to_string(), 3),
+            ]
+        );
+    }
+
+    /// A resumed folder skips files that are already on disk at full size, and
+    /// does not trust a name-only match with the wrong size.
+    #[tokio::test]
+    async fn a_file_counts_as_done_only_at_its_final_size() {
+        let dir = std::env::temp_dir().join(format!("quark-f-{}", now_millis()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("a.txt");
+        tokio::fs::write(&path, b"12345").await.unwrap();
+        assert!(file_complete(&path, 5).await);
+        assert!(!file_complete(&path, 6).await);
+        assert!(!file_complete(&dir.join("missing.txt"), 0).await);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
     fn sample(id: &str, status: &str, part: Option<&str>) -> TransferTask {
         TransferTask {
             id: id.to_string(),
@@ -2074,6 +2714,13 @@ mod tests {
             share: None,
             provider: "quark".to_string(),
             cross: None,
+            parent: None,
+            hidden: false,
+            listing: false,
+            children_total: 0,
+            children_done: 0,
+            children_failed: 0,
+            folder: None,
         }
     }
 

@@ -765,8 +765,6 @@ async function confirmDownload() {
     toast(errText(err), "error");
   } finally {
     downloading.value = false;
-    // The walk may have reported progress; the queue is built now.
-    app.scan = null;
   }
 }
 
@@ -1462,13 +1460,7 @@ defineExpose({ refresh });
           :disabled="downloading || !downloadPrompt?.dir"
           @click="confirmDownload"
         >
-          {{
-            downloading
-              ? app.scan
-                ? `已找到 ${app.scan.found} 个文件…`
-                : "正在扫描文件夹…"
-              : "开始下载"
-          }}
+          {{ downloading ? "正在加入队列…" : "开始下载" }}
         </button>
       </template>
     </Modal>

@@ -5,7 +5,7 @@
 //! forwarded. The only drive-specific pieces left in this file are the Quark
 //! cookie lives in `state.rs` and the share endpoints in `share.rs`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -830,8 +830,6 @@ pub async fn download_entries(
         return Err(AppError::new("请先在设置中选择下载目录"));
     }
     let mut tasks = Vec::new();
-    // Tasks that were started silently, to be announced in one event.
-    let mut batched: Vec<TransferTask> = Vec::new();
     for item in items {
         let id = crate::providers::EntryId::parse(&item.fid)?;
         let drive = state.drive_of(id.provider).await?;
@@ -853,69 +851,26 @@ pub async fn download_entries(
             continue;
         }
 
-        // Folders are flattened into one task per file so progress, cancel and
-        // resume keep working per file; the folder name becomes the local root.
+        // A folder becomes **one** task. Its files are downloaded by hidden
+        // children inside the transfer manager, so the list stays readable and
+        // pause / cancel / resume act on the folder as a whole.
         let root = crate::paths::unique_path(
             &PathBuf::from(&target).join(crate::paths::safe_component(&item.name)),
         );
-        tokio::fs::create_dir_all(&root).await?;
-        // Walking a big folder takes a while and used to be invisible: the
-        // dialog sat on "正在加入队列…" for minutes with no sign of progress.
-        let watcher = app.clone();
-        let label = item.name.clone();
-        let mut last_report = std::time::Instant::now();
-        let files = collect_remote_files(&drive, &id.native, |found| {
-            if last_report.elapsed() < std::time::Duration::from_millis(400) {
-                return;
-            }
-            last_report = std::time::Instant::now();
-            let _ = watcher.emit(
-                crate::transfer::EVENT_SCAN,
-                crate::transfer::ScanProgress {
-                    name: label.clone(),
-                    found,
-                },
-            );
-        })
-        .await?;
-        if files.is_empty() {
-            return Err(AppError::new(format!("「{}」中没有可下载的文件", item.name)));
-        }
-        let mut made_dirs: HashSet<PathBuf> = HashSet::new();
-        for file in files {
-            let dir = match file.relative.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => {
-                    crate::paths::safe_join(&root, parent)
-                }
-                _ => root.clone(),
-            };
-            // One syscall per distinct subfolder, not per file: a flat folder of
-            // 3000 files asked the kernel the same question 3000 times.
-            if made_dirs.insert(dir.clone()) {
-                tokio::fs::create_dir_all(&dir).await?;
-            }
-            let job = DownloadJob {
-                fid: qualify(id.provider, &file.fid),
-                name: file.name,
-                size: file.size,
-                dir: dir.to_string_lossy().to_string(),
-                share: None,
-                provider: id.provider.as_str().to_string(),
-            };
-            // Quiet: the whole batch is announced once, below.
-            let task = state
+        let folder = crate::transfer::FolderRef {
+            provider: id.provider.as_str().to_string(),
+            fid: id.native.clone(),
+            name: item.name.clone(),
+        };
+        tasks.push(
+            state
                 .transfers
-                .start_download_quiet(app.clone(), arc_ctx(Arc::clone(&drive)), job)
-                .await?;
-            batched.push(task.clone());
-            tasks.push(task);
-        }
+                .start_folder(app.clone(), drive, folder, root)
+                .await?,
+        );
     }
     if tasks.is_empty() {
         return Err(AppError::new("没有可下载的内容"));
-    }
-    if !batched.is_empty() {
-        let _ = app.emit(crate::transfer::EVENT_TRANSFERS, &batched);
     }
     Ok(tasks)
 }
@@ -1266,6 +1221,16 @@ async fn retry_task(state: &Arc<AppState>, app: AppHandle, id: &str) -> AppResul
             )
             .await?;
         return state.transfers.retry_cross(app, from, to, &id).await;
+    }
+    if task.kind == "folder" {
+        let folder = task
+            .folder
+            .clone()
+            .ok_or_else(|| AppError::new("任务缺少文件夹信息"))?;
+        let provider = ProviderId::parse(&folder.provider)
+            .ok_or_else(|| AppError::new(format!("未知的网盘：{}", folder.provider)))?;
+        let drive = state.drive_of(provider).await?;
+        return state.transfers.resume_folder(app, drive, &id).await;
     }
     if task.kind != "download" {
         return Err(AppError::new("上传任务无法续传，请重新上传"));

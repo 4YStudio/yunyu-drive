@@ -236,8 +236,6 @@ export const events = {
   onTransfersRemovedMany: (cb: (ids: string[]) => void): Promise<UnlistenFn> =>
     listen<string[]>("transfer://removed-many", (e) => cb(e.payload)),
   /** How many files a folder walk has found so far, before any task exists. */
-  onScan: (cb: (progress: { name: string; found: number }) => void): Promise<UnlistenFn> =>
-    listen<{ name: string; found: number }>("transfer://scan", (e) => cb(e.payload)),
   onWebLogin: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
     listen<WebLoginEvent>("auth://web-login", (e) => cb(e.payload)),
   onWebLogin139: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>

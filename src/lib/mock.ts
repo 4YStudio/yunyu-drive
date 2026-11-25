@@ -212,6 +212,12 @@ function makeTransfer(partial: Partial<TransferTask> & { name: string; kind: Tra
     partPath: null,
     share: null,
     cross: null,
+    parent: null,
+    hidden: false,
+    listing: false,
+    childrenTotal: 0,
+    childrenDone: 0,
+    childrenFailed: 0,
     provider: "quark",
     ...partial,
   };
@@ -232,6 +238,19 @@ function seedTransfers() {
     segmentsDone: 719,
   });
   transfers.push(running);
+  // A folder download: one row for a whole tree, files counted underneath.
+  transfers.push(
+    makeTransfer({
+      kind: "folder",
+      name: "2026 年度素材",
+      size: 12_400_000_000,
+      transferred: 4_100_000_000,
+      speed: 12_400_000,
+      listing: true,
+      childrenTotal: 1268,
+      childrenDone: 412,
+    }),
+  );
   transfers.push(
     makeTransfer({
       kind: "upload",
@@ -876,7 +895,6 @@ export const mockEvents = {
       removedManyListeners.delete(cb);
     };
   },
-  onScan: async (_cb: (progress: { name: string; found: number }) => void) => () => {},
   onDeeplink: async (_cb: (link: string) => void) => () => {},
   onNavigate: async (_cb: (view: string) => void) => () => {},
 };

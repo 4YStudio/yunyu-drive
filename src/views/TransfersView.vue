@@ -33,7 +33,7 @@ const visible = computed(() => {
   return list.filter((task) => {
     if (kindFilter.value === "cross" && !isCross(task)) return false;
     else if (kindFilter.value === "upload" && task.kind !== "upload") return false;
-    else if (kindFilter.value === "download" && task.kind !== "download") return false;
+    else if (kindFilter.value === "download" && !isDownload(task)) return false;
     if (statusFilter.value === "active") return ACTIVE.includes(task.status);
     if (statusFilter.value === "finished") return FINISHED.includes(task.status);
     return true;
@@ -128,7 +128,7 @@ async function bulk(action: "pause" | "cancel" | "remove" | "resume") {
 const counts = computed(() => ({
   active: all.value.filter((t) => ACTIVE.includes(t.status)).length,
   upload: all.value.filter((t) => t.kind === "upload").length,
-  download: all.value.filter((t) => t.kind === "download").length,
+  download: all.value.filter((t) => isDownload(t)).length,
   cross: all.value.filter(isCross).length,
 }));
 
@@ -138,11 +138,17 @@ function isCross(task: TransferTask) {
 }
 
 function isDownload(task: TransferTask) {
-  return task.kind === "download";
+  return task.kind === "download" || task.kind === "folder";
+}
+
+/** A whole folder downloaded as one row. */
+function isFolder(task: TransferTask) {
+  return task.kind === "folder";
 }
 
 function kindLabel(task: TransferTask) {
   if (isCross(task)) return task.kind === "copy" ? "跨盘复制" : "跨盘移动";
+  if (isFolder(task)) return "文件夹";
   return task.kind === "download" ? "下载" : "上传";
 }
 
@@ -202,6 +208,9 @@ function statusLabel(task: TransferTask) {
       return task.kind === "download" ? "校验中" : "预处理中";
     case "running":
       if (isCross(task)) return task.kind === "copy" ? "复制中" : "移动中";
+      // A folder is walking and downloading at the same time; before the first
+      // file shows up there is nothing to count, so say what it is doing.
+      if (isFolder(task)) return task.listing && !task.size ? "读取中" : "下载中";
       return task.kind === "download" ? "下载中" : "上传中";
     case "done":
       return task.rapid ? "秒传完成" : "已完成";
@@ -362,7 +371,15 @@ onActivated(() => {
           </label>
           <div class="task-glyph">
             <Icon
-              :name="isCross(task) ? 'arrow-up-down' : task.kind === 'download' ? 'download' : 'upload'"
+              :name="
+                isCross(task)
+                  ? 'arrow-up-down'
+                  : isFolder(task)
+                    ? 'folder'
+                    : task.kind === 'download'
+                      ? 'download'
+                      : 'upload'
+              "
               :size="15"
               :stroke="1.7"
             />
@@ -397,6 +414,18 @@ onActivated(() => {
                 {{ formatSize(task.transferred + preparedSize(task)) }} /
                 {{ formatSize(task.size) }}
               </span>
+              <template v-if="isFolder(task)">
+                <span class="dot">·</span>
+                <span class="mono">
+                  {{ task.childrenDone ?? 0 }} / {{ task.childrenTotal ?? 0 }} 个文件
+                </span>
+                <span v-if="task.listing" class="dot">·</span>
+                <span v-if="task.listing" class="task-pool">正在读取</span>
+                <template v-if="task.childrenFailed">
+                  <span class="dot">·</span>
+                  <span class="task-error">{{ task.childrenFailed }} 个文件失败</span>
+                </template>
+              </template>
               <template v-if="task.status === 'running'">
                 <span class="dot">·</span>
                 <span class="mono">{{ formatSpeed(task.speed) }}</span>
@@ -432,7 +461,7 @@ onActivated(() => {
               <Icon name="x" :size="14" />
             </button>
             <button
-              v-if="task.status === 'done' && isDownload(task)"
+              v-if="task.status === 'done' && task.kind === 'download'"
               class="icon-btn"
               title="打开文件"
               @click="open(task)"
@@ -450,7 +479,13 @@ onActivated(() => {
             <button
               v-if="(isDownload(task) || isCross(task)) && ['failed', 'canceled', 'paused'].includes(task.status)"
               class="icon-btn"
-              :title="isCross(task) ? '继续传输' : '继续下载（断点续传）'"
+              :title="
+                isCross(task)
+                  ? '继续传输'
+                  : isFolder(task)
+                    ? '继续下载（已下好的文件会跳过）'
+                    : '继续下载（断点续传）'
+              "
               @click="retry(task)"
             >
               <Icon name="play" :size="14" />
