@@ -334,7 +334,6 @@ impl Cloud189QrSession {
             refresh_token: text(&value, "refreshToken"),
             nickname: text(&value, "loginName"),
             avatar: None,
-            web_cookie: String::new(),
         })
     }
 

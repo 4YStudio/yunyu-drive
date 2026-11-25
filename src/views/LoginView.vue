@@ -64,7 +64,6 @@ let unlisten: UnlistenFn | null = null;
 let unlisten139: UnlistenFn | null = null;
 let unlistenBaidu: UnlistenFn | null = null;
 let unlisten115: UnlistenFn | null = null;
-let unlisten189: UnlistenFn | null = null;
 
 const meta = computed(
   () => PROVIDERS.find((p) => p.id === target.value) ?? PROVIDERS[0],
@@ -204,7 +203,6 @@ async function loginWithWeb() {
     if (target.value === "yun139") await api.openWebLogin139();
     else if (target.value === "baidu") await api.openWebLoginBaidu();
     else if (target.value === "pan115") await api.openWebLogin115();
-    else if (target.value === "cloud189") await api.openWebLogin189();
     else await api.openWebLogin();
   } catch (err) {
     error.value = errText(err);
@@ -405,17 +403,6 @@ onMounted(async () => {
       toast(evt.message, "error");
     }
   });
-  unlisten189 = await events.onWebLogin189(async (evt) => {
-    webBusy.value = false;
-    // This window only adds the web session the recycle bin needs; the account
-    // itself still comes from the QR flow, so nothing is switched here.
-    if (evt.ok) {
-      toast("网页会话已保存，回收站可以用了", "success");
-      await loadProviderStates();
-    } else if (evt.message && evt.message !== "登录窗口已关闭") {
-      toast(evt.message, "error");
-    }
-  });
 });
 
 onBeforeUnmount(() => {
@@ -427,8 +414,6 @@ onBeforeUnmount(() => {
   unlistenBaidu = null;
   unlisten115?.();
   unlisten115 = null;
-  unlisten189?.();
-  unlisten189 = null;
   if (webBusy.value) void api.closeWebLogin().catch(() => {});
 });
 </script>
@@ -570,20 +555,6 @@ onBeforeUnmount(() => {
            only the QR flow produces. -->
       <template v-else-if="target === 'cloud189'">
         <Cloud189QrLogin @done="onCloud189Done" />
-        <button
-          v-if="state?.authenticated"
-          class="btn btn--ghost btn--wide"
-          :disabled="webBusy"
-          @click="loginWithWeb"
-        >
-          <Icon v-if="webBusy" name="loader" :size="14" spin />
-          <Icon v-else name="external" :size="14" />
-          <span>{{ webBusy ? "等待登录窗口…" : "网页登录（启用回收站）" }}</span>
-        </button>
-        <p v-if="state?.authenticated" class="hint">
-          <Icon name="info" :size="12.5" />
-          <span>天翼的回收站只在网页版提供，需要额外登录一次网页版；扫码登录本身不受影响。</span>
-        </p>
         <details class="manual">
           <summary>
             <Icon name="info" :size="13" />

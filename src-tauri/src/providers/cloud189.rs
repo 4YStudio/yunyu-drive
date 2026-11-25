@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use reqwest::header::{HeaderMap, CONTENT_RANGE, LOCATION, SET_COOKIE};
+use reqwest::header::CONTENT_RANGE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::Sha1;
@@ -77,10 +77,6 @@ pub struct Cloud189Credentials {
     /// Inlined `data:` avatar, or a remote URL until `profile()` runs.
     #[serde(default)]
     pub avatar: Option<String>,
-    /// Cookie header for the `/v2/*` web endpoints (recycle bin only).
-    /// Minted from `accessToken` through the SSO bridge, never typed by anyone.
-    #[serde(default)]
-    pub web_cookie: String,
 }
 
 impl Cloud189Credentials {
@@ -141,31 +137,6 @@ impl Cloud189Provider {
             }
         );
         Ok(Self::new(creds, path.to_string_lossy().to_string()))
-    }
-
-    /// Installs a web session harvested from the login window.
-    ///
-    /// The recycle bin only exists on `cloud.189.cn`, which authenticates with
-    /// the browser cookies (`COOKIE_LOGIN_USER`) instead of the signed client
-    /// session. The bridge that used to mint those cookies from the client
-    /// token (`open/ssoLoginByAccessToken`) now demands a web session first, so
-    /// a one-off web login is the only way in.
-    pub async fn save_web_cookie(own_dir: &Path, cookie: &str) -> AppResult<Self> {
-        let drive = Self::load(own_dir)?;
-        let cookie = cookie.trim().to_string();
-        if !cookie.contains("COOKIE_LOGIN_USER") {
-            return Err(AppError::new("天翼云盘网页版还没有登录完成"));
-        }
-        {
-            let mut creds = drive.creds.write().await;
-            creds.web_cookie = cookie.clone();
-        }
-        drive.persist().await;
-        crate::ylog!(
-            "cloud189 web: harvested {} cookies from the login window",
-            cookie.matches('=').count()
-        );
-        Ok(drive)
     }
 
     fn http(&self) -> AppResult<reqwest::Client> {
@@ -829,110 +800,14 @@ impl Cloud189Provider {
         Ok(value)
     }
 
-    /// Metadata of a share, addressed by the code in the link.
-    /// A cookie header for the `/v2/*` web endpoints, minted from the client
-    /// token.
+    /// One call against the web API (`cloud.189.cn/api/portal/**`).
     ///
-    /// The two APIs are separate universes: everything else in this driver signs
-    /// requests with `sessionSecret`, but `/v2/*` (which is the only place the
-    /// recycle bin exists) authenticates with a browser cookie. Rather than ask
-    /// the user to log in a second time, `open/ssoLoginByAccessToken` hands back
-    /// a URL that sets that cookie when fetched — so one QR scan covers both.
-    async fn web_cookie(&self, force: bool) -> AppResult<String> {
-        if !force {
-            let cached = self.creds.read().await.web_cookie.clone();
-            if !cached.trim().is_empty() {
-                return Ok(cached);
-            }
-        }
-        let token = self.open_token().await?;
-        let stamp = chrono::Utc::now().timestamp_millis().to_string();
-        let form = [
-            ("appId", APP_ID.to_string()),
-            ("redirectUrl", format!("{WEB}/web/main")),
-        ];
-        let mut pairs = [
-            ("AccessToken".to_string(), token.clone()),
-            ("Timestamp".to_string(), stamp.clone()),
-            ("appId".to_string(), APP_ID.to_string()),
-            ("redirectUrl".to_string(), format!("{WEB}/web/main")),
-        ];
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        let plain = pairs
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        let res = self
-            .http()?
-            .post(format!("{API}/open/ssoLoginByAccessToken.action"))
-            .header("AccessToken", &token)
-            .header("Timestamp", &stamp)
-            .header("Signature", md5_hex(&plain))
-            .header("Sign-Type", "1")
-            .header("Accept", "application/json;charset=UTF-8")
-            .header("X-Request-ID", random_id())
-            .form(&form[..])
-            .send()
-            .await
-            .map_err(|e| net_error("换取天翼云盘网页会话", &e))?;
-        let status = res.status().as_u16();
-        let body = res
-            .text()
-            .await
-            .map_err(|e| net_error("读取天翼云盘网页会话", &e))?;
-        let start = body.trim().to_string();
-        if !start.starts_with("http") {
-            crate::ylog!(
-                "cloud189 web: sso HTTP {status} head={}",
-                head(&body, 200)
-            );
-            return Err(AppError::new(format!(
-                "换取天翼云盘网页会话失败（HTTP {status}）"
-            )));
-        }
-        // The bridge answers with a URL, not JSON; fetching it (through however
-        // many hops it takes) is what actually sets COOKIE_LOGIN_USER.
-        let mut jar: std::collections::BTreeMap<String, String> = Default::default();
-        let mut next = start;
-        for _ in 0..5 {
-            let res = self
-                .http()?
-                .get(&next)
-                .header("User-Agent", crate::share::UA)
-                .header("Cookie", cookie_header(&jar))
-                .send()
-                .await
-                .map_err(|e| net_error("跟随天翼云盘网页登录", &e))?;
-            collect_cookies(&mut jar, res.headers());
-            let redirect = res
-                .headers()
-                .get(LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            match redirect {
-                Some(loc) if res.status().is_redirection() => {
-                    next = if loc.starts_with("http") {
-                        loc
-                    } else {
-                        format!("{WEB}{loc}")
-                    };
-                }
-                _ => break,
-            }
-        }
-        let header = cookie_header(&jar);
-        if !header.contains("COOKIE_LOGIN_USER") {
-            return Err(AppError::new("天翼云盘网页会话没有返回登录凭据，请重新登录"));
-        }
-        self.creds.write().await.web_cookie = header.clone();
-        self.persist().await;
-        crate::ylog!("cloud189 web: session ready ({} cookies)", jar.len());
-        Ok(header)
-    }
-
-    /// One call against the web API (`cloud.189.cn`, cookie auth), retried once
-    /// with a freshly minted cookie when the old one is refused.
+    /// This is the browser's API, not the client's: the recycle bin only exists
+    /// here. It authenticates with the **client session key as a query
+    /// parameter** (`?sessionKey=…`) — no cookie, no signature. The cookie route
+    /// the web client uses cannot be reproduced from a client token
+    /// (`ssoLoginByAccessToken` answers 400 `cookieUserSession is null`), so the
+    /// session key is the whole story, and one QR scan covers both APIs.
     async fn web_request(
         &self,
         post: bool,
@@ -941,58 +816,57 @@ impl Cloud189Provider {
         form: &[(&str, String)],
     ) -> AppResult<Value> {
         let (session_key, _) = self.session().await;
-        for attempt in 0..2 {
-            let cookie = self.web_cookie(attempt > 0).await?;
-            let method = if post {
-                reqwest::Method::POST
-            } else {
-                reqwest::Method::GET
-            };
-            let mut req = self
-                .http()?
-                .request(method, format!("{WEB}{path}"))
-                .header("User-Agent", crate::share::UA)
-                .header("SessionKey", &session_key)
-                .header("Cookie", &cookie)
-                .header("Accept", "application/json;charset=UTF-8")
-                .header("Referer", format!("{WEB}/web/main/recycle"))
-                .header("Origin", WEB)
-                .header("sign-type", "1")
-                .query(&[("returnType", "JSON")]);
-            for (k, v) in query {
-                req = req.query(&[(*k, v.as_str())]);
-            }
-            if post {
-                req = req.form(&form.to_vec());
-            }
-            let res = req
-                .send()
-                .await
-                .map_err(|e| net_error("访问天翼云盘回收站", &e))?;
-            let status = res.status().as_u16();
-            let body = res
-                .text()
-                .await
-                .map_err(|e| net_error("读取天翼云盘回收站", &e))?;
-            if body.trim().is_empty() {
-                return Ok(json!({}));
-            }
-            let value: Value =
-                serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body }));
-            match resp_error(&value, status) {
-                Some(err)
-                    if attempt == 0
-                        && (err.contains("InvalidSessionKey")
-                            || err.contains("cookieUserSession")) =>
-                {
-                    crate::ylog!("cloud189 web: cookie rejected, minting again");
-                    continue;
-                }
-                Some(err) => return Err(AppError::new(format!("天翼云盘：{err}"))),
-                None => return Ok(value),
-            }
+        if session_key.is_empty() {
+            return Err(AppError::new("天翼云盘登录状态已失效，请重新登录"));
         }
-        Err(AppError::new("天翼云盘网页会话已失效，请重新登录"))
+        let (method, url) = if post {
+            ("POST", format!("{WEB}{path}"))
+        } else {
+            ("GET", format!("{WEB}{path}"))
+        };
+        let mut req = self
+            .http()?
+            .request(
+                method.parse().map_err(|_| AppError::new("不支持的请求方法"))?,
+                &url,
+            )
+            .header("User-Agent", crate::share::UA)
+            .header("Accept", "application/json;charset=UTF-8")
+            .header("Referer", format!("{WEB}/web/main/recycle"))
+            .header("Origin", WEB)
+            .query(&[("sessionKey", session_key.as_str()), ("returnType", "JSON")]);
+        for (k, v) in query {
+            req = req.query(&[(*k, v.as_str())]);
+        }
+        if post {
+            req = req.form(&form.to_vec());
+        }
+        let started = std::time::Instant::now();
+        let res = req
+            .send()
+            .await
+            .map_err(|e| net_error("访问天翼云盘回收站", &e))?;
+        let status = res.status().as_u16();
+        let body = res
+            .text()
+            .await
+            .map_err(|e| net_error("读取天翼云盘回收站", &e))?;
+        crate::logging::http(
+            "cloud189",
+            method,
+            &url,
+            Some(status),
+            started.elapsed().as_millis(),
+            body.len(),
+        );
+        if body.trim().is_empty() {
+            return Ok(json!({}));
+        }
+        let value: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({ "raw": body }));
+        match resp_error(&value, status) {
+            Some(err) => Err(AppError::new(format!("天翼云盘：{err}"))),
+            None => Ok(value),
+        }
     }
 
     /// A recycle-bin batch task: create it, then wait for it.
@@ -1193,10 +1067,9 @@ impl DriveProvider for Cloud189Provider {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             // Browsing, saving and creating shares go through the `open/share`
-            // family. The recycle bin lives on the `/v2/*` web endpoints, which
-            // want a cookie session instead of the session-key signature; that
-            // cookie is minted from the client token (see `web_cookie`), so the
-            // user still only scans once.
+            // family. The recycle bin lives on `cloud.189.cn/api/portal/**`,
+            // which takes the same session key as a query parameter, so one QR
+            // scan covers both APIs.
             share_open: true,
             share_create: true,
             recycle: true,
@@ -2217,29 +2090,6 @@ impl Cloud189Provider {
 // ------------------------------------------------------------- helpers ---
 
 /// Lowercase MD5 of a string, the digest the `open/*` family signs with.
-fn cookie_header(jar: &std::collections::BTreeMap<String, String>) -> String {
-    jar.iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-/// Keep whatever `Set-Cookie` names/values a hop handed back; the rest of the
-/// attributes (path, expiry, flags) do not matter for a short replay.
-fn collect_cookies(jar: &mut std::collections::BTreeMap<String, String>, headers: &HeaderMap) {
-    for raw in headers.get_all(SET_COOKIE) {
-        let Ok(text) = raw.to_str() else { continue };
-        let pair = text.split(';').next().unwrap_or("").trim();
-        let Some((name, value)) = pair.split_once('=') else {
-            continue;
-        };
-        if name.is_empty() {
-            continue;
-        }
-        jar.insert(name.to_string(), value.to_string());
-    }
-}
-
 fn md5_hex(text: &str) -> String {
     use md5::Digest as _;
     let mut hasher = md5::Md5::new();
@@ -2856,6 +2706,78 @@ mod tests {
     /// Exercises the `open/share` family against the live account: open the
     /// sample link, page through it, mint a download link, then create and
     /// revoke a share of a scratch file.
+    /// Recycle bin end-to-end: delete a folder, find it, restore it, delete it
+    /// again, purge it.
+    ///
+    /// `cargo test --lib cloud189_live_recycle -- --ignored --nocapture`
+    ///
+    /// The bin is the one place on 189 that lives on the browser API
+    /// (`cloud.189.cn/api/portal/**`) rather than the signed client API, so this
+    /// pins down that the session key really is enough — no web login, no
+    /// cookies. It also covers the two bugs the first live pass found: folders
+    /// riding in `folderList` (invisible when only `fileList` was read) and a
+    /// paging loop that stopped on a short page (pages hold files *and*
+    /// folders, so a short page is not the last one).
+    #[tokio::test]
+    #[ignore = "hits the live 189 account"]
+    async fn cloud189_live_recycle() {
+        let dir = crate::config::AppPaths::resolve().unwrap().config_dir;
+        let drive = Cloud189Provider::load(&dir).expect("cloud189.json");
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name = format!("yunyu-rb-{stamp}");
+
+        // A folder, not a file: that is the case the old listing code missed.
+        let folder = drive.make_dir("0", &name).await.expect("make_dir");
+        drive
+            .delete(std::slice::from_ref(&folder))
+            .await
+            .expect("delete into the bin");
+
+        let items = drive.recycle_list(0, 100).await.expect("recycle_list");
+        println!("recycle bin: {} entries", items.len());
+        let hit = items
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} should be in the bin"));
+        assert!(hit.is_dir, "a deleted folder must be listed as a directory");
+
+        drive
+            .recycle_restore(std::slice::from_ref(hit))
+            .await
+            .expect("restore");
+        let root = drive.list("0").await.expect("root listing");
+        let restored = root
+            .entries
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} should be back in the root"));
+        println!("restored -> {}", restored.fid);
+
+        drive
+            .delete(std::slice::from_ref(&restored.fid))
+            .await
+            .expect("delete again");
+        let items = drive.recycle_list(0, 100).await.expect("recycle_list");
+        let hit = items
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} should be in the bin again"));
+        drive
+            .recycle_purge(std::slice::from_ref(hit))
+            .await
+            .expect("purge");
+        let items = drive.recycle_list(0, 100).await.expect("recycle_list");
+        assert!(
+            !items.iter().any(|e| e.name == name),
+            "a purged entry must not come back"
+        );
+        println!("purged; bin now holds {} entries", items.len());
+    }
+
     #[tokio::test]
     #[ignore = "hits the live 189 account"]
     async fn cloud189_live_share() {

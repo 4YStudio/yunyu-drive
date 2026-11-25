@@ -535,7 +535,6 @@ export const mockApi = {
   openWebLogin139: async () => {},
   openWebLoginBaidu: async () => {},
   openWebLogin115: async () => {},
-  openWebLogin189: async () => {},
   closeWebLogin: async () => {},
   systemTheme: async (): Promise<"light" | "dark"> => "dark",
 
@@ -959,7 +958,6 @@ export const mockEvents = {
   onWebLogin: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onWebLogin139: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onWebLoginBaidu: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
-  onWebLogin189: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onTransfersBatch: async (cb: (tasks: TransferTask[]) => void): Promise<() => void> => {
     batchListeners.add(cb);
     return () => {

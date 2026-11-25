@@ -117,7 +117,6 @@ export const api = {
   openWebLoginBaidu: () => invoke<void>("open_web_login_baidu"),
   openWebLogin115: () => invoke<void>("open_web_login_115"),
   /** Second, optional login: mints the web cookies the 天翼 recycle bin needs. */
-  openWebLogin189: () => invoke<void>("open_web_login_189"),
   closeWebLogin: () => invoke<void>("close_web_login"),
 
   listDir: (pdirFid: string) => invoke<DirListing>("list_dir", { pdirFid }),
@@ -295,8 +294,6 @@ export const events = {
   onWebLoginBaidu: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
     listen<WebLoginEvent>("auth://baidu-web-login", (e) => cb(e.payload)),
   /** 天翼云盘 web-session harvest (recycle bin). */
-  onWebLogin189: (cb: (evt: WebLoginEvent) => void): Promise<UnlistenFn> =>
-    listen<WebLoginEvent>("auth://cloud189-web-login", (e) => cb(e.payload)),
   onDeeplink: (cb: (link: string) => void): Promise<UnlistenFn> =>
     listen<string>("deeplink://open", (e) => cb(e.payload)),
   /** Tray menu asking for a screen change (`"transfers"`). */
