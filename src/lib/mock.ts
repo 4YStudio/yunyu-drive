@@ -182,6 +182,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // ------------------------------------------------------------------ transfers
 let transfers: TransferTask[] = [];
 const transferListeners = new Set<(t: TransferTask) => void>();
+// Batch listeners live in their own set: mixing them into `transferListeners`
+// fed a single task to a callback that expected an array, which threw inside
+// emit() and silently stopped every later listener (pause/retry looked dead).
+const batchListeners = new Set<(tasks: TransferTask[]) => void>();
 const removedListeners = new Set<(id: string) => void>();
 const removedManyListeners = new Set<(ids: string[]) => void>();
 
@@ -190,6 +194,24 @@ function emit(task: TransferTask) {
   if (index >= 0) transfers[index] = task;
   else transfers.unshift(task);
   for (const cb of transferListeners) cb({ ...task });
+  const batch = [{ ...task }];
+  for (const cb of batchListeners) cb(batch);
+}
+
+/**
+ * Writes a change back into the fixture array *and* broadcasts it.
+ *
+ * The progress ticker below re-reads `transfers`, so a pause that only emitted
+ * an update would be overwritten by the next tick — which made the pause button
+ * look broken in mock builds.
+ */
+function patchTask(id: string, patch: Partial<TransferTask>): TransferTask | undefined {
+  const index = transfers.findIndex((t) => t.id === id);
+  if (index < 0) return undefined;
+  const next = { ...transfers[index], ...patch, updatedAt: Date.now() };
+  transfers[index] = next;
+  emit(next);
+  return next;
 }
 
 function makeTransfer(partial: Partial<TransferTask> & { name: string; kind: TransferTask["kind"] }): TransferTask {
@@ -799,17 +821,45 @@ export const mockApi = {
 
   transfersList: async () => transfers,
 
-  transferCancel: async (id: string) => {
-    const task = transfers.find((t) => t.id === id);
-    if (task) emit({ ...task, status: "canceled", speed: 0 });
-  },
+  transferCancel: async (id: string) => patchTask(id, { status: "canceled", speed: 0 }),
 
-  transferPause: async (id: string) => {
-    const task = transfers.find((t) => t.id === id);
-    if (task) emit({ ...task, status: "paused", speed: 0 });
-  },
+  transferPause: async (id: string) => patchTask(id, { status: "paused", speed: 0 }),
 
-  transferChildren: async (id: string) => [],
+  transferChildren: async (id: string) => {
+    const parent = transfers.find((t) => t.id === id);
+    if (!parent || parent.kind !== "folder") return [];
+    const base = parent.updatedAt ?? Date.now();
+    return [
+      { name: "开场动画.mov", size: 820_000_000, transferred: 640_000_000, status: "running" as const },
+      { name: "logo 导出/logo@2x.png", size: 12_400_000, transferred: 12_400_000, status: "done" as const },
+      { name: "分镜稿/第 03 版.psd", size: 410_000_000, transferred: 96_000_000, status: "running" as const },
+    ].map((row, index) => ({
+      id: `${id}-kid-${index}`,
+      kind: "download" as const,
+      name: row.name,
+      fid: `kid-${index}`,
+      localPath: parent.localPath,
+      remoteDirFid: parent.remoteDirFid,
+      size: row.size,
+      transferred: row.transferred,
+      speed: row.status === "running" ? 4_800_000 : 0,
+      status: row.status,
+      error: null,
+      createdAt: base,
+      updatedAt: base,
+      rapid: false,
+      prepared: true,
+      connections: 1,
+      segments: 0,
+      segmentsDone: 0,
+      partPath: null,
+      share: null,
+      provider: parent.provider,
+      cross: null,
+      parent: id,
+      hidden: true,
+    }));
+  },
 
   transferRemove: async (id: string, _purgeLocal = false) => {
     transfers = transfers.filter((t) => t.id !== id);
@@ -819,9 +869,11 @@ export const mockApi = {
   transferRetry: async (id: string) => {
     const task = transfers.find((t) => t.id === id);
     if (!task) throw new Error("任务不存在");
-    const next = { ...task, status: "running" as TransferTask["status"], error: null, speed: 1_200_000 };
-    emit(next);
-    return next;
+    return patchTask(id, {
+      status: "running" as TransferTask["status"],
+      error: null,
+      speed: 1_200_000,
+    })!;
   },
 
   transferBulk: async (
@@ -890,9 +942,9 @@ export const mockEvents = {
   onWebLogin139: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onWebLoginBaidu: async (_cb: (evt: { ok: boolean; message: string }) => void) => () => {},
   onTransfersBatch: async (cb: (tasks: TransferTask[]) => void): Promise<() => void> => {
-    transferListeners.add(cb as unknown as (task: TransferTask) => void);
+    batchListeners.add(cb);
     return () => {
-      transferListeners.delete(cb as unknown as (task: TransferTask) => void);
+      batchListeners.delete(cb);
     };
   },
   onTransfersRemovedMany: async (cb: (ids: string[]) => void): Promise<() => void> => {

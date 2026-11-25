@@ -138,6 +138,31 @@ export function errText(err: unknown): string {
   return text;
 }
 
+/**
+ * One line for a transfer row's error.
+ *
+ * Provider errors arrive in English and technical ("too many requests"), which
+ * means nothing to a user staring at a red row. The common ones get a Chinese
+ * sentence that says what to do; anything else keeps its own text when it is
+ * already Chinese.
+ */
+export function taskErrorText(raw: string): string {
+  const text = (raw ?? "").trim();
+  if (!text) return "";
+  if (/too many requests|rate[ -]?limit|429/i.test(text))
+    return "网盘限流了（请求过多），等几分钟再点继续即可";
+  if (/unauthori[sz]ed|401|登录|token|令牌|session/i.test(text) && !/[\u4e00-\u9fa5]/.test(text))
+    return "登录状态失效，请重新登录这个网盘";
+  if (/timeout|timed out/i.test(text)) return "网络超时，稍后点继续会自动重试";
+  if (/connect|dns|network|connection reset|broken pipe/i.test(text))
+    return "网络连接中断，稍后点继续会自动重试";
+  if (/no space|insufficient|space left/i.test(text)) return "磁盘空间不足，清理后点继续即可";
+  if (/permission denied|拒绝访问/i.test(text)) return "没有写入权限，请检查下载目录";
+  if (/not found|404/i.test(text)) return "文件在网盘上找不到了，可能已被删除或移动";
+  if (/[\u4e00-\u9fa5]/.test(text)) return text;
+  return `传输失败（${shorten(text, 60)}）`;
+}
+
 /** Clips a long raw message so a toast stays one readable line. */
 function shorten(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;

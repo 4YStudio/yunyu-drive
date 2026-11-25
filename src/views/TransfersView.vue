@@ -11,7 +11,7 @@ import Modal from "@/components/Modal.vue";
 import { api } from "@/lib/backend";
 import { openFile, revealPath } from "@/lib/host";
 import { PROVIDERS, type TransferTask } from "@/lib/types";
-import { errText, formatSize, formatSpeed, formatEta } from "@/lib/format";
+import { errText, formatSize, formatSpeed, formatEta, taskErrorText } from "@/lib/format";
 import { useChunkedRows } from "@/lib/progressive";
 import { app, forgetTransfers, refreshTransfers, toast } from "@/store/app";
 
@@ -232,14 +232,6 @@ async function pause(task: TransferTask) {
   }
 }
 
-async function cancel(task: TransferTask) {
-  try {
-    await api.transferCancel(task.id);
-  } catch (err) {
-    toast(errText(err), "error");
-  }
-}
-
 /**
  * Removal has two meanings and only one of them is safe to assume.
  *
@@ -436,11 +428,8 @@ onActivated(() => {
       <button class="btn btn--ghost bulk-btn" :disabled="bulkBusy" @click="bulk('resume')">
         继续
       </button>
-      <button class="btn btn--ghost bulk-btn" :disabled="bulkBusy" @click="bulk('cancel')">
-        取消
-      </button>
       <button class="btn btn--ghost bulk-btn" :disabled="bulkBusy" @click="bulk('remove')">
-        移除记录
+        删除
       </button>
       <button class="btn btn--ghost bulk-btn" @click="clearSelection">取消选择</button>
     </div>
@@ -495,15 +484,6 @@ onActivated(() => {
                 :title="providerName(task)"
                 draggable="false"
               />
-              <button
-                v-if="isFolder(task)"
-                class="kid-toggle"
-                :aria-expanded="expanded === task.id"
-                :title="expanded === task.id ? '收起文件列表' : '展开查看正在下载的文件'"
-                @click.stop="toggleExpand(task)"
-              >
-                <Icon :name="expanded === task.id ? 'chevron-down' : 'chevron-right'" :size="11" />
-              </button>
               <span class="task-name truncate" :title="task.name">{{ task.name }}</span>
               <span class="task-state">{{ statusLabel(task) }}</span>
               <span v-if="isCross(task)" class="task-kind">{{ kindLabel(task) }}</span>
@@ -547,7 +527,9 @@ onActivated(() => {
               </template>
               <template v-else-if="task.status === 'failed' && task.error">
                 <span class="dot">·</span>
-                <span class="task-error truncate" :title="task.error">{{ task.error }}</span>
+                <span class="task-error truncate" :title="task.error">
+                  {{ taskErrorText(task.error ?? "") }}
+                </span>
               </template>
             </div>
           </div>
@@ -562,10 +544,18 @@ onActivated(() => {
               <Icon name="pause" :size="14" />
             </button>
             <button
+              v-if="isFolder(task)"
+              class="icon-btn"
+              :title="expanded === task.id ? '收起文件明细' : '查看正在下载的文件'"
+              @click="toggleExpand(task)"
+            >
+              <Icon :name="expanded === task.id ? 'chevron-down' : 'list'" :size="14" />
+            </button>
+            <button
               v-if="['running', 'hashing', 'queued', 'paused'].includes(task.status)"
               class="icon-btn"
-              title="取消"
-              @click="cancel(task)"
+              title="停止并移除任务（未完成的文件会一并删除）"
+              @click="runRemove([task])"
             >
               <Icon name="x" :size="14" />
             </button>
@@ -614,16 +604,18 @@ onActivated(() => {
               {{ task.listing ? "正在读取文件夹…" : "没有正在下载的文件" }}
             </p>
             <div v-for="kid in children" :key="kid.id" class="kid">
-              <span class="kid-name truncate" :title="kid.name">{{ kid.name }}</span>
+              <div class="kid-head">
+                <span class="kid-name truncate" :title="kid.name">{{ kid.name }}</span>
+                <span class="kid-size mono">
+                  {{ formatSize(kid.transferred) }} / {{ formatSize(kid.size) }}
+                </span>
+              </div>
               <div class="kid-bar">
                 <div
                   class="kid-bar-fill"
                   :style="{ width: `${kid.size ? Math.min(100, (kid.transferred / kid.size) * 100) : 0}%` }"
                 />
               </div>
-              <span class="kid-size mono">
-                {{ formatSize(kid.transferred) }} / {{ formatSize(kid.size) }}
-              </span>
             </div>
           </div>
         </motion.article>
@@ -752,6 +744,7 @@ onActivated(() => {
 }
 .task {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 13px;
   padding: 12px 12px 12px 14px;
@@ -879,29 +872,10 @@ onActivated(() => {
   transform: translateY(0);
 }
 
-/* Fold/unfold a folder row. Small targets on purpose: it sits inside the name
-   column, not in the action strip. */
-.kid-toggle {
-  flex: none;
-  display: grid;
-  place-items: center;
-  width: 16px;
-  height: 16px;
-  margin-right: -3px;
-  border: none;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text-3);
-  cursor: pointer;
-  transition: background 0.14s ease, color 0.14s ease;
-}
-.kid-toggle:hover {
-  background: var(--bg-3);
-  color: var(--text-2);
-}
-
+/* The detail panel drops to its own line under the row: it is a sibling of the
+   row's flex items, so it takes a full basis and wraps. */
 .kids {
-  grid-column: 1 / -1;
+  flex: 0 0 100%;
   margin: 2px 0 2px 30px;
   padding: 4px 0 6px 8px;
   border-left: 1px solid var(--line);
@@ -915,12 +889,18 @@ onActivated(() => {
   font-size: 11.8px;
 }
 .kid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 90px 118px;
-  align-items: center;
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 3px 0;
   font-size: 11.8px;
   color: var(--text-2);
+}
+.kid-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
 }
 .kid-name {
   min-width: 0;
@@ -934,7 +914,7 @@ onActivated(() => {
 .kid-bar-fill {
   height: 100%;
   border-radius: inherit;
-  background: var(--accent);
+  background: var(--fill);
   transition: width 0.24s linear;
 }
 .kid-size {

@@ -134,6 +134,30 @@ struct FolderFile {
     size: u64,
 }
 
+/// One cache the sidecar keeps of a listing that already happened.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SubDir {
+    fid: String,
+    name: String,
+}
+
+/// What a folder's sidecar file holds.
+///
+/// `files` is every file discovered so far, `dirs` is the listings that already
+/// completed (their files are in `files`, so resuming must not list them
+/// again), and `complete` says the whole tree was walked.
+struct Listing {
+    files: Vec<FolderFile>,
+    dirs: std::collections::HashMap<String, Vec<SubDir>>,
+    complete: bool,
+}
+
+/// How many times a directory listing is retried before it is skipped.
+const WALK_RETRIES: u32 = 3;
+
+/// First backoff between two listing attempts; doubles each time.
+const WALK_BACKOFF_MS: u64 = 1_500;
+
 /// How many child downloads a folder task keeps alive at once.
 ///
 /// The queue gates the real concurrency, so this is only about not creating a
@@ -994,57 +1018,51 @@ impl TransferManager {
         .await;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FolderFile>(256);
-        // A previous run of this folder left a complete listing behind: replay it
-        // instead of walking the drive again. That is what makes resuming a
-        // 20 000-file folder cheap, and it also means the totals are known up
-        // front instead of growing as the walk discovers more.
+        // The sidecar remembers every file found so far *and* every listing that
+        // already completed. Resuming therefore neither re-lists the whole tree
+        // (which is what hammered the drive's API into "too many requests") nor
+        // re-downloads anything: cached files are replayed, cached directories
+        // are walked from memory.
         let manifest = self.manifest_path(&id);
-        let replay = match &manifest {
-            Some(path) => read_manifest(path).await,
+        let listing = match &manifest {
+            Some(path) => read_listing(path).await,
             None => None,
         };
-        let replaying = replay.is_some();
-        let replay_stats = replay.as_ref().map(|files| {
-            (
-                files.len() as u64,
-                files.iter().map(|file| file.size).sum::<u64>(),
-            )
-        });
-        match replay {
-            Some(files) => {
-                let source = token.clone();
-                tokio::spawn(async move {
-                    for file in files {
-                        if source.is_cancelled() || tx.send(file).await.is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-            None => {
-                if let Some(path) = &manifest {
-                    // Half a listing is worse than none: a folder would look
-                    // finished while its rest was never discovered.
-                    let _ = tokio::fs::remove_file(path).await;
-                    if let Some(dir) = path.parent() {
-                        let _ = tokio::fs::create_dir_all(dir).await;
+        let complete = listing.as_ref().is_some_and(|l| l.complete);
+        let (replayed, cache) = match listing {
+            Some(l) => (l.files, l.dirs),
+            None => (Vec::new(), std::collections::HashMap::new()),
+        };
+        // Keys of everything already accounted for, so a file cannot be added
+        // twice — not by a replay overlapping the walk, and not by a double
+        // listing on the drive's side.
+        let mut seen: std::collections::HashSet<String> = replayed
+            .iter()
+            .map(|file| file_key(&file.relative_dir, &file.name))
+            .collect();
+        let mut total = replayed.len() as u64;
+        let mut bytes_found: u64 = replayed.iter().map(|file| file.size).sum();
+        {
+            let source = token.clone();
+            let walker = Arc::clone(&drive);
+            let start = folder.fid.clone();
+            let storing = manifest.clone();
+            tokio::spawn(async move {
+                for file in replayed {
+                    if source.is_cancelled() || tx.send(file).await.is_err() {
+                        return;
                     }
                 }
-                let walker = Arc::clone(&drive);
-                let walker_token = token.clone();
-                let start = folder.fid.clone();
-                tokio::spawn(async move {
-                    walk_folder(walker, start, PathBuf::new(), tx, walker_token).await;
-                });
-            }
+                if complete {
+                    return;
+                }
+                walk_folder(walker, start, PathBuf::new(), tx, source, cache, storing).await;
+            });
         }
 
         let mut live: Vec<String> = Vec::new();
         let mut walking = true;
         let mut made_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        // A replayed listing already knows both numbers, so the bar has a stable
-        // denominator from the first frame instead of growing with the walk.
-        let (mut total, mut bytes_found) = replay_stats.unwrap_or((0, 0));
         let mut bytes_finished = 0u64;
         let mut done = 0u64;
         let mut failed = 0u64;
@@ -1076,7 +1094,7 @@ impl TransferManager {
                 }
                 file = rx.recv(), if can_take => match file {
                     Some(file) => {
-                        if !replaying {
+                        if seen.insert(file_key(&file.relative_dir, &file.name)) {
                             total += 1;
                             bytes_found += file.size;
                             if let Some(path) = &manifest {
@@ -1132,10 +1150,8 @@ impl TransferManager {
                     }
                     None => {
                         walking = false;
-                        if !replaying {
-                            if let Some(path) = &manifest {
-                                append_manifest_end(path).await;
-                            }
+                        if let Some(path) = &manifest {
+                            append_manifest_end(path).await;
                         }
                     }
                 },
@@ -1911,6 +1927,8 @@ async fn walk_folder(
     prefix: PathBuf,
     tx: tokio::sync::mpsc::Sender<FolderFile>,
     token: CancellationToken,
+    cache: std::collections::HashMap<String, Vec<SubDir>>,
+    manifest: Option<PathBuf>,
 ) {
     let mut queue: std::collections::VecDeque<(String, PathBuf, usize)> =
         std::collections::VecDeque::new();
@@ -1919,13 +1937,48 @@ async fn walk_folder(
         if token.is_cancelled() {
             return;
         }
-        let listing = match drive.list(&fid).await {
-            Ok(listing) => listing,
-            Err(err) => {
-                crate::ylog!("文件夹读取失败 {fid}：{err}");
-                continue;
+        // Already listed in an earlier run: its files are in the sidecar and
+        // its children are cached, so there is nothing to ask the drive for.
+        if let Some(subs) = cache.get(&fid) {
+            if depth < FOLDER_MAX_DEPTH {
+                for sub in subs {
+                    queue.push_back((
+                        sub.fid.clone(),
+                        dir.join(crate::paths::safe_component(&sub.name)),
+                        depth + 1,
+                    ));
+                }
             }
+            continue;
+        }
+        // A rate-limited drive answers with "too many requests" for a while;
+        // skipping the directory would silently drop its files, so back off and
+        // try again before giving up on it.
+        let mut listing = None;
+        for attempt in 0..WALK_RETRIES {
+            if token.is_cancelled() {
+                return;
+            }
+            match drive.list(&fid).await {
+                Ok(found) => {
+                    listing = Some(found);
+                    break;
+                }
+                Err(err) => {
+                    crate::ylog!("文件夹读取失败 {fid}（第 {} 次）：{err}", attempt + 1);
+                    if attempt + 1 < WALK_RETRIES {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            WALK_BACKOFF_MS << attempt,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+        let Some(listing) = listing else {
+            continue;
         };
+        let mut subs: Vec<SubDir> = Vec::new();
         for entry in listing.entries {
             if token.is_cancelled() {
                 return;
@@ -1933,6 +1986,10 @@ async fn walk_folder(
             let name = crate::paths::safe_component(&entry.name);
             let native = crate::providers::native_of(&entry.fid);
             if entry.is_dir {
+                subs.push(SubDir {
+                    fid: native.clone(),
+                    name: name.clone(),
+                });
                 if depth < FOLDER_MAX_DEPTH {
                     queue.push_back((native, dir.join(name), depth + 1));
                 }
@@ -1948,14 +2005,28 @@ async fn walk_folder(
                 return;
             }
         }
+        // Written after the files, never before: on resume the cache is trusted
+        // to mean "everything below is in the sidecar".
+        if let Some(path) = &manifest {
+            append_dir_record(path, &fid, &subs).await;
+        }
     }
+}
+
+/// Identity of a file inside the folder: two records with the same key are the
+/// same target on disk.
+fn file_key(relative_dir: &Path, name: &str) -> String {
+    format!("{}/{}", relative_dir.to_string_lossy(), name)
 }
 
 /// A file already sitting on disk at its final size counts as downloaded, so a
 /// resumed folder skips it without asking the drive anything.
 async fn file_complete(path: &Path, size: u64) -> bool {
+    // A drive that does not report sizes (some listings say 0) would otherwise
+    // look "unfinished" forever and re-download the file next to the copy it
+    // already made — which is how a resumed folder's byte counts doubled.
     if size == 0 {
-        return false;
+        return tokio::fs::metadata(path).await.is_ok();
     }
     tokio::fs::metadata(path)
         .await
@@ -1966,11 +2037,11 @@ async fn file_complete(path: &Path, size: u64) -> bool {
 /// Reads a folder listing that finished being written. A truncated listing (no
 /// end marker) returns `None`: the folder would look complete while the rest of
 /// it was never seen.
-async fn read_manifest(path: &Path) -> Option<Vec<FolderFile>> {
+async fn read_listing(path: &Path) -> Option<Listing> {
     let text = tokio::fs::read_to_string(path).await.ok()?;
     let mut files = Vec::new();
-    let mut ended = false;
-    let mut broken = false;
+    let mut dirs = std::collections::HashMap::new();
+    let mut complete = false;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
@@ -1979,22 +2050,52 @@ async fn read_manifest(path: &Path) -> Option<Vec<FolderFile>> {
             // A line we cannot read means the file was written by a version that
             // knew fields this one does not; replaying it would silently drop
             // files, so the folder gets walked again instead.
-            broken = true;
-            continue;
+            return None;
         };
         if value.get("end").and_then(|v| v.as_bool()).unwrap_or(false) {
-            ended = true;
+            complete = true;
+            continue;
+        }
+        // A directory record: this listing finished, so its files are already
+        // in the file records and its children are known without asking again.
+        if let Some(dir) = value.get("dir").and_then(|v| v.as_str()) {
+            let subs = value
+                .get("subs")
+                .and_then(|v| serde_json::from_value::<Vec<SubDir>>(v.clone()).ok())
+                .unwrap_or_default();
+            dirs.insert(dir.to_string(), subs);
             continue;
         }
         match serde_json::from_value::<FolderFile>(value) {
             Ok(file) => files.push(file),
-            Err(_) => broken = true,
+            Err(_) => return None,
         }
     }
-    if ended && !broken {
-        Some(files)
-    } else {
-        None
+    Some(Listing {
+        files,
+        dirs,
+        complete,
+    })
+}
+
+/// Appends one directory record to a folder's sidecar.
+async fn append_dir_record(path: &Path, dir: &str, subs: &[SubDir]) {
+    let line = serde_json::json!({ "dir": dir, "subs": subs });
+    append_line(path, &line).await;
+}
+
+async fn append_line(path: &Path, value: &serde_json::Value) {
+    let Ok(mut line) = serde_json::to_vec(value) else {
+        return;
+    };
+    line.push(b'\n');
+    if let Ok(mut handle) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        let _ = handle.write_all(&line).await;
     }
 }
 
@@ -2834,21 +2935,24 @@ mod tests {
             size: 3,
         };
         append_manifest(&path, &file).await;
-        assert!(read_manifest(&path).await.is_none(), "no end marker yet");
+        let open = read_listing(&path).await.expect("a truncated listing is still readable");
+        assert_eq!(open.files.len(), 1);
+        assert!(!open.complete, "no end marker yet");
 
         append_manifest_end(&path).await;
-        let files = read_manifest(&path).await.expect("complete listing");
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].name, "b.txt");
-        assert_eq!(files[0].relative_dir, PathBuf::from("sub"));
-        assert_eq!(files[0].size, 3);
+        let listing = read_listing(&path).await.expect("complete listing");
+        assert!(listing.complete);
+        assert_eq!(listing.files.len(), 1);
+        assert_eq!(listing.files[0].name, "b.txt");
+        assert_eq!(listing.files[0].relative_dir, PathBuf::from("sub"));
+        assert_eq!(listing.files[0].size, 3);
 
         // A line this version cannot read (written by a newer one) must not be
         // silently skipped: the folder is walked again instead.
         let mut text = tokio::fs::read_to_string(&path).await.unwrap();
         text.push_str("{\"fid\":\"c\",\"name\":\"c.txt\",\"size\":1}\n");
         tokio::fs::write(&path, text).await.unwrap();
-        assert!(read_manifest(&path).await.is_none(), "a broken line forces a walk");
+        assert!(read_listing(&path).await.is_none(), "a broken line forces a walk");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -2857,6 +2961,9 @@ mod tests {
     /// network or an `AppHandle`.
     struct FakeDrive {
         tree: std::collections::HashMap<String, Vec<(&'static str, &'static str, bool, u64)>>,
+        /// How many listings the drive was asked for, so a test can prove a
+        /// resumed folder does not walk the tree again.
+        calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeDrive {
@@ -2868,7 +2975,10 @@ mod tests {
                 vec![("a", "a.txt", false, 5), ("sub", "sub", true, 0)],
             );
             tree.insert("sub".to_string(), vec![("b", "b.txt", false, 3)]);
-            Self { tree }
+            Self {
+                tree,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
     }
 
@@ -2899,6 +3009,8 @@ mod tests {
             Ok(None)
         }
         async fn list(&self, dir: &str) -> AppResult<crate::providers::DirListing> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let native = crate::providers::native_of(dir);
             let rows = self.tree.get(&native).cloned().unwrap_or_default();
             let entries = rows
@@ -2966,13 +3078,60 @@ mod tests {
         }
     }
 
+    /// A directory the sidecar already recorded is walked from memory: the
+    /// drive must not be asked for it again, which is what kept a resumed
+    /// folder from tripping the provider's rate limit.
+    #[tokio::test]
+    async fn folder_walk_reuses_cached_listings() {
+        let drive = Arc::new(FakeDrive::new());
+        let as_trait: Arc<dyn DriveProvider> = drive.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "0".to_string(),
+            // Only directories are cached: a listing's files live in the
+            // sidecar's file records, which are replayed separately.
+            vec![SubDir {
+                fid: "sub".to_string(),
+                name: "sub".to_string(),
+            }],
+        );
+        walk_folder(
+            as_trait,
+            "0".to_string(),
+            PathBuf::new(),
+            tx,
+            CancellationToken::new(),
+            cache,
+            None,
+        )
+        .await;
+        let mut names = Vec::new();
+        while let Some(file) = rx.recv().await {
+            names.push(file.name);
+        }
+        names.sort();
+        // Root came from the cache, so only its child directory was listed.
+        assert_eq!(names, vec!["b.txt".to_string()]);
+        assert_eq!(drive.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// The walk must flatten a tree into files with their paths inside the
     /// folder, because that is what the children are told to create on disk.
     #[tokio::test]
     async fn folder_walk_flattens_the_tree_with_relative_paths() {
         let drive: Arc<dyn DriveProvider> = Arc::new(FakeDrive::new());
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        walk_folder(drive, "0".to_string(), PathBuf::new(), tx, CancellationToken::new()).await;
+        walk_folder(
+            drive,
+            "0".to_string(),
+            PathBuf::new(),
+            tx,
+            CancellationToken::new(),
+            std::collections::HashMap::new(),
+            None,
+        )
+        .await;
 
         let mut found: Vec<(String, String, u64)> = Vec::new();
         while let Some(file) = rx.recv().await {
@@ -3003,6 +3162,8 @@ mod tests {
         assert!(file_complete(&path, 5).await);
         assert!(!file_complete(&path, 6).await);
         assert!(!file_complete(&dir.join("missing.txt"), 0).await);
+        // Size-less listings still count an existing file as done.
+        assert!(file_complete(&path, 0).await);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
