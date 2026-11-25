@@ -735,6 +735,24 @@ function defaultDownloadDir() {
   return app.settings?.downloadDir ?? "";
 }
 
+/**
+ * A folder has no size in the listing, so summing the selection showed "0 B"
+ * for a folder of 30 GB. Count them separately and say so, instead of printing
+ * a number that is simply wrong.
+ */
+const downloadSummary = computed(() => {
+  const items = downloadPrompt.value?.items ?? [];
+  const dirs = items.filter((item) => item.isDir).length;
+  const files = items.length - dirs;
+  const bytes = items.reduce((sum, item) => sum + (item.isDir ? 0 : item.size), 0);
+  const parts: string[] = [];
+  if (files > 0) parts.push(`${files} 个文件`);
+  if (dirs > 0) parts.push(`${dirs} 个文件夹`);
+  const head = parts.length ? parts.join("、") : `${items.length} 项`;
+  if (dirs === 0) return `${head}，共 ${formatSize(bytes)}`;
+  return `${head}${bytes > 0 ? `，另有 ${formatSize(bytes)} 文件` : ""}（文件夹的实际大小在读取后显示）`;
+});
+
 function askDownload(items: { fid: string; name: string; size: number; isDir: boolean }[]) {
   if (items.length === 0) return;
   downloadPrompt.value = { items, dir: defaultDownloadDir(), remember: false };
@@ -1428,9 +1446,7 @@ defineExpose({ refresh });
     <Modal
       :open="downloadPrompt !== null"
       title="选择下载位置"
-      :subtitle="`${downloadPrompt?.items.length ?? 0} 项，共 ${formatSize(
-        (downloadPrompt?.items ?? []).reduce((sum, i) => sum + (i.isDir ? 0 : i.size), 0),
-      )}`"
+      :subtitle="downloadSummary"
       :width="470"
       @close="downloadPrompt = null"
     >

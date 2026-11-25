@@ -1112,8 +1112,21 @@ pub async fn transfer_remove(
     state: State<'_, Arc<AppState>>,
     app: AppHandle,
     id: String,
+    purge_local: Option<bool>,
 ) -> AppResult<()> {
-    state.transfers.remove(&id, &app).await
+    state
+        .transfers
+        .remove(&id, &app, purge_local.unwrap_or(false))
+        .await
+}
+
+/// The files a folder task is working on right now, for the expanded row.
+#[tauri::command]
+pub async fn transfer_children(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> AppResult<Vec<TransferTask>> {
+    Ok(state.transfers.children(&id).await)
 }
 
 #[tauri::command]
@@ -1142,6 +1155,7 @@ pub async fn transfers_bulk(
     app: AppHandle,
     ids: Vec<String>,
     action: String,
+    purge_local: Option<bool>,
 ) -> AppResult<usize> {
     if ids.is_empty() {
         return Ok(0);
@@ -1162,7 +1176,10 @@ pub async fn transfers_bulk(
             Ok(changed.len())
         }
         "remove" => {
-            let gone = state.transfers.remove_many(&ids).await;
+            let gone = state
+                .transfers
+                .remove_many(&ids, purge_local.unwrap_or(false))
+                .await;
             if !gone.is_empty() {
                 let _ = app.emit(crate::transfer::EVENT_REMOVED_MANY, &gone);
             }

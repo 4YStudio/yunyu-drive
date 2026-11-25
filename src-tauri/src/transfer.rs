@@ -193,6 +193,11 @@ impl TransferTask {
 pub struct TransferManager {
     tasks: RwLock<HashMap<String, TransferTask>>,
     cancels: Mutex<HashMap<String, CancellationToken>>,
+    /// Which run currently owns a folder task. A resumed folder gets a new
+    /// generation, and the previous supervisor stops as soon as it sees that it
+    /// is no longer the current one — otherwise two loops would download the
+    /// same files and count every byte twice.
+    folder_runs: Mutex<HashMap<String, u64>>,
     counter: AtomicU64,
     /// Number of transfers currently holding a worker slot.
     active: std::sync::Mutex<usize>,
@@ -321,6 +326,7 @@ impl TransferManager {
         Arc::new(Self {
             tasks: RwLock::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
+            folder_runs: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
             active: std::sync::Mutex::new(0),
             limit: AtomicU64::new(normalize_limit(concurrent)),
@@ -530,7 +536,13 @@ impl TransferManager {
         }
     }
 
-    pub async fn remove(&self, id: &str, app: &AppHandle) -> AppResult<()> {
+    /// Removes a task.
+    ///
+    /// `purge_local` also deletes the files it produced: for a finished
+    /// download that is the file (or, for a folder, the tree) on disk, and for
+    /// an unfinished one its `.part` placeholder, which would otherwise linger
+    /// forever with nothing pointing at it.
+    pub async fn remove(&self, id: &str, app: &AppHandle, purge_local: bool) -> AppResult<()> {
         // Only a live worker needs a grace period; sleeping unconditionally made
         // every removal feel sluggish and delayed deleting the partial file.
         if self.cancel(id).await {
@@ -540,10 +552,10 @@ impl TransferManager {
         }
         let removed = self.tasks.write().await.remove(id);
         if let Some(task) = removed {
-            discard_partial(&task).await;
+            purge_task_files(&task, purge_local).await;
         }
         for child in self.remove_children(id).await {
-            discard_partial(&child).await;
+            purge_task_files(&child, purge_local).await;
         }
         self.drop_manifest(id).await;
         let _ = app.emit(EVENT_REMOVED, id.to_string());
@@ -631,7 +643,7 @@ impl TransferManager {
 
     /// Drops many task records (and their partial files), returning the ids that
     /// actually existed.
-    pub async fn remove_many(&self, ids: &[String]) -> Vec<String> {
+    pub async fn remove_many(&self, ids: &[String], purge_local: bool) -> Vec<String> {
         let mut removed = Vec::new();
         let mut discarded = Vec::new();
         let mut stopped = false;
@@ -656,11 +668,11 @@ impl TransferManager {
             }
         }
         for task in discarded {
-            discard_partial(&task).await;
+            purge_task_files(&task, purge_local).await;
         }
         for id in &removed {
             for child in self.remove_children(id).await {
-                discard_partial(&child).await;
+                purge_task_files(&child, purge_local).await;
             }
             self.drop_manifest(id).await;
         }
@@ -668,6 +680,18 @@ impl TransferManager {
             self.persist().await;
         }
         removed
+    }
+
+    /// Live files of a folder task, for the expanded row in the transfer list.
+    pub async fn children(&self, parent: &str) -> Vec<TransferTask> {
+        let tasks = self.tasks.read().await;
+        let mut list: Vec<TransferTask> = tasks
+            .values()
+            .filter(|t| t.parent.as_deref() == Some(parent))
+            .cloned()
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name));
+        list
     }
 
     /// Cancels a running worker. Returns whether one was actually running.
@@ -856,7 +880,7 @@ impl TransferManager {
         };
         let task = self.insert(task).await;
         task.emit(&app);
-        self.spawn_folder(app, drive, task.clone());
+        self.spawn_folder(app, drive, task.clone()).await;
         Ok(task)
     }
 
@@ -891,24 +915,57 @@ impl TransferManager {
         task.updated_at = now_millis();
         let task = self.insert(task).await;
         task.emit(&app);
-        self.spawn_folder(app, drive, task.clone());
+        self.spawn_folder(app, drive, task.clone()).await;
         Ok(task)
     }
 
-    fn spawn_folder(
+    /// Starts the supervisor loop for a folder task.
+    ///
+    /// The cancel token is registered *before* the loop is spawned. Registering
+    /// it inside the spawned future left a window in which a pause arriving
+    /// right after the start found no token, did nothing, and the folder kept
+    /// downloading behind a paused row.
+    async fn spawn_folder(
         self: &Arc<Self>,
         app: AppHandle,
         drive: Arc<dyn DriveProvider>,
         task: TransferTask,
     ) {
         let id = task.id.clone();
+        let token = CancellationToken::new();
+        let generation = {
+            let mut runs = self.folder_runs.lock().await;
+            let generation = runs.get(&id).copied().unwrap_or(0) + 1;
+            runs.insert(id.clone(), generation);
+            generation
+        };
+        {
+            let mut cancels = self.cancels.lock().await;
+            // Resuming while the old loop still breathes: stop it first, so the
+            // two never run side by side.
+            if let Some(old) = cancels.insert(id.clone(), token.clone()) {
+                old.cancel();
+            }
+        }
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let token = CancellationToken::new();
-            manager.cancels.lock().await.insert(id.clone(), token.clone());
-            manager.run_folder(app, drive, task, token).await;
-            manager.cancels.lock().await.remove(&id);
+            manager
+                .run_folder(app, drive, task, token, generation)
+                .await;
+            // Only the newest run may clean up; an older one finishing late
+            // must not drop the token of the run that replaced it.
+            let mut runs = manager.folder_runs.lock().await;
+            if runs.get(&id).copied() == Some(generation) {
+                runs.remove(&id);
+                drop(runs);
+                manager.cancels.lock().await.remove(&id);
+            }
         });
+    }
+
+    /// True while `generation` is still the run that owns this folder.
+    async fn folder_is_current(&self, id: &str, generation: u64) -> bool {
+        self.folder_runs.lock().await.get(id).copied() == Some(generation)
     }
 
     /// Walks the folder, hands each file to a child download, and reports the
@@ -919,6 +976,7 @@ impl TransferManager {
         drive: Arc<dyn DriveProvider>,
         parent: TransferTask,
         token: CancellationToken,
+        generation: u64,
     ) {
         let id = parent.id.clone();
         let Some(folder) = parent.folder.clone() else {
@@ -995,6 +1053,12 @@ impl TransferManager {
         loop {
             if !walking && live.is_empty() {
                 break;
+            }
+            if !self.folder_is_current(&id, generation).await {
+                // A newer run took the folder over. Hand its children back and
+                // leave the row alone: the new loop is the one reporting now.
+                self.drop_children(&live, "canceled").await;
+                return;
             }
             let can_take = walking && live.len() < FOLDER_WINDOW;
             tokio::select! {
@@ -2644,6 +2708,73 @@ async fn discard_partial(task: &TransferTask) {
     // The segmented engine keeps its own plan next to the partial; without the
     // partial it describes nothing.
     crate::engine::discard_progress(path);
+}
+
+/// Deletes what a removed task left on disk.
+///
+/// The partial file always goes (nothing else references it), and with
+/// `purge_local` the finished output goes too: a download's file, a folder
+/// task's tree, or a cross-drive task's staging directory.
+async fn purge_task_files(task: &TransferTask, purge_local: bool) {
+    discard_partial(task).await;
+    if !purge_local {
+        return;
+    }
+    let path = PathBuf::from(&task.local_path);
+    if task.kind == "folder" {
+        if !path.is_dir() {
+            return;
+        }
+        if task.status == "done" {
+            let _ = tokio::fs::remove_dir_all(&path).await;
+            return;
+        }
+        // A half-finished folder is not a folder to throw away: the files that
+        // did finish are complete and the user may want them. Only the
+        // placeholders go, plus the dirs that held nothing else.
+        remove_placeholders(&path).await;
+        return;
+    }
+    if task.kind == "cross" {
+        if path.is_dir() {
+            let _ = tokio::fs::remove_dir_all(&path).await;
+        }
+        return;
+    }
+    if path.is_file() {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
+
+/// Deletes `*.part` files below `dir` and any directory that ends up empty.
+async fn remove_placeholders(dir: &Path) {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut dirs = Vec::new();
+    while let Some(current) = stack.pop() {
+        dirs.push(current.clone());
+        let Ok(mut entries) = tokio::fs::read_dir(&current).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("part"))
+            {
+                crate::engine::discard_progress(&path);
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+    // Deepest first, so a parent can become empty once its children are gone.
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in dirs {
+        if path != dir {
+            let _ = tokio::fs::remove_dir(&path).await;
+        }
+    }
 }
 
 async fn md5_file(path: &Path) -> AppResult<String> {

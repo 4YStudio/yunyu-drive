@@ -116,7 +116,14 @@ export const api = {
   transferCancel: (id: string) => invoke<void>("transfer_cancel", { id }),
   /** Stops a transfer but keeps it resumable. */
   transferPause: (id: string) => invoke<void>("transfer_pause", { id }),
-  transferRemove: (id: string) => invoke<void>("transfer_remove", { id }),
+  /**
+   * Drops a task. `purgeLocal` also deletes what it left on disk: the partial
+   * placeholder of an unfinished download, or the finished file itself.
+   */
+  transferRemove: (id: string, purgeLocal = false) =>
+    invoke<void>("transfer_remove", { id, purgeLocal }),
+  /** The files a folder task is downloading right now. */
+  transferChildren: (id: string) => invoke<TransferTask[]>("transfer_children", { id }),
   transferClear: () => invoke<void>("transfer_clear"),
   transferRetry: (id: string) => invoke<TransferTask>("transfer_retry", { id }),
   /**
@@ -125,8 +132,11 @@ export const api = {
    * Looping `transferPause` over 3000 ids meant 3000 IPC round trips and 3000
    * events; the backend does it in one pass and announces the batch once.
    */
-  transferBulk: (ids: string[], action: "pause" | "cancel" | "remove" | "resume") =>
-    invoke<number>("transfers_bulk", { ids, action }),
+  transferBulk: (
+    ids: string[],
+    action: "pause" | "cancel" | "remove" | "resume",
+    purgeLocal = false,
+  ) => invoke<number>("transfers_bulk", { ids, action, purgeLocal }),
 
   settingsGet: () => invoke<Settings>("settings_get"),
   settingsSet: (settings: Settings) =>

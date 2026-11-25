@@ -192,6 +192,7 @@ pub fn run() {
             commands::transfer_cancel,
             commands::transfer_pause,
             commands::transfer_remove,
+            commands::transfer_children,
             commands::transfer_clear,
             commands::transfer_retry,
             commands::transfers_bulk,

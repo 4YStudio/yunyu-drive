@@ -809,7 +809,9 @@ export const mockApi = {
     if (task) emit({ ...task, status: "paused", speed: 0 });
   },
 
-  transferRemove: async (id: string) => {
+  transferChildren: async (id: string) => [],
+
+  transferRemove: async (id: string, _purgeLocal = false) => {
     transfers = transfers.filter((t) => t.id !== id);
     for (const cb of removedListeners) cb(id);
   },
@@ -822,7 +824,11 @@ export const mockApi = {
     return next;
   },
 
-  transferBulk: async (ids: string[], action: "pause" | "cancel" | "remove" | "resume") => {
+  transferBulk: async (
+    ids: string[],
+    action: "pause" | "cancel" | "remove" | "resume",
+    _purgeLocal = false,
+  ) => {
     let changed = 0;
     for (const id of ids) {
       const task = transfers.find((t) => t.id === id);

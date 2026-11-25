@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, ref } from "vue";
 
 import { motion } from "motion-v";
 import { barTransition, rowEnter } from "@/lib/motion";
@@ -7,6 +7,7 @@ import Icon from "@/components/Icon.vue";
 import ChunkFooter from "@/components/ChunkFooter.vue";
 import EmptyState from "@/components/EmptyState.vue";
 import Segmented from "@/components/Segmented.vue";
+import Modal from "@/components/Modal.vue";
 import { api } from "@/lib/backend";
 import { openFile, revealPath } from "@/lib/host";
 import { PROVIDERS, type TransferTask } from "@/lib/types";
@@ -107,13 +108,13 @@ async function bulk(action: "pause" | "cancel" | "remove" | "resume") {
       );
       return;
     }
+    if (action === "remove") {
+      await runRemove(list);
+      return;
+    }
     const ids = list.map((t) => t.id);
     const n = await api.transferBulk(ids, action);
-    if (action === "remove") {
-      forgetTransfers(ids);
-      clearSelection();
-      toast(`已移除 ${n} 条记录`, "success");
-    } else if (action === "pause") {
+    if (action === "pause") {
       toast(n ? `已暂停 ${n} 项` : "选中的任务当前都不在运行", "success");
     } else {
       toast(n ? `已取消 ${n} 项` : "选中的任务当前都不在运行", "success");
@@ -239,13 +240,112 @@ async function cancel(task: TransferTask) {
   }
 }
 
-async function remove(task: TransferTask) {
+/**
+ * Removal has two meanings and only one of them is safe to assume.
+ *
+ * An unfinished task owns nothing but a `.part` placeholder, so dropping it is
+ * free. A finished one owns a real file on disk — the user may still want it,
+ * and the app cannot know that for them. So: ask, and let a batch remember the
+ * answer, or selecting a hundred rows would mean a hundred dialogs.
+ */
+const removeAsk = ref<{ task: TransferTask; queue: TransferTask[] } | null>(null);
+const removeRest = ref(true);
+let removeMemory: boolean | null = null;
+
+async function runRemove(tasks: TransferTask[]) {
+  removeMemory = null;
+  removeAsk.value = null;
+  await nextRemove([...tasks]);
+}
+
+async function nextRemove(queue: TransferTask[]) {
+  const head = queue.shift();
+  if (!head) return;
+  if (removeMemory !== null) {
+    await applyRemove([head], removeMemory);
+    return nextRemove(queue);
+  }
+  if (head.status !== "done") {
+    // Nothing finished: the placeholders and partial trees go without asking.
+    await applyRemove([head], true);
+    return nextRemove(queue);
+  }
+  removeAsk.value = { task: head, queue };
+}
+
+async function confirmRemove(purgeLocal: boolean) {
+  const ask = removeAsk.value;
+  if (!ask) return;
+  if (removeRest.value) removeMemory = purgeLocal;
+  removeAsk.value = null;
+  await applyRemove([ask.task], purgeLocal);
+  await nextRemove(ask.queue);
+}
+
+function cancelRemove() {
+  removeAsk.value = null;
+}
+
+async function applyRemove(tasks: TransferTask[], purgeLocal: boolean) {
+  const ids = tasks.map((task) => task.id);
   try {
-    await api.transferRemove(task.id);
+    if (ids.length === 1) await api.transferRemove(ids[0], purgeLocal);
+    else await api.transferBulk(ids, "remove", purgeLocal);
+    forgetTransfers(ids);
+    clearSelection();
   } catch (err) {
     toast(errText(err), "error");
   }
 }
+
+/** Path shown in the confirm dialog: a folder task owns the whole tree. */
+const removeTarget = computed(() => removeAsk.value?.task.localPath ?? "");
+
+// ------------------------------------------------------------ expand a folder ---
+
+/** Which folder row is unfolded, and the files it is working on right now. */
+const expanded = ref<string | null>(null);
+const children = ref<TransferTask[]>([]);
+let childTimer: ReturnType<typeof setInterval> | undefined;
+
+async function loadChildren() {
+  const id = expanded.value;
+  if (!id) return;
+  try {
+    children.value = await api.transferChildren(id);
+  } catch {
+    children.value = [];
+  }
+}
+
+function stopChildren() {
+  if (childTimer !== undefined) clearInterval(childTimer);
+  childTimer = undefined;
+  children.value = [];
+}
+
+function collapse() {
+  expanded.value = null;
+  stopChildren();
+}
+
+async function toggleExpand(task: TransferTask) {
+  if (expanded.value === task.id) {
+    collapse();
+    return;
+  }
+  expanded.value = task.id;
+  children.value = [];
+  await loadChildren();
+  stopChildren();
+  expanded.value = task.id;
+  // Children are hidden from the event stream on purpose — a big folder has
+  // thousands of them and each event would re-render this list. The open row
+  // polls instead, and only while it is open.
+  childTimer = setInterval(loadChildren, 900);
+}
+
+onDeactivated(collapse);
 
 async function retry(task: TransferTask) {
   try {
@@ -395,6 +495,15 @@ onActivated(() => {
                 :title="providerName(task)"
                 draggable="false"
               />
+              <button
+                v-if="isFolder(task)"
+                class="kid-toggle"
+                :aria-expanded="expanded === task.id"
+                :title="expanded === task.id ? '收起文件列表' : '展开查看正在下载的文件'"
+                @click.stop="toggleExpand(task)"
+              >
+                <Icon :name="expanded === task.id ? 'chevron-down' : 'chevron-right'" :size="11" />
+              </button>
               <span class="task-name truncate" :title="task.name">{{ task.name }}</span>
               <span class="task-state">{{ statusLabel(task) }}</span>
               <span v-if="isCross(task)" class="task-kind">{{ kindLabel(task) }}</span>
@@ -493,16 +602,58 @@ onActivated(() => {
             <button
               v-if="['done', 'failed', 'canceled'].includes(task.status)"
               class="icon-btn"
-              title="移除记录"
-              @click="remove(task)"
+              title="移除任务"
+              @click="runRemove([task])"
             >
               <Icon name="trash" :size="14" />
             </button>
+          </div>
+
+          <div v-if="expanded === task.id" class="kids">
+            <p v-if="children.length === 0" class="kids-empty">
+              {{ task.listing ? "正在读取文件夹…" : "没有正在下载的文件" }}
+            </p>
+            <div v-for="kid in children" :key="kid.id" class="kid">
+              <span class="kid-name truncate" :title="kid.name">{{ kid.name }}</span>
+              <div class="kid-bar">
+                <div
+                  class="kid-bar-fill"
+                  :style="{ width: `${kid.size ? Math.min(100, (kid.transferred / kid.size) * 100) : 0}%` }"
+                />
+              </div>
+              <span class="kid-size mono">
+                {{ formatSize(kid.transferred) }} / {{ formatSize(kid.size) }}
+              </span>
+            </div>
           </div>
         </motion.article>
 
         <ChunkFooter :mounted="pagedRows.length" :rest="rest" noun="传输" @more="more()" />
       </div>
+
+      <Modal
+        :open="removeAsk !== null"
+        title="移除任务"
+        :width="430"
+        @close="cancelRemove"
+      >
+        <p class="rm-text">
+          <b>{{ removeAsk?.task.name }}</b> 已经下载完成，本地文件还在：
+        </p>
+        <p class="rm-path mono" :title="removeTarget">{{ removeTarget }}</p>
+        <p class="rm-hint">
+          只移除记录不会动这个文件；移除并删除会把它从磁盘上删掉（无法恢复）。
+        </p>
+        <label v-if="(removeAsk?.queue.length ?? 0) > 0" class="rm-remember">
+          <input v-model="removeRest" type="checkbox" />
+          <span>对剩下的 {{ removeAsk?.queue.length }} 项都这样处理</span>
+        </label>
+        <template #footer>
+          <button class="btn" @click="cancelRemove">取消</button>
+          <button class="btn btn--danger" @click="confirmRemove(true)">移除并删除文件</button>
+          <button class="btn btn--solid" @click="confirmRemove(false)">只移除记录</button>
+        </template>
+      </Modal>
     </div>
   </section>
 </template>
@@ -726,5 +877,97 @@ onActivated(() => {
 :where(.task) {
   /* `motion.article` — see src/lib/motion.ts. */
   transform: translateY(0);
+}
+
+/* Fold/unfold a folder row. Small targets on purpose: it sits inside the name
+   column, not in the action strip. */
+.kid-toggle {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-right: -3px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.kid-toggle:hover {
+  background: var(--bg-3);
+  color: var(--text-2);
+}
+
+.kids {
+  grid-column: 1 / -1;
+  margin: 2px 0 2px 30px;
+  padding: 4px 0 6px 8px;
+  border-left: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.kids-empty {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 11.8px;
+}
+.kid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px 118px;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.8px;
+  color: var(--text-2);
+}
+.kid-name {
+  min-width: 0;
+}
+.kid-bar {
+  height: 3px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+.kid-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.24s linear;
+}
+.kid-size {
+  text-align: right;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.rm-text {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.rm-path {
+  margin: 0 0 10px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  font-size: 11.5px;
+  color: var(--text-2);
+  word-break: break-all;
+}
+.rm-hint {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.55;
+}
+.rm-remember {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.2px;
+  color: var(--text-2);
 }
 </style>
