@@ -917,6 +917,7 @@ async fn ensure_remote_dir(
 }
 
 /// Walks a local directory and returns (relative path, absolute path) pairs.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn collect_local_files(root: &Path) -> AppResult<Vec<(PathBuf, PathBuf)>> {
     const MAX_FILES: usize = 5000;
     let mut out = Vec::new();
@@ -989,29 +990,22 @@ pub async fn upload_files(
                 .to_string();
             let folder_fid =
                 ensure_remote_dir(&drive, &mut dir_cache, &root_fid, &root_name).await?;
-            let files = collect_local_files(&path).await?;
-            if files.is_empty() {
-                return Err(AppError::new(format!("「{root_name}」是空文件夹")));
-            }
-            for (relative, absolute) in files {
-                let mut parent = folder_fid.clone();
-                if let Some(rel_parent) = relative.parent() {
-                    for segment in rel_parent.components() {
-                        let piece = segment.as_os_str().to_string_lossy().to_string();
-                        if piece.is_empty() {
-                            continue;
-                        }
-                        parent =
-                            ensure_remote_dir(&drive, &mut dir_cache, &parent, &piece).await?;
-                    }
-                }
-                let file_name = absolute
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or("file")
-                    .to_string();
-                sources.push((absolute.to_string_lossy().to_string(), parent, file_name));
-            }
+            // A folder upload is one row in the transfer list, not one row per
+            // file: the manager walks the tree, creates the remote folders and
+            // keeps a few uploads in flight. Sending 3000 files as 3000 tasks is
+            // what used to freeze the window.
+            let folder = crate::transfer::UploadDirRef {
+                provider: id.provider.as_str().to_string(),
+                pdir_fid: folder_fid,
+                path: raw.clone(),
+                name: root_name,
+                conflict: settings.upload_conflict.clone(),
+            };
+            let task = state
+                .transfers
+                .start_upload_folder(app.clone(), Arc::clone(&drive), folder)
+                .await?;
+            tasks.push(task);
             continue;
         }
 
@@ -1249,8 +1243,18 @@ async fn retry_task(state: &Arc<AppState>, app: AppHandle, id: &str) -> AppResul
         let drive = state.drive_of(provider).await?;
         return state.transfers.resume_folder(app, drive, &id).await;
     }
+    if task.kind == "upload" {
+        // Folder uploads resume; single files are sent again from scratch.
+        let Some(dir) = task.upload_dir.clone() else {
+            return Err(AppError::new("上传任务无法续传，请重新上传"));
+        };
+        let provider = ProviderId::parse(&dir.provider)
+            .ok_or_else(|| AppError::new(format!("未知的网盘：{}", dir.provider)))?;
+        let drive = state.drive_of(provider).await?;
+        return state.transfers.resume_upload_folder(app, drive, &id).await;
+    }
     if task.kind != "download" {
-        return Err(AppError::new("上传任务无法续传，请重新上传"));
+        return Err(AppError::new("这个任务无法续传，请重新开始"));
     }
     let ctx = match &task.share {
         Some(share) => {
@@ -1423,4 +1427,809 @@ pub async fn app_info(state: State<'_, Arc<AppState>>) -> AppResult<AppInfo> {
         platform: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         log_path: crate::logging::path().map(|p| p.to_string_lossy().to_string()),
     })
+}
+
+// ---------------------------------------------------------------------------
+// live upload probe
+// ---------------------------------------------------------------------------
+//
+// Diagnostic only: every test here is `#[ignore]` and talks to a real account.
+// It creates exactly one remote folder `yunyu-probe-up-<pid>` per drive, works
+// inside it, and deletes it at the end. Nothing outside that folder is touched.
+//
+// Run one drive at a time, e.g.:
+//   cargo test --lib quark_live_upload_probe -- --ignored --nocapture
+//
+// The command layer itself needs a `tauri::AppHandle` (not constructible in a
+// unit test), so these tests drive `DriveProvider::upload` directly and reuse the
+// very helpers `upload_files` uses (`collect_local_files`, `ensure_remote_dir`,
+// `resolve_conflict`), plus the same `CancellationToken` that pause/cancel use.
+#[cfg(test)]
+mod live_upload_probe {
+    use super::*;
+    use crate::providers::UploadSink;
+    use futures_util::StreamExt;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    /// Native root id accepted by every provider (`cloud189` maps "0" -> "-11").
+    const ROOT: &str = "0";
+    const BIG: usize = 10 * 1024 * 1024;
+    const CANCEL_SIZE: usize = 50 * 1024 * 1024;
+
+    fn config_dir() -> PathBuf {
+        crate::config::AppPaths::resolve()
+            .expect("无法定位配置目录")
+            .config_dir
+    }
+
+    fn probe_name() -> String {
+        format!("yunyu-probe-up-{}", std::process::id())
+    }
+
+    // ------------------------------------------------------------- providers ---
+
+    fn quark_drive() -> Option<Arc<dyn DriveProvider>> {
+        let paths = crate::config::AppPaths::resolve().ok()?;
+        let cookie = crate::config::read_cookie(&paths)?;
+        let client = libquarkpan::QuarkPan::builder()
+            .cookie(cookie.clone())
+            .api_base_url("https://drive.quark.cn".to_string())
+            .prepare()
+            .ok()?;
+        Some(Arc::new(crate::providers::quark::QuarkProvider::new(
+            client,
+            cookie,
+            paths.cookie_file().to_string_lossy().to_string(),
+        )))
+    }
+
+    macro_rules! loader {
+        ($name:ident, $ty:path) => {
+            fn $name() -> Option<Arc<dyn DriveProvider>> {
+                <$ty>::load(&config_dir())
+                    .ok()
+                    .map(|p| Arc::new(p) as Arc<dyn DriveProvider>)
+            }
+        };
+    }
+
+    loader!(yun139_drive, crate::providers::yun139::Yun139Provider);
+    loader!(aliyun_drive, crate::providers::aliyun::AliyunProvider);
+    loader!(pan115_drive, crate::providers::pan115::Pan115Provider);
+    loader!(pan123_drive, crate::providers::pan123::Pan123Provider);
+    loader!(baidu_drive, crate::providers::baidu::BaiduProvider);
+    loader!(cloud189_drive, crate::providers::cloud189::Cloud189Provider);
+
+    // --------------------------------------------------------------- helpers ---
+
+    /// Deterministic pseudo-random bytes: unique per run, incompressible enough
+    /// that no drive answers with a rapid upload by accident.
+    fn payload(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len + 8);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    struct Row {
+        item: String,
+        ok: bool,
+        detail: String,
+    }
+
+    /// Records what the provider reports while it uploads.
+    struct Recorder {
+        bytes: AtomicU64,
+        phases: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                bytes: AtomicU64::new(0),
+                phases: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn phases(&self) -> Vec<String> {
+            self.phases.lock().map(|v| v.clone()).unwrap_or_default()
+        }
+
+        fn bytes(&self) -> u64 {
+            self.bytes.load(Ordering::Relaxed)
+        }
+    }
+
+    impl UploadSink for Recorder {
+        fn phase(&self, phase: &str) {
+            if let Ok(mut list) = self.phases.lock() {
+                if list.last().map(String::as_str) != Some(phase) {
+                    list.push(phase.to_string());
+                }
+            }
+        }
+
+        fn progress(&self, bytes: u64) {
+            self.bytes.fetch_max(bytes, Ordering::Relaxed);
+        }
+    }
+
+    async fn download_all(drive: &Arc<dyn DriveProvider>, fid: &str) -> AppResult<Vec<u8>> {
+        let mut handle = drive.open_download(fid, 0).await?;
+        let mut out = Vec::with_capacity(handle.size as usize);
+        while let Some(chunk) = handle.stream.next().await {
+            out.extend_from_slice(&chunk?);
+        }
+        Ok(out)
+    }
+
+    /// Deletes everything below `dir` (files first, then folders bottom-up).
+    async fn purge_dir(drive: &Arc<dyn DriveProvider>, dir: &str, depth: usize) -> AppResult<usize> {
+        if depth > 8 {
+            return Ok(0);
+        }
+        let entries = drive.list(dir).await?.entries;
+        let mut removed = 0usize;
+        for entry in entries.iter().filter(|e| !e.is_dir) {
+            drive.delete(&[native_of(&entry.fid)]).await?;
+            removed += 1;
+        }
+        for entry in entries.iter().filter(|e| e.is_dir) {
+            removed += Box::pin(purge_dir(drive, &native_of(&entry.fid), depth + 1)).await?;
+            drive.delete(&[native_of(&entry.fid)]).await?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// `relative path -> (native id, size)` for a remote tree.
+    async fn remote_tree(
+        drive: &Arc<dyn DriveProvider>,
+        dir: &str,
+        prefix: &str,
+        out: &mut BTreeMap<String, (String, u64)>,
+        depth: usize,
+    ) -> AppResult<()> {
+        if depth > 8 {
+            return Ok(());
+        }
+        for entry in drive.list(dir).await?.entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{prefix}/{}", entry.name)
+            };
+            if entry.is_dir {
+                Box::pin(remote_tree(
+                    drive,
+                    &native_of(&entry.fid),
+                    &path,
+                    out,
+                    depth + 1,
+                ))
+                .await?;
+            } else {
+                out.insert(path, (native_of(&entry.fid), entry.size));
+            }
+        }
+        Ok(())
+    }
+
+    struct Uploaded {
+        fid: Option<String>,
+        phases: Vec<String>,
+        bytes: u64,
+        ms: u128,
+    }
+
+    struct Probe {
+        label: &'static str,
+        drive: Arc<dyn DriveProvider>,
+        /// Native id of `yunyu-probe-up-<pid>`.
+        remote: String,
+        local: PathBuf,
+        rows: Vec<Row>,
+        started: Instant,
+    }
+
+    impl Probe {
+        async fn new(label: &'static str, drive: Arc<dyn DriveProvider>) -> AppResult<Self> {
+            let remote_name = probe_name();
+            // Leftovers from an aborted earlier run with the same pid are ours.
+            for entry in drive
+                .list(ROOT)
+                .await?
+                .entries
+                .iter()
+                .filter(|e| e.is_dir && e.name == remote_name)
+            {
+                let native = native_of(&entry.fid);
+                let _ = purge_dir(&drive, &native, 0).await;
+                let _ = drive.delete(&[native]).await;
+            }
+            let qualified = drive.make_dir(ROOT, &remote_name).await?;
+            let local = std::env::temp_dir().join(format!("{remote_name}-local"));
+            tokio::fs::create_dir_all(&local).await?;
+            Ok(Self {
+                label,
+                drive,
+                remote: native_of(&qualified),
+                local,
+                rows: Vec::new(),
+                started: Instant::now(),
+            })
+        }
+
+        fn record(&mut self, item: impl Into<String>, result: AppResult<String>) {
+            let item = item.into();
+            match result {
+                Ok(detail) => self.rows.push(Row {
+                    item,
+                    ok: true,
+                    detail,
+                }),
+                Err(err) => self.rows.push(Row {
+                    item,
+                    ok: false,
+                    detail: err.to_string(),
+                }),
+            }
+        }
+
+        async fn upload(&self, local: &Path, parent: &str, name: &str) -> AppResult<Uploaded> {
+            let sink = Recorder::new();
+            let started = Instant::now();
+            let fid = self
+                .drive
+                .upload(local, parent, name, sink.clone(), CancellationToken::new())
+                .await?;
+            Ok(Uploaded {
+                fid,
+                phases: sink.phases(),
+                bytes: sink.bytes(),
+                ms: started.elapsed().as_millis(),
+            })
+        }
+
+        async fn entries(&self, parent: &str) -> AppResult<Vec<EntryDto>> {
+            Ok(self.drive.list(parent).await?.entries)
+        }
+
+        /// Listing size + full byte comparison, the only trustworthy check that
+        /// what the drive stored is what we meant to store. Some drives serve a
+        /// stale listing right after an upload, so the entry is polled for up to
+        /// 30 s and the observed visibility delay is reported.
+        async fn read_back(&self, dir: &str, name: &str, expected: &[u8]) -> AppResult<String> {
+            let started = Instant::now();
+            let mut waited = 0u128;
+            let hit = loop {
+                let entries = self.entries(dir).await?;
+                if let Some(hit) = entries.iter().find(|e| e.name == name) {
+                    break hit.clone();
+                }
+                if started.elapsed() > Duration::from_secs(30) {
+                    return Err(AppError::new(format!(
+                        "列表里没有「{name}」（轮询 30 秒仍未出现）"
+                    )));
+                }
+                waited = started.elapsed().as_millis();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            };
+            if hit.size != expected.len() as u64 {
+                return Err(AppError::new(format!(
+                    "列表 size={} 与本地 {} 不一致",
+                    hit.size,
+                    expected.len()
+                )));
+            }
+            let bytes = download_all(&self.drive, &native_of(&hit.fid)).await?;
+            if bytes != expected {
+                return Err(AppError::new(format!(
+                    "下载内容不一致：下载 {} 字节，本地 {} 字节",
+                    bytes.len(),
+                    expected.len()
+                )));
+            }
+            Ok(format!(
+                "size={} 一致，逐字节下载一致（{} 字节）{}，fid={}",
+                hit.size,
+                bytes.len(),
+                if waited > 0 {
+                    format!("，列表延迟约 {waited}ms 才可见")
+                } else {
+                    String::new()
+                },
+                hit.fid
+            ))
+        }
+    }
+
+    /// The remote tree `upload_files` builds for one local folder: one remote
+    /// dir per relative directory, `resolve_conflict` per file.
+    async fn upload_tree(
+        probe: &Probe,
+        tree: &Path,
+        settings: &Settings,
+    ) -> AppResult<(usize, usize, String, Vec<u64>)> {
+        let files = super::collect_local_files(tree).await?;
+        let mut cache: HashMap<String, Vec<EntryDto>> = HashMap::new();
+        let mut used: HashMap<String, Vec<String>> = HashMap::new();
+        let root_name = tree
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("tree")
+            .to_string();
+        let folder =
+            super::ensure_remote_dir(&probe.drive, &mut cache, &probe.remote, &root_name).await?;
+        let mut uploaded = 0usize;
+        let mut skipped = 0usize;
+        let mut millis = Vec::new();
+        for (relative, absolute) in files {
+            let mut parent = folder.clone();
+            if let Some(rel_parent) = relative.parent() {
+                for segment in rel_parent.components() {
+                    let piece = segment.as_os_str().to_string_lossy().to_string();
+                    if piece.is_empty() {
+                        continue;
+                    }
+                    parent =
+                        super::ensure_remote_dir(&probe.drive, &mut cache, &parent, &piece).await?;
+                }
+            }
+            let file_name = absolute
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or("file")
+                .to_string();
+            if !used.contains_key(&parent) {
+                let listing = probe.drive.list(&parent).await?;
+                used.insert(
+                    parent.clone(),
+                    listing.entries.iter().map(|e| e.name.clone()).collect(),
+                );
+            }
+            let names = used.get_mut(&parent).expect("populated above");
+            let Some(name) = super::resolve_conflict(&file_name, names, settings) else {
+                skipped += 1;
+                continue;
+            };
+            names.push(name.clone());
+            let started = Instant::now();
+            probe
+                .drive
+                .upload(&absolute, &parent, &name, Recorder::new(), CancellationToken::new())
+                .await?;
+            millis.push(started.elapsed().as_millis() as u64);
+            uploaded += 1;
+        }
+        Ok((uploaded, skipped, folder, millis))
+    }
+
+    /// 3 levels, 30 files: empty file, 10 MiB file, Chinese/emoji names.
+    async fn build_tree(root: &Path, seed: u64) -> AppResult<()> {
+        let level2 = root.join("中文 目录").join("level2");
+        tokio::fs::create_dir_all(&level2).await?;
+        tokio::fs::write(root.join("a.txt"), payload(1024, seed ^ 0x11)).await?;
+        tokio::fs::write(root.join("empty.bin"), b"").await?;
+        tokio::fs::write(
+            root.join("中文 目录").join("b.txt"),
+            payload(2048, seed ^ 0x22),
+        )
+        .await?;
+        tokio::fs::write(
+            root.join("中文 目录").join("😀表情.txt"),
+            payload(1024, seed ^ 0x33),
+        )
+        .await?;
+        for index in 0..26u64 {
+            let path = level2.join(format!("f{index:02}.bin"));
+            let bytes = match index {
+                20 => payload(BIG, seed ^ index),
+                25 => Vec::new(),
+                _ => payload(1024 + index as usize * 37, seed ^ index),
+            };
+            tokio::fs::write(&path, bytes).await?;
+        }
+        Ok(())
+    }
+
+    fn report(probe: &Probe) -> String {
+        let mut text = format!(
+            "== {} 上传 live 探针 ==\n远端临时目录：{}/{}\n用时：{}ms\n",
+            probe.label,
+            ROOT,
+            probe_name(),
+            probe.started.elapsed().as_millis()
+        );
+        for row in &probe.rows {
+            text.push_str(&format!(
+                "{} | {} | {}\n",
+                if row.ok { "PASS" } else { "FAIL" },
+                row.item,
+                row.detail.replace('\n', " ")
+            ));
+        }
+        let failed = probe.rows.iter().filter(|r| !r.ok).count();
+        text.push_str(&format!(
+            "合计 {} 项，失败 {}\n",
+            probe.rows.len(),
+            failed
+        ));
+        text
+    }
+
+    async fn run(mut probe: Probe) -> (usize, String) {
+        let remote = probe.remote.clone();
+        let local = probe.local.clone();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x5eed);
+        let settings = crate::config::load_settings(&crate::config::AppPaths::resolve().unwrap());
+
+        // ---- a1. 0 字节 ----
+        let zero = payload(0, seed);
+        let path = local.join("zero.bin");
+        let result = async {
+            tokio::fs::write(&path, &zero).await?;
+            let up = probe.upload(&path, &remote, "zero.bin").await?;
+            let detail = probe.read_back(&remote, "zero.bin", &zero).await?;
+            Ok(format!(
+                "{detail}；phases={:?}；{}ms；fid={:?}",
+                up.phases, up.ms, up.fid
+            ))
+        }
+        .await;
+        probe.record("单文件：0 字节", result);
+
+        // ---- a2. 1 MiB ----
+        let one_mib = payload(1024 * 1024, seed ^ 0x1001);
+        let path = local.join("onemib.bin");
+        let result = async {
+            tokio::fs::write(&path, &one_mib).await?;
+            let up = probe.upload(&path, &remote, "onemib.bin").await?;
+            let detail = probe.read_back(&remote, "onemib.bin", &one_mib).await?;
+            Ok(format!(
+                "{detail}；phases={:?}；{}ms；sink 记录 {} 字节",
+                up.phases, up.ms, up.bytes
+            ))
+        }
+        .await;
+        probe.record("单文件：1 MiB", result);
+
+        // ---- a3. 中文 + emoji 名 ----
+        let odd_name = "中文 测试😀 #1.bin";
+        let odd = payload(128 * 1024, seed ^ 0x2002);
+        let path = local.join("odd.bin");
+        let result = async {
+            tokio::fs::write(&path, &odd).await?;
+            let up = probe.upload(&path, &remote, odd_name).await?;
+            let detail = probe.read_back(&remote, odd_name, &odd).await?;
+            Ok(format!("{detail}；phases={:?}；{}ms", up.phases, up.ms))
+        }
+        .await;
+        probe.record("单文件：中文/emoji 文件名", result);
+
+        // ---- a4. 重名 ----
+        let dup = payload(64 * 1024, seed ^ 0x3003);
+        let dup_other = payload(64 * 1024, seed ^ 0x4004);
+        let path = local.join("dup.bin");
+        let result = async {
+            tokio::fs::write(&path, &dup).await?;
+            probe.upload(&path, &remote, "dup.bin").await?;
+            let names: Vec<String> = probe
+                .entries(&remote)
+                .await?
+                .iter()
+                .map(|e| e.name.clone())
+                .collect();
+            let chosen = super::resolve_conflict("dup.bin", &names, &settings)
+                .ok_or_else(|| AppError::new("重名策略为「跳过」，命令层会静默跳过"))?;
+            let up = probe.upload(&path, &remote, &chosen).await?;
+            let verified = probe.read_back(&remote, &chosen, &dup).await?;
+            let renamed_phases = format!("{:?}", up.phases);
+            // Same name again, bypassing the policy: does the drive overwrite,
+            // keep two entries, or reject?
+            tokio::fs::write(&path, &dup_other).await?;
+            let raw = probe.upload(&path, &remote, "dup.bin").await?;
+            let entries = probe.entries(&remote).await?;
+            let same: Vec<&EntryDto> = entries.iter().filter(|e| e.name == "dup.bin").collect();
+            let after = if same.len() == 1 {
+                let bytes = download_all(&probe.drive, &native_of(&same[0].fid)).await?;
+                if bytes == dup_other {
+                    "只有 1 条，内容被覆盖"
+                } else if bytes == dup {
+                    "只有 1 条，内容仍是第一次"
+                } else {
+                    "只有 1 条，内容既非旧也非新"
+                }
+            } else {
+                "出现多条同名条目"
+            };
+            Ok(format!(
+                "重名策略={}，命令层选名「{chosen}」（phases={renamed_phases}）；{verified}；直接同名再传：{after}（共 {} 条 dup.bin）；phases={:?}；{}ms",
+                settings.upload_conflict,
+                same.len(),
+                raw.phases,
+                raw.ms
+            ))
+        }
+        .await;
+        probe.record("单文件：重名/不覆盖", result);
+
+        // ---- b. rename + 再 list ----
+        let result = async {
+            let entries = probe.entries(&remote).await?;
+            let hit = entries
+                .iter()
+                .find(|e| e.name == "onemib.bin")
+                .ok_or_else(|| AppError::new("找不到 onemib.bin"))?;
+            let fid = native_of(&hit.fid);
+            let renamed = format!("renamed-{}.bin", std::process::id());
+            probe.drive.rename(&fid, &renamed).await?;
+            let entries = probe.entries(&remote).await?;
+            if entries.iter().any(|e| e.name == "onemib.bin") {
+                return Err(AppError::new("改名后旧名仍在列表里"));
+            }
+            let detail = probe.read_back(&remote, &renamed, &one_mib).await?;
+            Ok(format!("→{renamed}；{detail}"))
+        }
+        .await;
+        probe.record("改名 + 再 list + 内容核对", result);
+
+        // ---- c. 文件夹上传 ----
+        let tree = local.join("probe-tree");
+        let mut tree_folder = String::new();
+        let result = async {
+            build_tree(&tree, seed).await?;
+            let (uploaded, skipped, folder, millis) =
+                upload_tree(&probe, &tree, &settings).await?;
+            let files = super::collect_local_files(&tree).await?;
+            let mut expected: BTreeMap<String, u64> = BTreeMap::new();
+            for (relative, absolute) in &files {
+                expected.insert(
+                    format!("probe-tree/{}", relative.to_string_lossy().replace('\\', "/")),
+                    tokio::fs::metadata(absolute).await?.len(),
+                );
+            }
+            let mut actual: BTreeMap<String, (String, u64)> = BTreeMap::new();
+            remote_tree(&probe.drive, &folder, "probe-tree", &mut actual, 0).await?;
+            let missing: Vec<&String> = expected.keys().filter(|k| !actual.contains_key(*k)).collect();
+            let extra: Vec<&String> = actual.keys().filter(|k| !expected.contains_key(*k)).collect();
+            let wrong: Vec<String> = expected
+                .iter()
+                .filter_map(|(k, size)| match actual.get(k) {
+                    Some((_, got)) if got != size => Some(format!("{k}: {got}≠{size}")),
+                    _ => None,
+                })
+                .collect();
+            if !missing.is_empty() || !extra.is_empty() || !wrong.is_empty() {
+                return Err(AppError::new(format!(
+                    "远端 {} 个文件 / 本地 {} 个：缺 {:?}，多 {:?}，大小不符 {:?}",
+                    actual.len(),
+                    expected.len(),
+                    missing,
+                    extra,
+                    wrong
+                )));
+            }
+            // Spot-check the bytes of a shallow and a deep file.
+            for relative in ["a.txt", "中文 目录/level2/f00.bin"] {
+                let key = format!("probe-tree/{relative}");
+                let (fid, _) = actual.get(&key).expect("checked above");
+                let want = tokio::fs::read(tree.join(relative)).await?;
+                let got = download_all(&probe.drive, fid).await?;
+                if got != want {
+                    return Err(AppError::new(format!("抽查 {relative} 内容不一致")));
+                }
+            }
+            tree_folder = folder.clone();
+            let slowest = millis.iter().max().copied().unwrap_or(0);
+            let total: u64 = millis.iter().sum();
+            Ok(format!(
+                "层数 3，本地 30 个文件（含空文件与 {} MiB 大文件，中文/emoji 目录名）；ensure_remote_dir 建目录 + 逐文件上传：上传 {uploaded}，跳过 {skipped}，远端 {}/{} 一致，抽查 2 个文件逐字节一致；串行总耗时 {}ms，单文件最慢 {}ms",
+                BIG / 1024 / 1024,
+                actual.len(),
+                expected.len(),
+                total,
+                slowest
+            ))
+        }
+        .await;
+        probe.record("文件夹上传（3 层 / 30 文件）", result);
+
+        // ---- c2. 重复执行同一个文件夹 ----
+        if !tree_folder.is_empty() {
+            let result = async {
+                let (uploaded, skipped, folder, _) = upload_tree(&probe, &tree, &settings).await?;
+                let mut actual: BTreeMap<String, (String, u64)> = BTreeMap::new();
+                remote_tree(&probe.drive, &folder, "probe-tree", &mut actual, 0).await?;
+                let copies = actual.keys().filter(|k| k.contains(" (2)")).count();
+                Ok(format!(
+                    "重复上传同一目录：新上传 {uploaded}，跳过 {skipped}，远端共 {} 个文件，其中带「 (2)」的副本 {copies} 个（策略 {}）",
+                    actual.len(),
+                    settings.upload_conflict
+                ))
+            }
+            .await;
+            probe.record("文件夹重复上传（是否产生副本）", result);
+        }
+
+        // ---- d. 50 MiB 上传中取消 ----
+        let big_path = local.join("cancel-me.bin");
+        let cancel_payload = payload(CANCEL_SIZE, seed ^ 0x7777);
+        let result = async {
+            tokio::fs::write(&big_path, &cancel_payload).await?;
+            let drive = probe.drive.clone();
+            let parent = remote.clone();
+            let path = big_path.clone();
+            let token = CancellationToken::new();
+            let child = token.clone();
+            let task = tokio::spawn(async move {
+                drive
+                    .upload(&path, &parent, "cancel-me.bin", Recorder::new(), child)
+                    .await
+            });
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if task.is_finished() {
+                let outcome = match task.await {
+                    Ok(Ok(_)) => "5 秒内已传完，未能测试中途取消".to_string(),
+                    Ok(Err(err)) => format!("5 秒内已失败：{err}"),
+                    Err(err) => format!("5 秒内任务崩溃：{err}"),
+                };
+                return Ok(outcome);
+            }
+            token.cancel();
+            let outcome = match tokio::time::timeout(Duration::from_secs(120), task).await {
+                Ok(Ok(Ok(fid))) => format!("取消后上传仍返回成功（fid={fid:?}）"),
+                Ok(Ok(Err(err))) => format!("取消后返回错误：{err}"),
+                Ok(Err(err)) => format!("任务崩溃：{err}"),
+                Err(_) => "取消后 120 秒仍未返回".to_string(),
+            };
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let left: Vec<String> = probe
+                .entries(&remote)
+                .await?
+                .into_iter()
+                .filter(|e| e.name.contains("cancel"))
+                .map(|e| format!("{} size={}", e.name, e.size))
+                .collect();
+            Ok(format!(
+                "{outcome}；3 秒后远端残留：{left:?}"
+            ))
+        }
+        .await;
+        probe.record("50 MiB 上传中取消（5 秒后）", result);
+
+        // ---- d2. 取消后重新完整上传 ----
+        let result = async {
+            let up = probe
+                .upload(&big_path, &remote, "cancel-ok.bin")
+                .await?;
+            let detail = probe
+                .read_back(&remote, "cancel-ok.bin", &cancel_payload)
+                .await?;
+            Ok(format!("{detail}；{}ms；phases={:?}", up.ms, up.phases))
+        }
+        .await;
+        probe.record("50 MiB 完整上传 + 内容核对", result);
+
+        // ---- e. 秒传 / 极速上传 ----
+        let rapid = payload(1024 * 1024, seed ^ 0x9999);
+        let path = local.join("rapid.bin");
+        let result = async {
+            tokio::fs::write(&path, &rapid).await?;
+            let first = probe.upload(&path, &remote, "rapid.bin").await?;
+            let second = probe.upload(&path, &remote, "rapid.bin").await?;
+            let entries = probe.entries(&remote).await?;
+            let hits: Vec<&EntryDto> = entries.iter().filter(|e| e.name.starts_with("rapid")).collect();
+            let sizes: Vec<u64> = hits.iter().map(|e| e.size).collect();
+            Ok(format!(
+                "首传 phases={:?} {}ms；二传 phases={:?} {}ms sink 记录 {} 字节（首传 {}）；列表名={:?} 大小={:?}",
+                first.phases,
+                first.ms,
+                second.phases,
+                second.ms,
+                second.bytes,
+                first.bytes,
+                hits.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+                sizes
+            ))
+        }
+        .await;
+        probe.record("秒传/同内容二次上传", result);
+
+        // ---- 清理 ----
+        let result = async {
+            let removed = purge_dir(&probe.drive, &remote, 0).await?;
+            probe.drive.delete(std::slice::from_ref(&remote)).await?;
+            let left = probe
+                .entries(ROOT)
+                .await?
+                .into_iter()
+                .filter(|e| e.name == probe_name())
+                .count();
+            let _ = tokio::fs::remove_dir_all(&local).await;
+            if left != 0 {
+                return Err(AppError::new(format!(
+                    "远端仍残留 {left} 个同名目录"
+                )));
+            }
+            Ok(format!("删除远端 {removed} 项 + 临时目录；根目录已无 {}", probe_name()))
+        }
+        .await;
+        probe.record("清理", result);
+
+        let failed = probe.rows.iter().filter(|r| !r.ok).count();
+        (failed, report(&probe))
+    }
+
+    async fn run_drive(label: &'static str, drive: Option<Arc<dyn DriveProvider>>) {
+        let Some(drive) = drive else {
+            println!("SKIP {label}: 没有可用凭据");
+            return;
+        };
+        let probe = match Probe::new(label, drive).await {
+            Ok(probe) => probe,
+            Err(err) => panic!("{label} 建立临时目录失败：{err}"),
+        };
+        let (failed, text) = run(probe).await;
+        println!("{text}");
+        let safe: String = label.chars().filter(|c| c.is_alphanumeric()).collect();
+        let path = std::env::temp_dir().join(format!("yunyu-probe-report-{safe}.txt"));
+        let _ = std::fs::write(&path, &text);
+        println!("报告写入 {}", path.display());
+        assert_eq!(failed, 0, "{label} 有 {failed} 项失败，详见上方输出");
+    }
+
+    #[tokio::test]
+    #[ignore = "live: 需要真实夸克凭据"]
+    async fn quark_live_upload_probe() {
+        run_drive("夸克网盘", quark_drive()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: 需要真实移动云盘凭据"]
+    async fn yun139_live_upload_probe() {
+        run_drive("移动云盘139", yun139_drive()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: 需要真实阿里云盘凭据"]
+    async fn aliyun_live_upload_probe() {
+        run_drive("阿里云盘", aliyun_drive()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: 需要真实 115 凭据"]
+    async fn pan115_live_upload_probe() {
+        run_drive("115网盘", pan115_drive()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: 需要真实 123 凭据"]
+    async fn pan123_live_upload_probe() {
+        run_drive("123云盘", pan123_drive()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: 需要真实百度凭据"]
+    async fn baidu_live_upload_probe() {
+        run_drive("百度网盘", baidu_drive()).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "live: 需要真实天翼凭据"]
+    async fn cloud189_live_upload_probe() {
+        run_drive("天翼云盘189", cloud189_drive()).await;
+    }
 }

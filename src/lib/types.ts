@@ -172,6 +172,17 @@ export interface TransferTask {
   childrenTotal?: number;
   childrenDone?: number;
   childrenFailed?: number;
+  /**
+   * Present when a whole local folder is uploaded as one row: its hidden
+   * children are the individual file uploads.
+   */
+  uploadDir?: {
+    provider: ProviderId | "";
+    pdirFid: string;
+    path: string;
+    name: string;
+    conflict: string;
+  } | null;
   /** Present for cross-drive moves/copies; `files` shrinks as they land. */
   cross?: {
     fromProvider: ProviderId | "";

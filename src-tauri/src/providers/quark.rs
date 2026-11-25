@@ -522,13 +522,28 @@ impl DriveProvider for QuarkProvider {
                 // end. Yielding the error repeatedly left the reader in place, so
                 // a consumer that ignored the error would spin forever on the
                 // same message.
+                // Quark ignores the cancel token inside its upload API, so the
+                // token is checked as the body is produced: an interrupted read
+                // fails the request instead of silently sending the whole file
+                // (a cancelled 50 MB upload used to land in the drive anyway).
+                let stopping = token.clone();
                 let stream = futures_util::stream::unfold(
                     (reader, 0u64, false),
                     move |(mut reader, sent, finished)| {
                         let counter = Arc::clone(&counter);
+                        let stopping = stopping.clone();
                         async move {
                             if finished {
                                 return None;
+                            }
+                            if stopping.is_cancelled() {
+                                return Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::Interrupted,
+                                        "已取消",
+                                    )),
+                                    (reader, sent, true),
+                                ));
                             }
                             use tokio::io::AsyncReadExt;
                             let mut buf = vec![0u8; 1 << 20];

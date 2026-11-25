@@ -109,6 +109,11 @@ pub struct TransferTask {
     /// keeping the whole file list.
     #[serde(default)]
     pub folder: Option<FolderRef>,
+    /// Set on a folder *upload*: the local directory being pushed up and the
+    /// remote folder it lands in. The children of such a task are hidden file
+    /// uploads, exactly like a folder download's children are hidden downloads.
+    #[serde(default)]
+    pub upload_dir: Option<UploadDirRef>,
 }
 
 /// Root of a folder download.
@@ -120,6 +125,23 @@ pub struct FolderRef {
     /// Native id on that drive.
     pub fid: String,
     pub name: String,
+}
+
+/// Root of a folder upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadDirRef {
+    /// Which drive the files go to (`"quark"`, `"cloud189"`, …).
+    pub provider: String,
+    /// Native id of the remote folder the tree is created in.
+    pub pdir_fid: String,
+    /// Local directory on disk.
+    pub path: String,
+    pub name: String,
+    /// `"rename"` / `"skip"` / `"overwrite"`, copied from the settings so a
+    /// resume after a restart behaves like the original upload.
+    #[serde(default)]
+    pub conflict: String,
 }
 
 /// One file found by the folder walker.
@@ -168,6 +190,14 @@ const FOLDER_WINDOW: usize = 24;
 const FOLDER_TICK_MS: u64 = 400;
 /// Depth limit for the walk; deeper trees almost always mean a symlink loop.
 const FOLDER_MAX_DEPTH: usize = 32;
+
+/// How many files of a folder *upload* may be in flight at once. Uploads are
+/// bandwidth bound, so the point is only to keep the pipe full without parking
+/// thousands of tasks behind the manager's slot counter.
+const UPLOAD_WINDOW: usize = 6;
+/// Most files one folder upload will take. A local tree this large is almost
+/// always a mistake (a home directory, a mounted disk).
+const UPLOAD_MAX_FILES: usize = 20000;
 
 /// One file of a cross-drive job, already expanded out of its folder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -843,6 +873,7 @@ impl TransferManager {
             children_done: 0,
             children_failed: 0,
             folder: None,
+            upload_dir: None,
         };
         let task = self.insert(task).await;
         if announce {
@@ -908,6 +939,7 @@ impl TransferManager {
             children_done: 0,
             children_failed: 0,
             folder: Some(folder),
+            upload_dir: None,
         };
         let task = self.insert(task).await;
         task.emit(&app);
@@ -997,6 +1029,381 @@ impl TransferManager {
     /// True while `generation` is still the run that owns this folder.
     async fn folder_is_current(&self, id: &str, generation: u64) -> bool {
         self.folder_runs.lock().await.get(id).copied() == Some(generation)
+    }
+
+    /// Starts a folder upload: one row for the whole local directory, hidden
+    /// children for the files inside it.
+    pub async fn start_upload_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        dir: UploadDirRef,
+    ) -> AppResult<TransferTask> {
+        let provider = crate::providers::ProviderId::parse(&dir.provider)
+            .ok_or_else(|| AppError::new(format!("未知的网盘：{}", dir.provider)))?;
+        let root = PathBuf::from(&dir.path);
+        if !root.is_dir() {
+            return Err(AppError::new("文件夹不存在"));
+        }
+        let task = TransferTask {
+            id: self.next_id().await,
+            kind: "upload".to_string(),
+            name: dir.name.clone(),
+            fid: None,
+            local_path: dir.path.clone(),
+            remote_dir_fid: Some(crate::providers::qualify(provider, &dir.pdir_fid)),
+            size: 0,
+            transferred: 0,
+            speed: 0.0,
+            status: "queued".to_string(),
+            error: None,
+            created_at: now_millis(),
+            updated_at: now_millis(),
+            rapid: false,
+            prepared: 0,
+            connections: 0,
+            segments: 0,
+            segments_done: 0,
+            part_path: None,
+            share: None,
+            provider: dir.provider.clone(),
+            cross: None,
+            parent: None,
+            hidden: false,
+            listing: true,
+            children_total: 0,
+            children_done: 0,
+            children_failed: 0,
+            folder: None,
+            upload_dir: Some(dir),
+        };
+        let task = self.insert(task).await;
+        task.emit(&app);
+        self.spawn_upload_folder(app, drive, task.clone(), false).await;
+        Ok(task)
+    }
+
+    /// Restarts a folder upload after a pause, a cancel or a restart. Files
+    /// already on the drive with the same name and size are skipped, so the
+    /// second attempt only sends what is missing.
+    pub async fn resume_upload_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        id: &str,
+    ) -> AppResult<TransferTask> {
+        let mut task = {
+            let tasks = self.tasks.read().await;
+            tasks
+                .get(id)
+                .cloned()
+                .ok_or_else(|| AppError::new("任务不存在"))?
+        };
+        if task.kind != "upload" || task.upload_dir.is_none() {
+            return Err(AppError::new("该任务不是文件夹上传"));
+        }
+        task.status = "queued".to_string();
+        task.error = None;
+        task.speed = 0.0;
+        task.transferred = 0;
+        task.listing = true;
+        task.children_done = 0;
+        task.children_failed = 0;
+        task.updated_at = now_millis();
+        let task = self.insert(task).await;
+        task.emit(&app);
+        self.spawn_upload_folder(app, drive, task.clone(), true).await;
+        Ok(task)
+    }
+
+    /// Starts the supervisor loop for a folder upload (same generation guard as
+    /// a folder download, so a resume never leaves two loops behind).
+    async fn spawn_upload_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        task: TransferTask,
+        resumed: bool,
+    ) {
+        let id = task.id.clone();
+        let token = CancellationToken::new();
+        let generation = {
+            let mut runs = self.folder_runs.lock().await;
+            let generation = runs.get(&id).copied().unwrap_or(0) + 1;
+            runs.insert(id.clone(), generation);
+            generation
+        };
+        {
+            let mut cancels = self.cancels.lock().await;
+            if let Some(old) = cancels.insert(id.clone(), token.clone()) {
+                old.cancel();
+            }
+        }
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager
+                .run_upload_folder(app, drive, task, token, generation, resumed)
+                .await;
+            let mut runs = manager.folder_runs.lock().await;
+            if runs.get(&id).copied() == Some(generation) {
+                runs.remove(&id);
+                drop(runs);
+                manager.cancels.lock().await.remove(&id);
+            }
+        });
+    }
+
+    async fn snapshot(&self, id: &str) -> Option<TransferTask> {
+        self.tasks.read().await.get(id).cloned()
+    }
+
+    /// Pushes a local directory up as one task: it walks the tree, creates the
+    /// remote folders and keeps `UPLOAD_WINDOW` file uploads in flight.
+    async fn run_upload_folder(
+        self: &Arc<Self>,
+        app: AppHandle,
+        drive: Arc<dyn DriveProvider>,
+        parent: TransferTask,
+        token: CancellationToken,
+        generation: u64,
+        resumed: bool,
+    ) {
+        let id = parent.id.clone();
+        let Some(dir) = parent.upload_dir.clone() else {
+            return;
+        };
+        let Some(provider) = crate::providers::ProviderId::parse(&dir.provider) else {
+            return;
+        };
+        let root = PathBuf::from(&dir.path);
+        self.patch(&id, &app, |t| {
+            t.status = "running".to_string();
+            t.listing = true;
+            t.error = None;
+        })
+        .await;
+
+        if resumed {
+            // The files that were in flight when the previous run stopped may
+            // still be committing on the drive. Listing too early made the
+            // uploader believe the name was free and send a second copy — the
+            // drive then stored it as `name(timestamp).ext`. A short settle
+            // costs nothing next to the transfer itself.
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            if token.is_cancelled() || !self.folder_is_current(&id, generation).await {
+                return;
+            }
+        }
+        let mut files = match scan_local(&root).await {
+            Ok(files) => files,
+            Err(err) => {
+                finish_failed(self, &app, &id, err.to_string(), false).await;
+                return;
+            }
+        };
+        if files.is_empty() {
+            finish_failed(self, &app, &id, "文件夹里没有可上传的文件".to_string(), false).await;
+            return;
+        }
+        files.sort_by(|a, b| a.relative.cmp(&b.relative));
+        let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+        let total_files = files.len() as u64;
+        self.patch(&id, &app, |t| {
+            t.size = total_bytes;
+            t.children_total = total_files;
+            t.listing = false;
+        })
+        .await;
+
+        let mut queue: std::collections::VecDeque<LocalFile> = files.into();
+        let mut dirs = RemoteDirs::default();
+        // Files the drive already holds: on a resume these are skipped without
+        // sending a byte, and they count as finished right away.
+        let mut skip_ahead: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut live: Vec<(String, String, u64)> = Vec::new();
+        let mut stored: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut done_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut failed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut skipped_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut first_error: Option<String> = None;
+        let mut last_bytes = 0u64;
+        let mut last_at = Instant::now();
+        let mut skipped = 0u64;
+
+        loop {
+            if !self.folder_is_current(&id, generation).await {
+                let ids: Vec<String> = live.iter().map(|(cid, _, _)| cid.clone()).collect();
+                self.drop_children(&ids, "canceled").await;
+                return;
+            }
+            if token.is_cancelled() {
+                let ids: Vec<String> = live.iter().map(|(cid, _, _)| cid.clone()).collect();
+                self.drop_children(&ids, "canceled").await;
+                self.patch(&id, &app, |t| {
+                    t.listing = false;
+                    t.speed = 0.0;
+                })
+                .await;
+                return;
+            }
+
+            while live.len() < UPLOAD_WINDOW {
+                let Some(file) = queue.pop_front() else {
+                    break;
+                };
+                let key = file_key(file.relative.parent().unwrap_or(Path::new("")), &file.name);
+                let prepared =
+                    prepare_upload(&drive, &dir, &file, &mut dirs, &mut skip_ahead).await;
+                let (parent_fid, name) = match prepared {
+                    Ok(None) => {
+                        skipped += 1;
+                        stored.insert(key.clone(), file.size);
+                        done_files.insert(key);
+                        continue;
+                    }
+                    Ok(Some(pair)) => pair,
+                    Err(err) => {
+                        failed_files.insert(key);
+                        if first_error.is_none() {
+                            first_error = Some(err.to_string());
+                        }
+                        continue;
+                    }
+                };
+                let job = UploadJob {
+                    path: file.absolute.to_string_lossy().to_string(),
+                    pdir_fid: crate::providers::qualify(provider, &parent_fid),
+                    name: Some(name),
+                };
+                match self
+                    .start_upload(app.clone(), DownloadCtx::Provider(Arc::clone(&drive)), job)
+                    .await
+                {
+                    Ok(child) => {
+                        let cid = child.id.clone();
+                        let parent_id = id.clone();
+                        self.patch(&cid, &app, |t| {
+                            t.hidden = true;
+                            t.parent = Some(parent_id);
+                        })
+                        .await;
+                        live.push((cid, key, file.size));
+                    }
+                    Err(err) => {
+                        failed_files.insert(key);
+                        if first_error.is_none() {
+                            first_error = Some(err.to_string());
+                        }
+                    }
+                }
+            }
+
+            // Harvest the children that reached a terminal state.
+            let mut still: Vec<(String, String, u64)> = Vec::new();
+            for (cid, key, size) in std::mem::take(&mut live) {
+                let Some(child) = self.snapshot(&cid).await else {
+                    continue;
+                };
+                match child.status.as_str() {
+                    "done" => {
+                        done_files.insert(key.clone());
+                        stored.insert(key, size.max(child.transferred).min(size));
+                    }
+                    "failed" | "canceled" => {
+                        let unsupported = child
+                            .error
+                            .as_deref()
+                            .map(is_unsupported_upload)
+                            .unwrap_or(false);
+                        if unsupported {
+                            skipped_files.insert(key.clone());
+                        } else {
+                            failed_files.insert(key.clone());
+                        }
+                        stored.insert(key, child.transferred.min(size));
+                        if first_error.is_none() && !unsupported {
+                            first_error = child.error.clone();
+                        }
+                    }
+                    _ => still.push((cid, key, size)),
+                }
+            }
+            live = still;
+
+            if queue.is_empty() && live.is_empty() {
+                break;
+            }
+
+            let mut bytes: u64 = stored.values().sum();
+            for (cid, _, _) in &live {
+                if let Some(child) = self.snapshot(cid).await {
+                    bytes += child.transferred;
+                }
+            }
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_at).as_secs_f64();
+            let speed = if elapsed > 0.05 {
+                bytes.saturating_sub(last_bytes) as f64 / elapsed
+            } else {
+                0.0
+            };
+            if elapsed > 0.05 {
+                last_bytes = bytes;
+                last_at = now;
+            }
+            let (done_count, failed_count) = (done_files.len() as u64, failed_files.len() as u64);
+            let error_now = first_error.clone();
+            self.patch(&id, &app, move |t| {
+                t.transferred = bytes.min(total_bytes);
+                t.speed = speed;
+                t.children_done = done_count;
+                t.children_failed = failed_count;
+                t.error = error_now;
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(FOLDER_TICK_MS)).await;
+        }
+
+        let ok = done_files.len() as u64 + skipped_files.len() as u64;
+        let bad = failed_files.len() as u64;
+        let skipped = skipped + skipped_files.len() as u64;
+        self.patch(&id, &app, move |t| {
+            t.listing = false;
+            t.speed = 0.0;
+            // The loop breaks as soon as the last child lands, so the counters
+            // from the previous tick are one file short: the final numbers are
+            // written here rather than by an aggregate pass that never runs.
+            t.children_done = ok;
+            t.children_total = t.children_total.max(ok + bad);
+            t.transferred = t.size;
+            let reason = first_error
+                .clone()
+                .unwrap_or_else(|| "未知原因".to_string());
+            if bad == 0 {
+                t.status = "done".to_string();
+                t.children_failed = 0;
+                t.error = None;
+            } else if ok > 0 {
+                // Most of the folder made it: mark it finished and keep the
+                // count + reason as a note instead of painting the whole row red.
+                t.status = "done".to_string();
+                t.error = Some(format!(
+                    "{bad} 个文件上传失败（成功 {ok} 个，跳过 {skipped} 个）：{reason}，可以点继续重试这些文件"
+                ));
+            } else {
+                t.status = "failed".to_string();
+                t.error = Some(format!("{bad} 个文件上传失败：{reason}"));
+            }
+        })
+        .await;
+        if failed_files.is_empty() {
+            crate::tray::notify(
+                &app,
+                "上传完成",
+                &format!("{} 共 {ok} 个文件已上传", parent.name),
+            );
+        }
     }
 
     /// Walks the folder, hands each file to a child download, and reports the
@@ -1640,6 +2047,7 @@ impl TransferManager {
             children_done: 0,
             children_failed: 0,
             folder: None,
+            upload_dir: None,
         };
         let task = self.insert(task).await;
         task.emit(&app);
@@ -1715,9 +2123,16 @@ impl TransferManager {
                 })
             };
             let native_parent = crate::providers::native_of(&job.pdir_fid);
-            let result = drive
-                .upload(&path, &native_parent, &file_name, sink_trait, token.clone())
-                .await;
+            // Racing the provider future against the cancel token is what makes
+            // "暂停/取消" mean something for uploads: quark (and others) ignore
+            // the token inside `upload()`, so a 50 MB request used to run to
+            // completion and then still be reported as finished after cancel.
+            // Dropping the future aborts the in-flight HTTP request.
+            let result = tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(AppError::new("已取消")),
+                done = drive.upload(&path, &native_parent, &file_name, sink_trait, token.clone()) => done,
+            };
 
             ticker.abort();
             phase_watch.abort();
@@ -1855,6 +2270,7 @@ impl TransferManager {
             children_done: 0,
             children_failed: 0,
             folder: None,
+            upload_dir: None,
         };
         let task = self.insert(task).await;
         task.emit(&app);
@@ -2106,6 +2522,200 @@ async fn walk_folder(
 /// running children report. Taking the larger of the two is what keeps a
 /// resumed file from being counted twice — once for the bytes it had when it
 /// was paused and again for the whole file now.
+/// One file found by the folder-upload walker.
+#[derive(Debug, Clone)]
+struct LocalFile {
+    /// Path inside the uploaded directory (empty for the root itself).
+    relative: PathBuf,
+    /// Absolute path on disk.
+    absolute: PathBuf,
+    name: String,
+    size: u64,
+}
+
+/// Lists a local tree for upload. Symlinks are followed only as files, and
+/// dotfiles are skipped — the same rules the single-file uploader applies.
+async fn scan_local(root: &Path) -> AppResult<Vec<LocalFile>> {
+    let mut out: Vec<LocalFile> = Vec::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, PathBuf)> =
+        std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), PathBuf::new()));
+    while let Some((dir, prefix)) = queue.pop_front() {
+        let mut reader = tokio::fs::read_dir(&dir).await?;
+        while let Some(entry) = reader.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            let relative = prefix.join(&name);
+            if meta.is_dir() {
+                if relative.components().count() > FOLDER_MAX_DEPTH {
+                    continue;
+                }
+                queue.push_back((path, relative));
+            } else if meta.is_file() {
+                out.push(LocalFile {
+                    relative,
+                    absolute: path,
+                    name,
+                    size: meta.len(),
+                });
+                if out.len() > UPLOAD_MAX_FILES {
+                    return Err(AppError::new(
+                        "文件夹里文件过多（超过 20000 个），请分批上传",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Remote folders and file names seen during one folder upload, so a tree of
+/// 3000 files costs one listing per folder instead of one per file.
+#[derive(Default)]
+struct RemoteDirs {
+    /// folder fid → (file name, size)
+    files: std::collections::HashMap<String, Vec<(String, u64)>>,
+    /// folder fid → (subfolder name, fid)
+    subdirs: std::collections::HashMap<String, Vec<(String, String)>>,
+}
+
+impl RemoteDirs {
+    async fn ensure_listed(
+        &mut self,
+        drive: &Arc<dyn DriveProvider>,
+        fid: &str,
+    ) -> AppResult<()> {
+        if self.files.contains_key(fid) {
+            return Ok(());
+        }
+        let page = drive.list(fid).await?;
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for entry in page.entries {
+            if entry.is_dir {
+                dirs.push((
+                    entry.name.clone(),
+                    crate::providers::native_of(&entry.fid).to_string(),
+                ));
+            } else {
+                files.push((entry.name, entry.size));
+            }
+        }
+        self.files.insert(fid.to_string(), files);
+        self.subdirs.insert(fid.to_string(), dirs);
+        Ok(())
+    }
+
+    /// Id of `name` below `parent`, created when missing.
+    async fn child(
+        &mut self,
+        drive: &Arc<dyn DriveProvider>,
+        parent: &str,
+        name: &str,
+    ) -> AppResult<String> {
+        self.ensure_listed(drive, parent).await?;
+        if let Some(fid) = self
+            .subdirs
+            .get(parent)
+            .and_then(|list| list.iter().find(|(n, _)| n == name))
+            .map(|(_, fid)| fid.clone())
+        {
+            return Ok(fid);
+        }
+        let qualified = drive.make_dir(parent, name).await?;
+        let fid = crate::providers::native_of(&qualified).to_string();
+        self.subdirs
+            .entry(parent.to_string())
+            .or_default()
+            .push((name.to_string(), fid.clone()));
+        self.files.entry(fid.clone()).or_default();
+        Ok(fid)
+    }
+
+    fn file_size(&self, fid: &str, name: &str) -> Option<u64> {
+        self.files
+            .get(fid)
+            .and_then(|list| list.iter().find(|(n, _)| n == name))
+            .map(|(_, size)| *size)
+    }
+
+    fn remember(&mut self, fid: &str, name: &str, size: u64) {
+        self.files
+            .entry(fid.to_string())
+            .or_default()
+            .push((name.to_string(), size));
+    }
+}
+
+/// `name (2).ext`, `name (3).ext`, … skipping every candidate `taken` claims.
+fn unique_remote_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        Some(index) if index > 0 => (&name[..index], &name[index..]),
+        _ => (name, ""),
+    };
+    for round in 2..1000 {
+        let candidate = format!("{stem} ({round}){ext}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    format!("{stem} ({}){ext}", now_millis())
+}
+
+/// Creates the remote folders for one local file, decides its remote name and
+/// says whether it has to be sent at all. `Ok(None)` means "already there".
+async fn prepare_upload(
+    drive: &Arc<dyn DriveProvider>,
+    dir: &UploadDirRef,
+    file: &LocalFile,
+    dirs: &mut RemoteDirs,
+    skip_ahead: &mut std::collections::HashSet<String>,
+) -> AppResult<Option<(String, String)>> {
+    let mut parent = dir.pdir_fid.clone();
+    let sub = file.relative.parent().unwrap_or(Path::new(""));
+    for part in sub.components() {
+        let name = part.as_os_str().to_string_lossy().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        parent = dirs.child(drive, &parent, &name).await?;
+    }
+    dirs.ensure_listed(drive, &parent).await?;
+    let policy = if dir.conflict.is_empty() {
+        "rename"
+    } else {
+        dir.conflict.as_str()
+    };
+    let name = file.name.clone();
+    match dirs.file_size(&parent, &name) {
+        None => {
+            dirs.remember(&parent, &name, file.size);
+            Ok(Some((parent, name)))
+        }
+        Some(_) if policy == "overwrite" => Ok(Some((parent, name))),
+        // Same name and same size: this is the file a previous attempt already
+        // uploaded (or the user ran the upload twice). Sending it again would
+        // only create a duplicate.
+        Some(size) if size == file.size || policy == "skip" => {
+            skip_ahead.insert(name);
+            Ok(None)
+        }
+        Some(_) => {
+            let unique = unique_remote_name(&name, |candidate| {
+                dirs.file_size(&parent, candidate).is_some()
+            });
+            dirs.remember(&parent, &unique, file.size);
+            Ok(Some((parent, unique)))
+        }
+    }
+}
+
 fn folder_bytes(
     stored: &std::collections::HashMap<String, u64>,
     live: &[(String, u64)],
@@ -2122,6 +2732,13 @@ fn folder_bytes(
 
 /// Identity of a file inside the folder: two records with the same key are the
 /// same target on disk.
+/// A drive refused a file for a reason no retry can fix (a 0-byte file on
+/// 百度网盘 is the common one). Counting those as failures made a 24/25 folder
+/// look broken, so they are reported as skipped instead.
+fn is_unsupported_upload(reason: &str) -> bool {
+    reason.contains("空文件") || reason.contains("0 字节") || reason.contains("empty file")
+}
+
 fn file_key(relative_dir: &Path, name: &str) -> String {
     format!("{}/{}", relative_dir.to_string_lossy(), name)
 }
@@ -2533,8 +3150,17 @@ fn spawn_ticker(
             if smoothed < 1.0 {
                 smoothed = 0.0;
             }
+            // A paused row must not keep showing throughput: the worker is gone
+            // but this ticker still runs until the cancel unwinds, and its next
+            // sample used to write a stale speed back onto the paused task.
+            let mut still_active = true;
             manager
                 .patch(&id, &app, |t| {
+                    if !matches!(t.status.as_str(), "queued" | "running" | "hashing") {
+                        still_active = false;
+                        t.speed = 0.0;
+                        return;
+                    }
                     if t.size == 0 && total > 0 {
                         t.size = total;
                     }
@@ -2550,6 +3176,9 @@ fn spawn_ticker(
                     }
                 })
                 .await;
+            if !still_active {
+                return;
+            }
         }
     })
 }
@@ -2957,6 +3586,11 @@ async fn discard_partial(task: &TransferTask) {
 async fn purge_task_files(task: &TransferTask, purge_local: bool) {
     discard_partial(task).await;
     if !purge_local {
+        return;
+    }
+    // An upload's `local_path` is the user's *source* file: deleting it would
+    // destroy data the drive never owned. Uploads clean up nothing locally.
+    if task.kind == "upload" {
         return;
     }
     let path = PathBuf::from(&task.local_path);
@@ -3370,6 +4004,7 @@ mod tests {
             children_done: 0,
             children_failed: 0,
             folder: None,
+            upload_dir: None,
         }
     }
 
@@ -3510,5 +4145,1575 @@ mod retry_tests {
         ] {
             assert!(is_retryable(&AppError::new(msg)), "should retry: {msg}");
         }
+    }
+}
+// ---------------------------------------------------------------------------
+// Live concurrency probe (ignored by default; it talks to a real account).
+//
+//   cargo test --lib live_concurrency_probe -- --ignored --nocapture
+//
+// Everything happens inside one throwaway folder named `yunyu-probe-cc-<pid>`
+// that is deleted again at the end; the user's own data is never touched.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod live_concurrency_probe {
+    use super::*;
+    use crate::config::AppPaths;
+    use crate::providers::{qualify, Cloud189Provider, CounterSink, DriveProvider, ProviderId, UploadSink};
+    use std::collections::{HashMap, HashSet};
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    const PROVIDER: &str = "cloud189";
+    const BIG_COUNT: usize = 6;
+    const BIG_SIZE: u64 = 30 * 1024 * 1024;
+    const SMALL_COUNT: usize = 200;
+    const SMALL_SIZE: u64 = 2048;
+    const MAX_ATTEMPTS: u32 = 4;
+    const ROUND_TIMEOUT: Duration = Duration::from_secs(600);
+    const FOLDER_TIMEOUT: Duration = Duration::from_secs(900);
+    const PAUSE_TIMEOUT: Duration = Duration::from_secs(600);
+
+    fn big_name(i: usize) -> String {
+        format!("big{i}.bin")
+    }
+
+    fn small_name(i: usize) -> String {
+        format!("f{i:03}.bin")
+    }
+
+    fn big_byte(offset: u64) -> u8 {
+        (offset % 251) as u8
+    }
+
+    fn small_byte(file: usize, offset: u64) -> u8 {
+        ((offset * 31 + file as u64 * 7 + 11) % 251) as u8
+    }
+
+    fn is_rate_limited(msg: &str) -> bool {
+        let m = msg.to_lowercase();
+        ["429", "too many", "rate limit", "限流", "频繁", "请求过快", "稍后再试"]
+            .iter()
+            .any(|needle| m.contains(needle))
+    }
+
+    fn secs(start: Instant) -> f64 {
+        start.elapsed().as_secs_f64()
+    }
+
+    // ------------------------------------------------------------- probe ---
+
+    struct Probe {
+        drive: Arc<dyn DriveProvider>,
+        root: PathBuf,
+        remote_fid: std::sync::Mutex<Option<String>>,
+        errors: std::sync::Mutex<Vec<String>>,
+        rate_hits: AtomicU64,
+    }
+
+    impl Probe {
+        fn new(drive: Arc<dyn DriveProvider>, root: PathBuf) -> Self {
+            Self {
+                drive,
+                root,
+                remote_fid: std::sync::Mutex::new(None),
+                errors: std::sync::Mutex::new(Vec::new()),
+                rate_hits: AtomicU64::new(0),
+            }
+        }
+
+        fn note(&self, line: impl std::fmt::Display) {
+            println!("[probe] {line}");
+        }
+
+        fn error(&self, phase: &str, msg: impl std::fmt::Display) {
+            let text = format!("{phase}: {msg}");
+            if is_rate_limited(&text) {
+                self.rate_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            println!("[probe][error] {text}");
+            self.errors.lock().unwrap().push(text);
+        }
+
+        fn error_count(&self) -> usize {
+            self.errors.lock().unwrap().len()
+        }
+
+        /// Last-resort cleanup: a panic still leaves the drive as it was found.
+        fn cleanup_blocking(&self) {
+            let fid = self.remote_fid.lock().unwrap().take();
+            if let Some(fid) = fid {
+                let drive = Arc::clone(&self.drive);
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let ok = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(rt) => rt.block_on(async {
+                            match tokio::time::timeout(
+                                Duration::from_secs(180),
+                                drive.delete(std::slice::from_ref(&fid)),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => true,
+                                Ok(Err(e)) => {
+                                    eprintln!("[probe][cleanup] delete {fid} failed: {e}");
+                                    false
+                                }
+                                Err(_) => {
+                                    eprintln!("[probe][cleanup] delete {fid} timed out");
+                                    false
+                                }
+                            }
+                        }),
+                        Err(e) => {
+                            eprintln!("[probe][cleanup] no runtime: {e}");
+                            false
+                        }
+                    };
+                    let _ = tx.send(ok);
+                });
+                let _ = rx.recv_timeout(Duration::from_secs(200));
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.cleanup_blocking();
+        }
+    }
+
+    /// Deletes a remote tree bottom-up: files first, then their folders.
+    async fn delete_tree(probe: &Probe, top: &str) {
+        let mut stack = vec![top.to_string()];
+        let mut dirs: Vec<String> = Vec::new();
+        while let Some(fid) = stack.pop() {
+            match probe.drive.list(&fid).await {
+                Ok(listing) => {
+                    let mut files = Vec::new();
+                    for entry in listing.entries {
+                        if entry.is_dir {
+                            stack.push(entry.fid.clone());
+                        } else {
+                            files.push(entry.fid.clone());
+                        }
+                    }
+                    for chunk in files.chunks(50) {
+                        if let Err(e) = probe.drive.delete(chunk).await {
+                            probe.error("cleanup-file", e);
+                        }
+                    }
+                    dirs.push(fid);
+                }
+                Err(e) => {
+                    probe.error("cleanup-list", format!("{fid}: {e}"));
+                    dirs.push(fid);
+                }
+            }
+        }
+        // Deepest first: `dirs` was filled top-down.
+        for dir in dirs.iter().rev() {
+            if let Err(e) = probe.drive.delete(std::slice::from_ref(dir)).await {
+                probe.error("cleanup-dir", format!("{dir}: {e}"));
+            }
+        }
+    }
+
+    // -------------------------------------------------------- local files ---
+
+    fn write_big_template(path: &Path) -> std::io::Result<()> {
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut off = 0u64;
+        while off < BIG_SIZE {
+            let n = ((BIG_SIZE - off) as usize).min(buf.len());
+            for (i, slot) in buf[..n].iter_mut().enumerate() {
+                *slot = big_byte(off + i as u64);
+            }
+            out.write_all(&buf[..n])?;
+            off += n as u64;
+        }
+        out.flush()
+    }
+
+    fn write_small_file(path: &Path, file: usize) -> std::io::Result<()> {
+        let mut payload = vec![0u8; SMALL_SIZE as usize];
+        for (i, slot) in payload.iter_mut().enumerate() {
+            *slot = small_byte(file, i as u64);
+        }
+        std::fs::write(path, payload)
+    }
+
+    fn verify_big_sync(path: &Path, size: u64) -> Result<(), String> {
+        let meta = std::fs::metadata(path).map_err(|e| format!("metadata: {e}"))?;
+        if meta.len() != size {
+            return Err(format!("length {} != {size}", meta.len()));
+        }
+        let mut file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut off = 0u64;
+        loop {
+            let n = file.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            for (i, byte) in buf[..n].iter().enumerate() {
+                let at = off + i as u64;
+                if *byte != big_byte(at) {
+                    return Err(format!("byte {at} = {byte} != {}", big_byte(at)));
+                }
+            }
+            off += n as u64;
+        }
+        if off != size {
+            return Err(format!("read {off} != {size}"));
+        }
+        Ok(())
+    }
+
+    fn verify_small_sync(path: &Path, file: usize) -> Result<(), String> {
+        let data = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+        if data.len() != SMALL_SIZE as usize {
+            return Err(format!("length {} != {SMALL_SIZE}", data.len()));
+        }
+        for (i, byte) in data.iter().enumerate() {
+            if *byte != small_byte(file, i as u64) {
+                return Err(format!("byte {i} = {byte} != {}", small_byte(file, i as u64)));
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_big(path: PathBuf, size: u64) -> Result<(), String> {
+        tokio::task::spawn_blocking(move || verify_big_sync(&path, size))
+            .await
+            .map_err(|e| format!("join: {e}"))?
+    }
+
+    fn verify_small_dir_sync(dir: &Path) -> (usize, Vec<String>) {
+        let mut ok = 0usize;
+        let mut problems = Vec::new();
+        for file in 0..SMALL_COUNT {
+            let name = small_name(file);
+            match verify_small_sync(&dir.join(&name), file) {
+                Ok(()) => ok += 1,
+                Err(e) => problems.push(format!("{name}: {e}")),
+            }
+        }
+        (ok, problems)
+    }
+
+    async fn upload_with_retry(
+        probe: &Probe,
+        local: &Path,
+        parent: &str,
+        name: &str,
+        attempts: u32,
+    ) -> Result<String, String> {
+        let mut last = String::from("not attempted");
+        for attempt in 1..=attempts {
+            let counter = Arc::new(AtomicU64::new(0));
+            let sink: Arc<dyn UploadSink> = Arc::new(CounterSink::new(counter));
+            match probe
+                .drive
+                .upload(local, parent, name, sink, CancellationToken::new())
+                .await
+            {
+                Ok(Some(id)) => return Ok(id),
+                Ok(None) => last = "provider reported no id".to_string(),
+                Err(e) => {
+                    last = e.to_string();
+                    probe.error("upload", format!("{name}: {e}"));
+                }
+            }
+            if attempt < attempts {
+                tokio::time::sleep(Duration::from_secs(2 * u64::from(attempt))).await;
+            }
+        }
+        Err(last)
+    }
+
+    // ----------------------------------------------------------- sampler ---
+
+    /// Samples the raw `done` counters (never clamped) and the engine's
+    /// connection counters while a round runs.
+    struct Sampler {
+        stop: AtomicBool,
+        dones: Vec<Arc<AtomicU64>>,
+        stats: Vec<Arc<crate::engine::Stats>>,
+        peak_done: Vec<AtomicU64>,
+        max_conn_sum: AtomicU64,
+        max_conn_file: AtomicU64,
+        inflight: AtomicU64,
+        max_inflight: AtomicU64,
+        samples: AtomicU64,
+    }
+
+    impl Sampler {
+        fn new(dones: Vec<Arc<AtomicU64>>, stats: Vec<Arc<crate::engine::Stats>>) -> Arc<Self> {
+            let peak_done = dones.iter().map(|_| AtomicU64::new(0)).collect();
+            Arc::new(Self {
+                stop: AtomicBool::new(false),
+                dones,
+                stats,
+                peak_done,
+                max_conn_sum: AtomicU64::new(0),
+                max_conn_file: AtomicU64::new(0),
+                inflight: AtomicU64::new(0),
+                max_inflight: AtomicU64::new(0),
+                samples: AtomicU64::new(0),
+            })
+        }
+
+        fn spawn(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+            let me = Arc::clone(self);
+            tokio::spawn(async move {
+                while !me.stop.load(Ordering::Relaxed) {
+                    let mut sum = 0u64;
+                    for (i, done) in me.dones.iter().enumerate() {
+                        let v = done.load(Ordering::Relaxed);
+                        me.peak_done[i].fetch_max(v, Ordering::Relaxed);
+                        let c = me.stats.get(i).map(|s| s.connections()).unwrap_or(0);
+                        sum += c;
+                        me.max_conn_file.fetch_max(c, Ordering::Relaxed);
+                    }
+                    me.max_conn_sum.fetch_max(sum, Ordering::Relaxed);
+                    me.max_inflight
+                        .fetch_max(me.inflight.load(Ordering::Relaxed), Ordering::Relaxed);
+                    me.samples.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+        }
+    }
+
+    // -------------------------------------------------------- part b data ---
+
+    struct FileOutcome {
+        attempts: u32,
+        error: Option<String>,
+        final_done: u64,
+    }
+
+    struct RoundOutcome {
+        limit: u32,
+        elapsed_s: f64,
+        peaks: Vec<u64>,
+        overflow: Vec<String>,
+        final_dones: Vec<u64>,
+        verified: usize,
+        mismatches: Vec<String>,
+        errors: Vec<String>,
+        attempts_total: u32,
+        max_conn_sum: u64,
+        max_conn_file: u64,
+        max_inflight: u64,
+    }
+
+    async fn raw_round(
+        probe: &Probe,
+        manager: &Arc<TransferManager>,
+        files: &[(String, String, u64)],
+        limit: u32,
+    ) -> RoundOutcome {
+        let dir = probe.root.join(format!("dl-limit{limit}"));
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir round");
+        manager.set_limit(limit);
+        let started = Instant::now();
+
+        let mut dones = Vec::new();
+        let mut stats = Vec::new();
+        for _ in files {
+            dones.push(Arc::new(AtomicU64::new(0)));
+            stats.push(Arc::new(crate::engine::Stats::default()));
+        }
+        let sampler = Sampler::new(dones.clone(), stats.clone());
+        let sampler_task = sampler.spawn();
+        let mut tokens = Vec::new();
+        let mut handles = Vec::new();
+        for (i, (fid, name, size)) in files.iter().enumerate() {
+            let done = Arc::clone(&dones[i]);
+            let stat = Arc::clone(&stats[i]);
+            let sampler = Arc::clone(&sampler);
+            let token = CancellationToken::new();
+            tokens.push(token.clone());
+            let manager = Arc::clone(manager);
+            let drive = Arc::clone(&probe.drive);
+            let fid = fid.clone();
+            let name = name.clone();
+            let size = *size;
+            let dir = dir.clone();
+            handles.push(tokio::spawn(async move {
+                let slot = match manager.acquire(&token).await {
+                    Some(slot) => slot,
+                    None => {
+                        return FileOutcome {
+                            attempts: 0,
+                            error: Some("acquire cancelled".into()),
+                            final_done: 0,
+                        }
+                    }
+                };
+                sampler.inflight.fetch_add(1, Ordering::Relaxed);
+                let part = dir.join(format!("{name}.part"));
+                let final_path = dir.join(&name);
+                let mut attempts = 0u32;
+                let outcome = loop {
+                    attempts += 1;
+                    let result = run_provider_download(
+                        &drive,
+                        &fid,
+                        &part,
+                        &final_path,
+                        size,
+                        Arc::clone(&done),
+                        token.clone(),
+                        0,
+                        Some(Arc::clone(&stat)),
+                    )
+                    .await;
+                    match result {
+                        Ok(()) => break Ok(()),
+                        Err(e) => {
+                            if attempts < MAX_ATTEMPTS && is_retryable(&e) {
+                                tokio::time::sleep(Duration::from_secs(3 * u64::from(attempts)))
+                                    .await;
+                                continue;
+                            }
+                            break Err(e.to_string());
+                        }
+                    }
+                };
+                drop(slot);
+                sampler.inflight.fetch_sub(1, Ordering::Relaxed);
+                FileOutcome {
+                    attempts,
+                    error: outcome.err(),
+                    final_done: done.load(Ordering::Relaxed),
+                }
+            }));
+        }
+
+        let joined =
+            tokio::time::timeout(ROUND_TIMEOUT, futures_util::future::join_all(handles)).await;
+        if joined.is_err() {
+            // Do not leave orphan downloads writing into a directory that is
+            // about to be deleted: cancel them and give them a moment to exit.
+            for token in &tokens {
+                token.cancel();
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        sampler.stop.store(true, Ordering::Relaxed);
+        let _ = sampler_task.await;
+
+        let mut outcome = RoundOutcome {
+            limit,
+            elapsed_s: secs(started),
+            peaks: sampler
+                .peak_done
+                .iter()
+                .map(|p| p.load(Ordering::Relaxed))
+                .collect(),
+            overflow: Vec::new(),
+            final_dones: Vec::new(),
+            verified: 0,
+            mismatches: Vec::new(),
+            errors: Vec::new(),
+            attempts_total: 0,
+            max_conn_sum: sampler.max_conn_sum.load(Ordering::Relaxed),
+            max_conn_file: sampler.max_conn_file.load(Ordering::Relaxed),
+            max_inflight: sampler.max_inflight.load(Ordering::Relaxed),
+        };
+
+        match joined {
+            Err(_) => outcome
+                .errors
+                .push(format!("round timed out after {}s", ROUND_TIMEOUT.as_secs())),
+            Ok(results) => {
+                for (i, result) in results.into_iter().enumerate() {
+                    match result {
+                        Err(e) => outcome.errors.push(format!("task {i}: join error {e}")),
+                        Ok(file) => {
+                            outcome.attempts_total += file.attempts;
+                            outcome.final_dones.push(file.final_done);
+                            if let Some(err) = file.error {
+                                outcome.errors.push(format!("{}: {err}", files[i].1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (i, (_, name, size)) in files.iter().enumerate() {
+            if let Some(peak) = outcome.peaks.get(i) {
+                if *peak > *size {
+                    outcome
+                        .overflow
+                        .push(format!("{name}: peak {peak} > {size}"));
+                }
+            }
+            let path = dir.join(name);
+            match verify_big(path.clone(), *size).await {
+                Ok(()) => outcome.verified += 1,
+                Err(e) => outcome.mismatches.push(format!("{name}: {e}")),
+            }
+        }
+
+        // Keep the local disk tidy between rounds; the files were verified.
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        outcome
+    }
+
+    // -------------------------------------------------------- part c data ---
+
+    struct FolderOutcome {
+        elapsed_s: f64,
+        parent_status: String,
+        children_total: u64,
+        children_done: u64,
+        children_failed: u64,
+        parent_transferred: u64,
+        parent_size: u64,
+        expected_bytes: u64,
+        parent_monotonic: bool,
+        done_le_total: bool,
+        max_live_children: usize,
+        distinct_child_ids: usize,
+        duplicate_paths: Vec<String>,
+        small_verified: usize,
+        small_problems: Vec<String>,
+        single_verified: usize,
+        single_problems: Vec<String>,
+        single_errors: Vec<String>,
+        timed_out: bool,
+        error: Option<String>,
+    }
+
+    async fn folder_phase(
+        probe: &Probe,
+        app: &AppHandle,
+        manager: &Arc<TransferManager>,
+        small_fid: &str,
+        bigs: &[(String, String, u64)],
+    ) -> FolderOutcome {
+        manager.set_limit(3);
+        let folder_dir = probe.root.join("folder-dl");
+        let single_dir = probe.root.join("single-dl");
+        tokio::fs::create_dir_all(&folder_dir)
+            .await
+            .expect("mkdir folder dir");
+        tokio::fs::create_dir_all(&single_dir)
+            .await
+            .expect("mkdir single dir");
+        let started = Instant::now();
+        let expected_bytes = (SMALL_COUNT as u64) * SMALL_SIZE;
+
+        let folder_task = match manager
+            .start_folder(
+                app.clone(),
+                Arc::clone(&probe.drive),
+                FolderRef {
+                    provider: PROVIDER.to_string(),
+                    fid: small_fid.to_string(),
+                    name: "small".to_string(),
+                },
+                folder_dir.clone(),
+            )
+            .await
+        {
+            Ok(task) => task,
+            Err(e) => {
+                return FolderOutcome {
+                    elapsed_s: secs(started),
+                    parent_status: "not-started".into(),
+                    children_total: 0,
+                    children_done: 0,
+                    children_failed: 0,
+                    parent_transferred: 0,
+                    parent_size: 0,
+                    expected_bytes,
+                    parent_monotonic: true,
+                    done_le_total: true,
+                    max_live_children: 0,
+                    distinct_child_ids: 0,
+                    duplicate_paths: Vec::new(),
+                    small_verified: 0,
+                    small_problems: Vec::new(),
+                    single_verified: 0,
+                    single_problems: Vec::new(),
+                    single_errors: Vec::new(),
+                    timed_out: false,
+                    error: Some(e.to_string()),
+                }
+            }
+        };
+
+        let mut single_ids = Vec::new();
+        for (fid, name, size) in bigs.iter().take(3) {
+            match manager
+                .start_download(
+                    app.clone(),
+                    DownloadCtx::Provider(Arc::clone(&probe.drive)),
+                    DownloadJob {
+                        fid: fid.clone(),
+                        name: name.clone(),
+                        size: *size,
+                        dir: single_dir.to_string_lossy().to_string(),
+                        share: None,
+                        provider: PROVIDER.to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(task) => single_ids.push(task.id),
+                Err(e) => probe.error("folder/single-start", e),
+            }
+        }
+
+        let mut seen_paths: HashMap<String, String> = HashMap::new();
+        let mut duplicate_paths: HashSet<String> = HashSet::new();
+        let mut distinct_ids: HashSet<String> = HashSet::new();
+        let mut max_live_children = 0usize;
+        let mut parent_monotonic = true;
+        let mut done_le_total = true;
+        let mut last_parent_transferred = 0u64;
+        let mut timed_out = false;
+        let mut parent_status = folder_task.status.clone();
+        let mut last_parent = folder_task.clone();
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let kids = manager.children(&folder_task.id).await;
+            max_live_children = max_live_children.max(kids.len());
+            for kid in kids {
+                distinct_ids.insert(kid.id.clone());
+                if let Some(prev) = seen_paths.insert(kid.local_path.clone(), kid.id.clone()) {
+                    if prev != kid.id {
+                        duplicate_paths.insert(kid.local_path.clone());
+                    }
+                }
+            }
+
+            let list = manager.list().await;
+            if let Some(parent) = list.iter().find(|t| t.id == folder_task.id) {
+                if parent.transferred < last_parent_transferred {
+                    parent_monotonic = false;
+                }
+                last_parent_transferred = parent.transferred;
+                if parent.children_done > parent.children_total {
+                    done_le_total = false;
+                }
+                parent_status = parent.status.clone();
+                last_parent = parent.clone();
+            }
+            let singles_terminal = single_ids.iter().all(|id| {
+                list.iter()
+                    .find(|t| &t.id == id)
+                    .map(|t| {
+                        matches!(
+                            t.status.as_str(),
+                            "done" | "failed" | "canceled" | "paused"
+                        )
+                    })
+                    .unwrap_or(true)
+            });
+            if matches!(parent_status.as_str(), "done" | "failed" | "canceled")
+                && singles_terminal
+            {
+                break;
+            }
+            if started.elapsed() > FOLDER_TIMEOUT {
+                timed_out = true;
+                break;
+            }
+        }
+
+        // Stop whatever is still running before reading the files; the outcome
+        // above already used the last snapshot of the parent.
+        let _ = manager.pause_task(&folder_task.id, app).await;
+        for id in &single_ids {
+            let _ = manager.pause_task(id, app).await;
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let (small_verified, small_problems) =
+            tokio::task::spawn_blocking(move || verify_small_dir_sync(&folder_dir))
+                .await
+                .expect("verify smalls");
+
+        let mut single_verified = 0usize;
+        let mut single_problems = Vec::new();
+        let mut single_errors = Vec::new();
+        let list = manager.list().await;
+        for (fid, name, size) in bigs.iter().take(3) {
+            let _ = fid;
+            let path = single_dir.join(name);
+            match verify_big(path, *size).await {
+                Ok(()) => single_verified += 1,
+                Err(e) => single_problems.push(format!("{name}: {e}")),
+            }
+            if let Some(task) = list
+                .iter()
+                .find(|t| t.name == *name && t.kind == "download")
+            {
+                if task.status != "done" {
+                    single_errors.push(format!(
+                        "{name}: status {} error {:?}",
+                        task.status, task.error
+                    ));
+                }
+            }
+        }
+
+        FolderOutcome {
+            elapsed_s: secs(started),
+            parent_status,
+            children_total: last_parent.children_total,
+            children_done: last_parent.children_done,
+            children_failed: last_parent.children_failed,
+            parent_transferred: last_parent.transferred,
+            parent_size: last_parent.size,
+            expected_bytes,
+            parent_monotonic,
+            done_le_total,
+            max_live_children,
+            distinct_child_ids: distinct_ids.len(),
+            duplicate_paths: duplicate_paths.into_iter().collect(),
+            small_verified,
+            small_problems,
+            single_verified,
+            single_problems,
+            single_errors,
+            timed_out,
+            error: last_parent.error.clone(),
+        }
+    }
+
+    // -------------------------------------------------------- part d data ---
+
+    struct PauseOutcome {
+        elapsed_s: f64,
+        paused: Vec<(String, String, u64)>,
+        frozen: bool,
+        pause_delta: u64,
+        max_speed_while_paused: f64,
+        final_statuses: Vec<(String, String, Option<String>)>,
+        peaks: Vec<(String, u64, u64)>,
+        verified: usize,
+        problems: Vec<String>,
+        timed_out: bool,
+    }
+
+    async fn pause_phase(
+        probe: &Probe,
+        app: &AppHandle,
+        manager: &Arc<TransferManager>,
+        files: &[(String, String, u64)],
+    ) -> PauseOutcome {
+        manager.set_limit(3);
+        let dir = probe.root.join("pause-dl");
+        tokio::fs::create_dir_all(&dir).await.expect("mkdir pause dir");
+        let started = Instant::now();
+
+        let mut tasks = Vec::new();
+        for (fid, name, size) in files.iter().take(BIG_COUNT) {
+            match manager
+                .start_download(
+                    app.clone(),
+                    DownloadCtx::Provider(Arc::clone(&probe.drive)),
+                    DownloadJob {
+                        fid: fid.clone(),
+                        name: name.clone(),
+                        size: *size,
+                        dir: dir.to_string_lossy().to_string(),
+                        share: None,
+                        provider: PROVIDER.to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(task) => tasks.push((task.id, name.clone(), *size)),
+                Err(e) => probe.error("pause-start", e),
+            }
+        }
+        if tasks.is_empty() {
+            return PauseOutcome {
+                elapsed_s: secs(started),
+                paused: Vec::new(),
+                frozen: false,
+                pause_delta: 0,
+                max_speed_while_paused: 0.0,
+                final_statuses: Vec::new(),
+                peaks: Vec::new(),
+                verified: 0,
+                problems: vec!["no task started".into()],
+                timed_out: false,
+            };
+        }
+
+        // Sample transferred continuously: the peak must never pass `size`.
+        let mut peaks: HashMap<String, u64> = tasks.iter().map(|(id, _, _)| (id.clone(), 0)).collect();
+        let mut over: HashSet<String> = HashSet::new();
+
+        let mut to_pause: Vec<(String, String, u64)> = Vec::new();
+        let wait_start = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let list = manager.list().await;
+            for task in &list {
+                if let Some(peak) = peaks.get_mut(&task.id) {
+                    *peak = (*peak).max(task.transferred);
+                }
+                if task.transferred > task.size && task.size > 0 {
+                    over.insert(task.id.clone());
+                }
+            }
+            let mut candidates: Vec<&TransferTask> = list
+                .iter()
+                .filter(|t| t.status == "running" && t.transferred > 2 * 1024 * 1024)
+                .collect();
+            candidates.sort_by_key(|t| std::cmp::Reverse(t.transferred));
+            for task in candidates {
+                if to_pause.len() >= 2 {
+                    break;
+                }
+                if to_pause.iter().any(|(id, _, _)| id == &task.id) {
+                    continue;
+                }
+                match files.iter().find(|(_, name, _)| name == &task.name) {
+                    Some((_, name, size)) => {
+                        to_pause.push((task.id.clone(), name.clone(), *size));
+                    }
+                    None => continue,
+                }
+            }
+            if to_pause.len() == 2 || wait_start.elapsed() > Duration::from_secs(120) {
+                break;
+            }
+        }
+
+        for (id, _, _) in &to_pause {
+            if let Err(e) = manager.pause_task(id, app).await {
+                probe.error("pause", e);
+            }
+        }
+        println!(
+            "[probe] paused {} task(s) after {:.1}s",
+            to_pause.len(),
+            secs(started)
+        );
+
+        // Let the in-flight chunks land, then sample a quiet window.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut before: HashMap<String, u64> = HashMap::new();
+        for (id, _, _) in &to_pause {
+            if let Some(task) = manager.list().await.iter().find(|t| &t.id == id) {
+                before.insert(id.clone(), task.transferred);
+            }
+        }
+        let mut last = before.clone();
+        let mut max_speed_while_paused: f64 = 0.0;
+        let mut pause_delta = 0u64;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let list = manager.list().await;
+            for (id, _, _) in &to_pause {
+                if let Some(task) = list.iter().find(|t| &t.id == id) {
+                    max_speed_while_paused = max_speed_while_paused.max(task.speed);
+                    if let Some(prev) = last.get(id).copied() {
+                        if task.transferred > prev {
+                            pause_delta += task.transferred - prev;
+                            last.insert(id.clone(), task.transferred);
+                        }
+                    }
+                    if let Some(peak) = peaks.get_mut(id) {
+                        *peak = (*peak).max(task.transferred);
+                    }
+                }
+            }
+        }
+        let frozen = last == before;
+
+        let mut resume_errors = Vec::new();
+        for (id, _, _) in &to_pause {
+            match manager
+                .retry_download(
+                    app.clone(),
+                    DownloadCtx::Provider(Arc::clone(&probe.drive)),
+                    id,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => resume_errors.push(format!("{id}: {e}")),
+            }
+        }
+        for e in &resume_errors {
+            probe.error("resume", e);
+        }
+
+        let deadline = Instant::now() + PAUSE_TIMEOUT;
+        let mut timed_out = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let list = manager.list().await;
+            for task in &list {
+                if let Some(peak) = peaks.get_mut(&task.id) {
+                    *peak = (*peak).max(task.transferred);
+                }
+                if task.transferred > task.size && task.size > 0 {
+                    over.insert(task.id.clone());
+                }
+            }
+            let all_done = tasks.iter().all(|(id, _, _)| {
+                list.iter()
+                    .find(|t| &t.id == id)
+                    .map(|t| matches!(t.status.as_str(), "done" | "failed" | "canceled" | "paused"))
+                    .unwrap_or(true)
+            });
+            if all_done {
+                break;
+            }
+            if Instant::now() > deadline {
+                timed_out = true;
+                break;
+            }
+        }
+
+        let list = manager.list().await;
+        let mut final_statuses = Vec::new();
+        for (id, name, _) in &tasks {
+            if let Some(task) = list.iter().find(|t| &t.id == id) {
+                final_statuses.push((name.clone(), task.status.clone(), task.error.clone()));
+            } else {
+                final_statuses.push((name.clone(), "missing".into(), None));
+            }
+        }
+
+        let mut verified = 0usize;
+        let mut problems = Vec::new();
+        for (_, name, size) in &tasks {
+            match verify_big(dir.join(name), *size).await {
+                Ok(()) => verified += 1,
+                Err(e) => problems.push(format!("{name}: {e}")),
+            }
+        }
+        for id in over {
+            problems.push(format!("{id}: transferred > size at some sample"));
+        }
+        for (name, status, error) in &final_statuses {
+            if status != "done" {
+                problems.push(format!("{name}: ended as {status} ({error:?})"));
+            }
+        }
+
+        PauseOutcome {
+            elapsed_s: secs(started),
+            paused: to_pause,
+            frozen,
+            pause_delta,
+            max_speed_while_paused,
+            final_statuses,
+            peaks: tasks
+                .iter()
+                .map(|(id, name, size)| {
+                    (
+                        name.clone(),
+                        peaks.get(id).copied().unwrap_or(0),
+                        *size,
+                    )
+                })
+                .collect(),
+            verified,
+            problems,
+            timed_out,
+        }
+    }
+
+    // -------------------------------------------------------------- test ---
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live: downloads/uploads against the real cloud189 account; run with --ignored --nocapture"]
+    async fn live_concurrency_probe() {
+        let app = tauri::Builder::<tauri::Wry>::default()
+            .any_thread()
+            .build(tauri::generate_context!())
+            .expect("build headless tauri app");
+        let handle: AppHandle = app.handle().clone();
+
+        let pid = std::process::id();
+        let root = std::env::temp_dir().join(format!("yunyu-probe-cc-{pid}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("templates")).expect("mkdir probe root");
+        let remote_name = format!("yunyu-probe-cc-{pid}");
+
+        let paths = AppPaths::resolve().expect("app paths");
+        let drive: Arc<dyn DriveProvider> = Arc::new(
+            Cloud189Provider::load(&paths.config_dir).expect("cloud189 credentials"),
+        );
+        let probe = Probe::new(drive, root.clone());
+        probe.note(format!(
+            "ENV provider={PROVIDER} big={BIG_COUNT}x{BIG_SIZE} small={SMALL_COUNT}x{SMALL_SIZE} remote={remote_name}"
+        ));
+
+        // --- setup: clean a stale folder of ours, then create the tree ----
+        let listing = probe.drive.list("0").await.expect("root listing");
+        for entry in listing.entries.iter().filter(|e| e.name == remote_name) {
+            probe.note(format!("removing stale folder from an earlier run: {}", entry.fid));
+            delete_tree(&probe, &entry.fid).await;
+        }
+        let top = probe
+            .drive
+            .make_dir("0", &remote_name)
+            .await
+            .expect("make top folder");
+        *probe.remote_fid.lock().unwrap() = Some(top.clone());
+        let big_fid = probe.drive.make_dir(&top, "big").await.expect("make big");
+        let small_fid = probe
+            .drive
+            .make_dir(&top, "small")
+            .await
+            .expect("make small");
+        probe.note(format!("remote tree ready: top={top} big={big_fid} small={small_fid}"));
+
+        // --- upload: one 30 MiB template, uploaded under six names --------
+        let template = root.join("templates").join("big.bin");
+        write_big_template(&template).expect("write big template");
+        let upload_started = Instant::now();
+        for i in 0..BIG_COUNT {
+            let name = big_name(i);
+            match upload_with_retry(&probe, &template, &big_fid, &name, 3).await {
+                Ok(_) => probe.note(format!("uploaded {name}")),
+                Err(e) => probe.error("upload-big", format!("{name}: {e}")),
+            }
+        }
+        probe.note(format!(
+            "big uploads took {:.1}s",
+            upload_started.elapsed().as_secs_f64()
+        ));
+
+        // --- upload: 200 small files, three at a time ---------------------
+        let small_local = root.join("templates").join("small");
+        std::fs::create_dir_all(&small_local).expect("mkdir small templates");
+        let small_started = Instant::now();
+        let mut small_upload_errors = 0usize;
+        let probe_ref: &Probe = &probe;
+        let small_parent: &str = &small_fid;
+        for chunk in (0..SMALL_COUNT).collect::<Vec<_>>().chunks(3) {
+            let futures = chunk.iter().map(|i| {
+                let file = *i;
+                let local = small_local.join(small_name(file));
+                let name = small_name(file);
+                let probe = probe_ref;
+                let parent = small_parent;
+                async move {
+                    write_small_file(&local, file).expect("write small");
+                    upload_with_retry(probe, &local, parent, &name, 3).await
+                }
+            });
+            for result in futures_util::future::join_all(futures).await {
+                if let Err(e) = result {
+                    small_upload_errors += 1;
+                    probe.error("upload-small", e);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        probe.note(format!(
+            "small uploads took {:.1}s, errors={small_upload_errors}",
+            small_started.elapsed().as_secs_f64()
+        ));
+
+        // --- resolve fids and sizes from the drive (not from upload ids) --
+        let big_listing = probe.drive.list(&big_fid).await.expect("list big");
+        let mut bigs: Vec<(String, String, u64)> = Vec::new();
+        for i in 0..BIG_COUNT {
+            let name = big_name(i);
+            match big_listing.entries.iter().find(|e| e.name == name) {
+                Some(entry) => {
+                    let fid = qualify(ProviderId::Cloud189, &crate::providers::native_of(&entry.fid));
+                    bigs.push((fid, name, entry.size));
+                }
+                None => probe.error("resolve", format!("missing uploaded file {name}")),
+            }
+        }
+        let small_listing = probe.drive.list(&small_fid).await.expect("list small");
+        let small_names: HashSet<&str> = small_listing.entries.iter().map(|e| e.name.as_str()).collect();
+        let mut missing_small = 0usize;
+        for i in 0..SMALL_COUNT {
+            if !small_names.contains(small_name(i).as_str()) {
+                missing_small += 1;
+            }
+        }
+        probe.note(format!(
+            "remote files: big={} small={} (missing small={missing_small}, duplicates={})",
+            bigs.len(),
+            small_listing.entries.len(),
+            small_listing.entries.len() as i64 - small_names.len() as i64
+        ));
+
+        std::fs::create_dir_all(root.join("state")).expect("mkdir state");
+        let store = root.join("state").join("transfers.json");
+        let manager = TransferManager::new(3, Some(store));
+
+        let mut rounds = Vec::new();
+        if bigs.len() == BIG_COUNT {
+            for limit in [1u32, 3, 6] {
+                println!("[probe] === round limit={limit} ===");
+                let round = raw_round(&probe, &manager, &bigs, limit).await;
+                for (i, (_, name, size)) in bigs.iter().enumerate() {
+                    println!(
+                        "[probe] B limit={} file={} size={} peak_done={} final_done={}",
+                        round.limit,
+                        name,
+                        size,
+                        round.peaks.get(i).copied().unwrap_or(0),
+                        round.final_dones.get(i).copied().unwrap_or(0)
+                    );
+                }
+                println!(
+                    "[probe] B limit={} elapsed={:.1}s verified={}/{} mismatches={} overflow={:?} errors={} attempts={} max_conn_sum={} max_conn_file={} max_inflight={}",
+                    round.limit,
+                    round.elapsed_s,
+                    round.verified,
+                    bigs.len(),
+                    round.mismatches.len(),
+                    round.overflow,
+                    round.errors.len(),
+                    round.attempts_total,
+                    round.max_conn_sum,
+                    round.max_conn_file,
+                    round.max_inflight
+                );
+                for e in round.errors.iter().take(5) {
+                    println!("[probe] B error: {e}");
+                }
+                rounds.push(round);
+            }
+        } else {
+            probe.error(
+                "part-b",
+                format!("only {} of {BIG_COUNT} big files uploaded", bigs.len()),
+            );
+        }
+
+        // --- part e: limit against the per-drive connection budget --------
+        for round in &rounds {
+            println!(
+                "[probe] E limit={} max_inflight={} max_conn_sum={} max_conn_file={} (cloud189 ceiling=128)",
+                round.limit, round.max_inflight, round.max_conn_sum, round.max_conn_file
+            );
+        }
+
+        // --- part c: 200-file folder next to 3 single files ---------------
+        let folder_outcome = folder_phase(&probe, &handle, &manager, &small_fid, &bigs).await;
+        println!(
+            "[probe] C elapsed={:.1}s parent_status={} children={}/{} failed={} parent={}/{} expected={} monotonic={} done<=total={} max_live_children={} distinct_child_ids={} duplicate_paths={} small_verified={}/{} single_verified={}/{} problems={} errors={:?} timeout={}",
+            folder_outcome.elapsed_s,
+            folder_outcome.parent_status,
+            folder_outcome.children_done,
+            folder_outcome.children_total,
+            folder_outcome.children_failed,
+            folder_outcome.parent_transferred,
+            folder_outcome.parent_size,
+            folder_outcome.expected_bytes,
+            folder_outcome.parent_monotonic,
+            folder_outcome.done_le_total,
+            folder_outcome.max_live_children,
+            folder_outcome.distinct_child_ids,
+            folder_outcome.duplicate_paths.len(),
+            folder_outcome.small_verified,
+            SMALL_COUNT,
+            folder_outcome.single_verified,
+            3,
+            folder_outcome.small_problems.len() + folder_outcome.single_problems.len(),
+            folder_outcome.single_errors,
+            folder_outcome.timed_out
+        );
+        for problem in folder_outcome
+            .small_problems
+            .iter()
+            .chain(folder_outcome.single_problems.iter())
+            .take(5)
+        {
+            println!("[probe] C problem: {problem}");
+        }
+        if let Some(err) = &folder_outcome.error {
+            println!("[probe] C parent error: {err}");
+        }
+        for path in folder_outcome.duplicate_paths.iter().take(5) {
+            println!("[probe] C duplicate child path: {path}");
+        }
+        let _ = tokio::fs::remove_dir_all(root.join("folder-dl")).await;
+        let _ = tokio::fs::remove_dir_all(root.join("single-dl")).await;
+
+        // --- part d: pause two of six, wait, resume -----------------------
+        if bigs.len() == BIG_COUNT {
+            let pause_outcome = pause_phase(&probe, &handle, &manager, &bigs).await;
+            println!(
+                "[probe] D elapsed={:.1}s paused={:?} frozen={} pause_delta={} max_speed_while_paused={:.1} verified={}/{} timeout={}",
+                pause_outcome.elapsed_s,
+                pause_outcome.paused.iter().map(|(_, n, _)| n.clone()).collect::<Vec<_>>(),
+                pause_outcome.frozen,
+                pause_outcome.pause_delta,
+                pause_outcome.max_speed_while_paused,
+                pause_outcome.verified,
+                BIG_COUNT,
+                pause_outcome.timed_out
+            );
+            for (name, peak, size) in &pause_outcome.peaks {
+                println!("[probe] D peak {name}={peak} size={size}");
+            }
+            for (name, status, err) in &pause_outcome.final_statuses {
+                println!("[probe] D final {name} status={status} error={err:?}");
+            }
+            for problem in pause_outcome.problems.iter().take(5) {
+                println!("[probe] D problem: {problem}");
+            }
+            let _ = tokio::fs::remove_dir_all(root.join("pause-dl")).await;
+        }
+
+        // --- teardown -----------------------------------------------------
+        let cleanup_fid = probe.remote_fid.lock().unwrap().clone();
+        if let Some(fid) = cleanup_fid {
+            delete_tree(&probe, &fid).await;
+        }
+        let root_listing = probe.drive.list("0").await.expect("final root listing");
+        let leftover = root_listing
+            .entries
+            .iter()
+            .filter(|e| e.name == remote_name)
+            .count();
+        let local_left = root.exists();
+        if local_left {
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        if leftover > 0 {
+            probe.error("cleanup", format!("{leftover} remote folder(s) still named {remote_name}"));
+        }
+        *probe.remote_fid.lock().unwrap() = None;
+        println!(
+            "[probe] CLEANUP remote_leftover={leftover} local_exists_after={} total_errors={} rate_limit_hits={}",
+            root.exists(),
+            probe.error_count(),
+            probe.rate_hits.load(Ordering::Relaxed)
+        );
+        for e in probe.errors.lock().unwrap().iter().take(20) {
+            println!("[probe] ERROR-LOG {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live folder-upload probe (ignored by default; it talks to a real account).
+//
+//   cargo test --lib live_upload_folder_probe -- --ignored --nocapture
+//
+// Uploads a 25-file / 3-level tree into `yunyu-probe-uf-<pid>`, checks the
+// remote tree file by file, pauses once and resumes, then deletes everything.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod live_upload_folder_probe {
+    use super::*;
+    use crate::config::AppPaths;
+    use crate::providers::{native_of, DriveProvider, ProviderId};
+
+    fn payload(len: usize, seed: u64) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i as u64 * 31 + seed * 17) % 251) as u8)
+            .collect()
+    }
+
+    async fn build_tree(root: &Path) -> AppResult<usize> {
+        tokio::fs::create_dir_all(root.join("中层").join("深层")).await?;
+        tokio::fs::create_dir_all(root.join("second")).await?;
+        let mut count = 0;
+        tokio::fs::write(root.join("empty.bin"), b"").await?;
+        count += 1;
+        tokio::fs::write(root.join("中文 名称.txt"), payload(2048, 1)).await?;
+        count += 1;
+        tokio::fs::write(root.join("second").join("big.bin"), payload(5 << 20, 7)).await?;
+        count += 1;
+        for index in 0..6u64 {
+            tokio::fs::write(
+                root.join("中层").join(format!("m{index}.bin")),
+                payload(1024 + index as usize * 91, index + 3),
+            )
+            .await?;
+            count += 1;
+        }
+        for index in 0..16u64 {
+            tokio::fs::write(
+                root.join("中层").join("深层").join(format!("d{index:02}.bin")),
+                payload(512 + index as usize * 13, index + 11),
+            )
+            .await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    async fn remote_tree(
+        drive: &Arc<dyn DriveProvider>,
+        fid: &str,
+        prefix: &str,
+        out: &mut Vec<(String, u64)>,
+    ) -> AppResult<()> {
+        let page = drive.list(fid).await?;
+        for entry in page.entries {
+            let path = format!("{prefix}/{}", entry.name);
+            if entry.is_dir {
+                let native = native_of(&entry.fid).to_string();
+                Box::pin(remote_tree(drive, &native, &path, out)).await?;
+            } else {
+                out.push((path, entry.size));
+            }
+        }
+        Ok(())
+    }
+
+    async fn local_tree(root: &Path, dir: &Path, prefix: &str, out: &mut Vec<(String, u64)>) {
+        let Ok(mut reader) = tokio::fs::read_dir(dir).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = reader.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = format!("{prefix}/{name}");
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            if meta.is_dir() {
+                Box::pin(local_tree(root, &entry.path(), &path, out)).await;
+            } else {
+                out.push((path, meta.len()));
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live: uploads a folder to the real cloud189 account; run with --ignored --nocapture"]
+    async fn live_upload_folder_probe() {
+        let app = tauri::Builder::<tauri::Wry>::default()
+            .any_thread()
+            .build(tauri::generate_context!())
+            .expect("build headless tauri app");
+        let handle: AppHandle = app.handle().clone();
+        let paths = AppPaths::resolve().expect("app paths");
+        // `PROBE_PROVIDER=quark cargo test ...` runs the same round trip against
+        // another drive so a folder upload can be checked provider by provider.
+        let _ = &paths;
+        let which = std::env::var("PROBE_PROVIDER").unwrap_or_else(|_| "cloud189".to_string());
+        let provider = ProviderId::parse(&which).expect("known provider id");
+        let drive: Arc<dyn DriveProvider> =
+            crate::share_live::drive(provider).expect("stored credentials");
+        println!("[probe] provider={which}");
+
+        let pid = std::process::id();
+        let sandbox = std::env::temp_dir().join(format!("yunyu-probe-uf-local-{pid}"));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        tokio::fs::create_dir_all(&sandbox).await.expect("mkdir");
+        let tree = sandbox.join("tree");
+        tokio::fs::create_dir_all(&tree).await.expect("mkdir tree");
+        let expected = build_tree(&tree).await.expect("build tree");
+
+        let remote_name = format!("yunyu-probe-uf-{pid}");
+        let remote_root = native_of(&drive.make_dir("0", &remote_name).await.expect("mkdir remote"))
+            .to_string();
+        println!("[probe] remote={remote_name} local_files={expected}");
+
+        let manager = TransferManager::new(4, None);
+        let dir = UploadDirRef {
+            provider: which.clone(),
+            pdir_fid: remote_root.clone(),
+            path: tree.to_string_lossy().to_string(),
+            name: remote_name.clone(),
+            conflict: "rename".to_string(),
+        };
+        let task = manager
+            .start_upload_folder(handle.clone(), Arc::clone(&drive), dir)
+            .await
+            .expect("start folder upload");
+        let id = task.id.clone();
+
+        let mut paused = false;
+        let started = Instant::now();
+        let finished = loop {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let Some(now) = manager.snapshot(&id).await else {
+                panic!("task vanished");
+            };
+            assert!(
+                now.transferred <= now.size.max(1),
+                "transferred {} > size {}",
+                now.transferred,
+                now.size
+            );
+            if !paused && now.transferred * 3 > now.size.max(1) && now.status == "running" {
+                paused = true;
+                manager.pause_many(std::slice::from_ref(&id)).await;
+                println!(
+                    "[probe] paused at {} / {} children={}/{}",
+                    now.transferred, now.size, now.children_done, now.children_total
+                );
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let after = manager.snapshot(&id).await.expect("task");
+                println!(
+                    "[probe] after 3s paused: transferred={} speed={:.0} status={}",
+                    after.transferred, after.speed, after.status
+                );
+                assert_eq!(after.status, "paused", "pause did not take effect");
+                assert_eq!(after.speed, 0.0, "a paused task must not report a speed");
+                manager
+                    .resume_upload_folder(handle.clone(), Arc::clone(&drive), &id)
+                    .await
+                    .expect("resume");
+            }
+            if matches!(now.status.as_str(), "done" | "failed") {
+                break now;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(900),
+                "folder upload timed out (status {})",
+                now.status
+            );
+        };
+        println!(
+            "[probe] final status={} transferred={} size={} children={}/{} failed={} error={:?} in {:?}",
+            finished.status,
+            finished.transferred,
+            finished.size,
+            finished.children_done,
+            finished.children_total,
+            finished.children_failed,
+            finished.error,
+            started.elapsed()
+        );
+
+        // Drives are eventually consistent after a commit: 123 云盘 listed the
+        // tree one file short a few milliseconds after `upload_complete`. Give
+        // the listing a couple of retries before calling it a missing file.
+        let mut remote = Vec::new();
+        for attempt in 0..4 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            remote.clear();
+            remote_tree(&drive, &remote_root, "", &mut remote)
+                .await
+                .expect("list remote");
+            if remote.len() >= expected {
+                break;
+            }
+            println!("[probe] listing retry {attempt}: {} files", remote.len());
+        }
+        let mut local = Vec::new();
+        local_tree(&tree, &tree, "", &mut local).await;
+        // 百度网盘 refuses 0-byte files, so they are expected to be missing.
+        if which == "baidu" {
+            local.retain(|(_, size)| *size > 0);
+        }
+        remote.sort();
+        local.sort();
+        let extras: Vec<_> = remote
+            .iter()
+            .filter(|(path, _)| !local.iter().any(|(lpath, _)| lpath == path))
+            .cloned()
+            .collect();
+        let missing: Vec<_> = local
+            .iter()
+            .filter(|(path, _)| !remote.iter().any(|(rpath, _)| rpath == path))
+            .cloned()
+            .collect();
+        let mismatched: Vec<_> = local
+            .iter()
+            .filter(|(path, size)| {
+                !remote
+                    .iter()
+                    .any(|(rpath, rsize)| rpath == path && rsize == size)
+            })
+            .cloned()
+            .collect();
+        println!(
+            "[probe] remote_files={} local_files={} extras={extras:?} missing={missing:?} mismatched={mismatched:?}",
+            remote.len(),
+            local.len()
+        );
+
+        // Clean up *before* asserting: a failed assertion used to leave the
+        // probe folder behind and those leftovers piled up between runs.
+        drive
+            .delete(std::slice::from_ref(&remote_root))
+            .await
+            .expect("delete remote tree");
+        let _ = drive.recycle_clear().await;
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let page = drive.list("0").await.expect("list root");
+        let leftover: Vec<_> = page
+            .entries
+            .iter()
+            .filter(|e| e.name.starts_with("yunyu-probe-uf"))
+            .map(|e| e.name.clone())
+            .collect();
+        println!("[probe] CLEANUP leftovers={leftover:?} local_exists={}", tree.exists());
+
+        assert_eq!(finished.status, "done", "upload failed: {:?}", finished.error);
+        assert_eq!(finished.children_done, expected as u64);
+        assert_eq!(finished.children_failed, 0);
+        assert_eq!(
+            remote.len(),
+            local.len(),
+            "remote file count differs: extras={extras:?} missing={missing:?}"
+        );
+        assert!(mismatched.is_empty(), "missing/different: {mismatched:?}");
+        assert!(leftover.is_empty(), "probe left entries behind: {leftover:?}");
+        assert!(!tree.exists(), "local temp tree was not removed");
+    }
+}
+
+#[cfg(test)]
+mod probe_cleanup {
+    use crate::config::AppPaths;
+    use crate::providers::{native_of, Cloud189Provider, DriveProvider};
+    use std::sync::Arc;
+
+    /// Removes probe leftovers from the cloud189 root. Ignored by default.
+    #[tokio::test]
+    #[ignore = "live: deletes yunyu-probe* entries from the real account root"]
+    async fn sweep_cloud189_probe_leftovers() {
+        let paths = AppPaths::resolve().expect("app paths");
+        let drive: Arc<dyn DriveProvider> =
+            Arc::new(Cloud189Provider::load(&paths.config_dir).expect("cloud189 credentials"));
+        let page = drive.list("0").await.expect("list root");
+        let mut removed = 0;
+        for entry in page.entries {
+            if entry.name.starts_with("yunyu-") {
+                let native = native_of(&entry.fid).to_string();
+                match drive.delete(&[native]).await {
+                    Ok(_) => {
+                        removed += 1;
+                        println!("[sweep] removed {}", entry.name);
+                    }
+                    Err(err) => println!("[sweep] failed {}: {err}", entry.name),
+                }
+            }
+        }
+        let _ = drive.recycle_clear().await;
+        let left = drive.list("0").await.expect("list root");
+        let others: Vec<_> = left
+            .entries
+            .iter()
+            .filter(|e| e.name.starts_with("yunyu-"))
+            .map(|e| e.name.clone())
+            .collect();
+        println!("[sweep] removed={removed} remaining={others:?}");
+        assert!(others.is_empty(), "leftovers: {others:?}");
     }
 }

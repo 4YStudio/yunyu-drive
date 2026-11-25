@@ -1034,3 +1034,1440 @@ mod tests {
         assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 512);
     }
 }
+
+// ------------------------------------------------------- live consistency ---
+
+/// Live, cross-drive consistency probe.
+///
+/// Every drive gets the same scripted sequence in a sandbox folder of our own
+/// (`yunyu-probe-pf-<pid>`), and every step is recorded as 通过 / 失败 / 未实现
+/// so the result can be diffed against what `Capabilities` promises.
+///
+/// These talk to the real accounts in `~/.config/yunyu-drive/`, so they are
+/// `#[ignore]`d. Run them one at a time:
+///
+/// ```text
+/// cargo test --lib live_provider_probe -- --ignored --nocapture --test-threads=1
+/// cargo test --lib live_provider_probe::probe_quark -- --ignored --nocapture
+/// ```
+///
+/// They only ever create/rename/delete names starting with `yunyu-probe-pf-`
+/// and remove them again before finishing.
+#[cfg(test)]
+mod live_provider_probe {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    // ---------------------------------------------------------- reporting ---
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Status {
+        Pass,
+        Fail,
+        Missing,
+        Skipped,
+    }
+
+    impl Status {
+        fn label(self) -> &'static str {
+            match self {
+                Status::Pass => "通过",
+                Status::Fail => "失败",
+                Status::Missing => "未实现",
+                Status::Skipped => "跳过",
+            }
+        }
+    }
+
+    struct Probe {
+        label: String,
+        caps: Capabilities,
+        rows: Vec<(String, Status, String)>,
+        /// Set once the drive answers 登录超时 / 401 / 403: the rest of that
+        /// drive is skipped instead of hammering a dead credential.
+        halted: bool,
+    }
+
+    impl Probe {
+        fn new(label: &str, caps: Capabilities) -> Self {
+            Self {
+                label: label.to_string(),
+                caps,
+                rows: Vec::new(),
+                halted: false,
+            }
+        }
+
+        fn add(&mut self, action: &str, status: Status, detail: impl Into<String>) {
+            let detail = detail.into();
+            println!("    [{:>6}] {action:<24} {detail}", status.label());
+            self.rows.push((action.to_string(), status, detail));
+        }
+
+        fn pass(&mut self, action: &str, detail: impl Into<String>) {
+            self.add(action, Status::Pass, detail);
+        }
+
+        fn fail(&mut self, action: &str, err: impl std::fmt::Display) {
+            let text = err.to_string();
+            if looks_like_auth_failure(&text) {
+                self.halted = true;
+                self.add(
+                    action,
+                    Status::Skipped,
+                    format!("{text}（登录失效/限流，跳过该盘剩余项）"),
+                );
+            } else {
+                self.add(action, Status::Fail, text);
+            }
+        }
+
+        fn missing(&mut self, action: &str, why: impl Into<String>) {
+            self.add(action, Status::Missing, why);
+        }
+
+        fn skip(&mut self, action: &str, why: impl Into<String>) {
+            self.add(action, Status::Skipped, why);
+        }
+
+        fn halted(&self) -> bool {
+            self.halted
+        }
+
+        fn report(&self) {
+            println!("\n===== {} 结果表 =====", self.label);
+            println!(
+                "capabilities: share_open={} share_create={} move={} copy={} search={} rename={} folders={} recycle={}",
+                self.caps.share_open,
+                self.caps.share_create,
+                self.caps.move_files,
+                self.caps.copy,
+                self.caps.search,
+                self.caps.rename,
+                self.caps.folders,
+                self.caps.recycle
+            );
+            println!("| 动作 | 结果 | 关键输出或错误原文 |");
+            println!("|---|---|---|");
+            for (action, status, detail) in &self.rows {
+                println!(
+                    "| {action} | {} | {} |",
+                    status.label(),
+                    detail.replace('|', "\\|").replace('\n', " ")
+                );
+            }
+
+            let mut notes: Vec<String> = Vec::new();
+            for (action, status, detail) in &self.rows {
+                match cap_for(action, self.caps) {
+                    Some(true) if *status == Status::Fail => notes.push(format!(
+                        "⚠ capabilities 声称支持，实测失败：{action} — {detail}"
+                    )),
+                    Some(true) if *status == Status::Missing => notes.push(format!(
+                        "⚠ capabilities 声称支持，但走的是默认实现：{action} — {detail}"
+                    )),
+                    Some(false) if *status == Status::Pass => notes.push(format!(
+                        "⚠ capabilities 声称不支持，实测可用：{action}"
+                    )),
+                    _ => {}
+                }
+                if *status == Status::Pass
+                    && (action.starts_with("recycle_list") || action == "search")
+                    && detail.contains("0 条")
+                {
+                    notes.push(format!("⚠ 返回空且未报错（可疑实现）：{action}"));
+                }
+            }
+            if self.halted {
+                notes.push("⛔ 该盘在登录失效/限流处停止，后面的动作没有执行".to_string());
+            }
+            println!("\n检测结论（{}）：", self.label);
+            if notes.is_empty() {
+                println!("- 没有发现 capabilities 与实际行为的偏差");
+            }
+            for note in notes {
+                println!("- {note}");
+            }
+            println!("\n");
+        }
+    }
+
+    fn cap_for(action: &str, caps: Capabilities) -> Option<bool> {
+        match action {
+            a if a.starts_with("recycle_list")
+                || a.starts_with("recycle_restore")
+                || a.starts_with("recycle_purge") =>
+            {
+                Some(caps.recycle)
+            }
+            "search" => Some(caps.search),
+            "copy" | "copy 确认" => Some(caps.copy),
+            "move" => Some(caps.move_files),
+            "rename(目录)" | "rename(文件)" => Some(caps.rename),
+            "create_share" => Some(caps.share_create),
+            "share_open" => Some(caps.share_open),
+            _ => None,
+        }
+    }
+
+    fn looks_like_auth_failure(text: &str) -> bool {
+        [
+            "登录超时",
+            "登录已失效",
+            "登录状态已失效",
+            "尚未登录",
+            "未登录",
+            "401",
+            "403",
+            "TokenExpired",
+            "AccessTokenInvalid",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+    }
+
+    fn human(bytes: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+        let mut value = bytes as f64;
+        let mut unit = 0;
+        while value >= 1024.0 && unit + 1 < UNITS.len() {
+            value /= 1024.0;
+            unit += 1;
+        }
+        format!("{value:.1}{}", UNITS[unit])
+    }
+
+    fn truncate(text: &str, max: usize) -> String {
+        if text.chars().count() <= max {
+            text.to_string()
+        } else {
+            let head: String = text.chars().take(max).collect();
+            format!("{head}…")
+        }
+    }
+
+    fn config_dir() -> std::path::PathBuf {
+        crate::config::AppPaths::resolve()
+            .expect("配置目录")
+            .config_dir
+    }
+
+    // ------------------------------------------------------------ helpers ---
+
+    /// Removes the probe's temp payload when the test ends, success or not.
+    struct TempFile(std::path::PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// First `want` bytes of a download stream.
+    async fn read_first(mut handle: DownloadHandle, want: usize) -> AppResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(want.min(4096));
+        while out.len() < want {
+            match handle.stream.next().await {
+                Some(Ok(chunk)) => {
+                    let take = (want - out.len()).min(chunk.len());
+                    out.extend_from_slice(&chunk[..take]);
+                    if take < chunk.len() {
+                        break;
+                    }
+                }
+                Some(Err(err)) => return Err(err),
+                None => break,
+            }
+        }
+        if out.is_empty() {
+            return Err(AppError::new("下载流立即结束（0 字节）"));
+        }
+        Ok(out)
+    }
+
+    /// Looks a name up in a folder and returns `(native fid, entry)`.
+    async fn find_in(
+        drive: &dyn DriveProvider,
+        dir: &str,
+        name: &str,
+    ) -> AppResult<Option<(String, EntryDto)>> {
+        let listing = drive.list(dir).await?;
+        Ok(listing
+            .entries
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| (native_of(&entry.fid), entry)))
+    }
+
+    /// `find_in` that re-lists a few times before giving up.
+    ///
+    /// 夸克's `file/sort` is read-after-write inconsistent for ~1–2 s (measured:
+    /// a folder created with `POST /1/clouddrive/file` is missing from the very
+    /// next listing and shows up ~2 s later), so a single list is not a fair
+    /// check right after a mutation.
+    async fn find_settled(
+        drive: &dyn DriveProvider,
+        dir: &str,
+        name: &str,
+        tries: u32,
+    ) -> AppResult<Option<(String, EntryDto)>> {
+        let mut last: Option<AppResult<Option<(String, EntryDto)>>> = None;
+        for attempt in 0..tries.max(1) {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+            match find_in(drive, dir, name).await {
+                Ok(Some(hit)) => return Ok(Some(hit)),
+                Ok(None) => last = Some(Ok(None)),
+                Err(err) => {
+                    last = Some(Err(err));
+                }
+            }
+        }
+        last.unwrap_or(Ok(None))
+    }
+
+    /// Waits for a name to LEAVE a folder: a move that the server applies
+    /// asynchronously still shows the entry in the source for a few seconds
+    /// (天翼 does), so a single re-list would call a working move a failure.
+    async fn gone_settled(
+        drive: &dyn DriveProvider,
+        dir: &str,
+        name: &str,
+        tries: u32,
+    ) -> bool {
+        for attempt in 0..tries.max(1) {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+            match find_in(drive, dir, name).await {
+                Ok(None) => return true,
+                _ => continue,
+            }
+        }
+        false
+    }
+
+    /// Bin rows created by this probe, re-listing until they show up.
+    ///
+    /// Deletes land in the bin asynchronously on 夸克 (same ~2 s lag as
+    /// `file/sort`), so one listing right after `delete` reports an empty bin
+    /// and makes `recycle_purge` fail with "请先选择要彻底删除的内容".
+    async fn bin_mine(
+        drive: &dyn DriveProvider,
+        prefix: &str,
+        tries: u32,
+    ) -> AppResult<(usize, Vec<RecycleEntry>)> {
+        let tries = tries.max(1);
+        let mut last: Option<AppError> = None;
+        for attempt in 0..tries {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+            match drive.recycle_list(0, 100).await {
+                Ok(rows) => {
+                    let mine: Vec<RecycleEntry> = rows
+                        .iter()
+                        .filter(|row| row.name.starts_with(prefix))
+                        .cloned()
+                        .collect();
+                    if !mine.is_empty() || attempt + 1 == tries {
+                        return Ok((rows.len(), mine));
+                    }
+                }
+                Err(err) => last = Some(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| AppError::new("回收站不可用")))
+    }
+
+    /// Last-resort permanent delete for drives whose trait has no per-item
+    /// purge (only 阿里 has one, `/v2/file/delete`).
+    async fn hard_delete(aliyun: Option<&AliyunProvider>, qualified: &str) -> Result<(), String> {
+        let Some(drive) = aliyun else {
+            return Err("该盘没有逐项彻底删除接口".to_string());
+        };
+        let drive_id = drive.debug_drive_id().await;
+        drive
+            .debug_call(
+                "/v2/file/delete",
+                serde_json::json!({
+                    "drive_id": drive_id,
+                    "file_id": native_of(qualified),
+                }),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    /// Empties the bin of everything whose name starts with `prefix`.
+    ///
+    /// Order: `recycle_purge` (the trait's own path) → restore + permanent
+    /// delete (阿里) → report what could not be removed.
+    async fn scrub_bin(
+        drive: &dyn DriveProvider,
+        prefix: &str,
+        aliyun: Option<&AliyunProvider>,
+        probe: &mut Probe,
+        phase: &str,
+    ) {
+        let mine: Vec<RecycleEntry> = match bin_mine(drive, prefix, 5).await {
+            Ok((_, mine)) => mine,
+            Err(_) => return,
+        };
+        if mine.is_empty() {
+            return;
+        }
+        let purge_err = drive.recycle_purge(&mine).await.err();
+        let mut still: Vec<RecycleEntry> = match bin_mine(drive, prefix, 4).await {
+            Ok((_, mine)) => mine,
+            Err(_) => Vec::new(),
+        };
+        if still.is_empty() {
+            probe.add(
+                &format!("清理({phase})"),
+                Status::Pass,
+                "回收站里的探针条目已清空",
+            );
+            return;
+        }
+        // Without a per-item purge the only way to leave nothing behind is to
+        // restore and then permanently delete.
+        let _ = drive.recycle_restore(&still).await;
+        let mut errors = Vec::new();
+        for entry in &still {
+            if let Err(err) = hard_delete(aliyun, &entry.fid).await {
+                errors.push(format!("{}：{err}", entry.name));
+            }
+        }
+        still = match bin_mine(drive, prefix, 4).await {
+            Ok((_, mine)) => mine,
+            Err(_) => still,
+        };
+        if still.is_empty() {
+            probe.add(
+                &format!("清理({phase})"),
+                Status::Pass,
+                format!(
+                    "逐项 purge 不可用（{}），改用「恢复 + 硬删除」清掉",
+                    purge_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "无".to_string())
+                ),
+            );
+        } else {
+            probe.add(
+                &format!("清理({phase})"),
+                Status::Fail,
+                format!(
+                    "仍有 {} 条留在回收站，请手动清理 {prefix}*：{}",
+                    still.len(),
+                    errors.join("；")
+                ),
+            );
+        }
+    }
+
+    // -------------------------------------------------------------- suite ---
+
+    /// Runs the same script against any drive.
+    ///
+    /// `aliyun` is only needed for the final hard delete (阿里 exposes no
+    /// per-item purge through the trait); every other drive passes `None`.
+    /// Opens a share, lists it and asks for one download link.
+    ///
+    /// Shared by the create-a-share path and the fallback that opens an
+    /// existing share, because several drives can list/read shares but fail to
+    /// create one (阿里 answers "登录已过期" on `/v2/share_link/create` while the
+    /// rest of the API works).
+    /// A freshly created share is not immediately readable everywhere: 115
+    /// answers `正在生成文件快照（4100021）` until its snapshot lands, so the
+    /// open is retried twice at 5 s before the failure is recorded.
+    async fn share_open_retry(
+        drive: &dyn DriveProvider,
+        id: &str,
+        passcode: &str,
+    ) -> AppResult<crate::share::ShareSession> {
+        let mut last = None;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            match drive.share_open(id, passcode).await {
+                Ok(session) => return Ok(session),
+                Err(err) => last = Some(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| AppError::new("share_open 未执行")))
+    }
+
+    async fn share_roundtrip(
+        drive: &dyn DriveProvider,
+        label: &str,
+        id: &str,
+        passcode: &str,
+        probe: &mut Probe,
+    ) {
+        match share_open_retry(drive, id, passcode).await {
+            Ok(session) => {
+                probe.pass(
+                    "share_open",
+                    format!(
+                        "title={:?} owner={:?} file_num={} total_size={} stoken={} own_avatar={}",
+                        session.title,
+                        session.owner,
+                        session.file_num,
+                        session.total_size,
+                        if session.stoken.is_empty() { "空" } else { "有" },
+                        if session.owner_avatar.is_some() { "有" } else { "空" }
+                    ),
+                );
+                let share_ref = crate::transfer::ShareRef {
+                    provider: label.to_string(),
+                    pwd_id: session.pwd_id.clone(),
+                    stoken: session.stoken.clone(),
+                    fid_token: String::new(),
+                    passcode: if session.passcode.is_empty() {
+                        passcode.to_string()
+                    } else {
+                        session.passcode.clone()
+                    },
+                };
+                match drive.share_list(&share_ref, "").await {
+                    Ok(listing) => {
+                        probe.pass(
+                            "share_list",
+                            format!(
+                                "{} 条：{}",
+                                listing.entries.len(),
+                                listing
+                                    .entries
+                                    .iter()
+                                    .take(5)
+                                    .map(|e| e.name.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                        if let Some(entry) = listing.entries.iter().find(|e| !e.is_dir) {
+                            // Every real caller stuffs the per-entry token into
+                            // `fid_token` before asking for a link
+                            // (share.rs:877/918, share_live.rs:516); without it
+                            // 夸克 answers code=41020.
+                            let mut single = share_ref.clone();
+                            single.fid_token = entry.token.clone();
+                            match drive.share_link(&single, &native_of(&entry.fid)).await {
+                                Ok(link) => probe.pass(
+                                    "share_link",
+                                    format!(
+                                        "size={} headers={} url={}",
+                                        link.size,
+                                        link.headers.len(),
+                                        truncate(&link.url, 70)
+                                    ),
+                                ),
+                                Err(err) => probe.fail("share_link", err),
+                            }
+                        } else {
+                            probe.skip("share_link", "分享里没有可直接下载的文件");
+                        }
+                    }
+                    Err(err) => probe.fail("share_list", err),
+                }
+            }
+            Err(err) => probe.fail("share_open", err),
+        }
+    }
+
+    async fn probe_drive(
+        label: &str,
+        drive: &dyn DriveProvider,
+        root: &str,
+        aliyun: Option<&AliyunProvider>,
+    ) -> Probe {
+        let caps = drive.capabilities();
+        let mut probe = Probe::new(label, caps);
+
+        let base = format!("yunyu-probe-pf-{}", std::process::id());
+        let mv_dir_name = format!("{base}-mv");
+        let file_name = format!("{base}.txt");
+        let renamed_file = format!("{base}-renamed.txt");
+        let copy_name = format!("{base}-copy.txt");
+
+        println!("\n##### {label} #####");
+
+        // ---------------------------------------------------------- auth ---
+        let auth = drive.auth_state().await;
+        probe.add(
+            "auth_state",
+            if auth.authenticated {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
+            format!(
+                "authenticated={} source={} masked={} nickname={:?} avatar={}",
+                auth.authenticated,
+                auth.source,
+                truncate(auth.masked.as_deref().unwrap_or("—"), 60),
+                auth.nickname,
+                if auth.avatar.is_some() { "有" } else { "空" }
+            ),
+        );
+        if !auth.authenticated {
+            probe.skip("全部动作", "未登录，无法继续");
+            probe.report();
+            return probe;
+        }
+
+        match drive.account().await {
+            Ok(Some(info)) => probe.add(
+                "account",
+                Status::Pass,
+                format!(
+                    "nickname={:?} avatar={}",
+                    info.nickname,
+                    if info.avatar.is_some() { "有" } else { "空" }
+                ),
+            ),
+            Ok(None) => probe.add("account", Status::Skipped, "None（未缓存）"),
+            Err(err) => probe.add("account", Status::Fail, err.to_string()),
+        }
+        match drive.profile().await {
+            Ok(Some(info)) => probe.pass(
+                "profile",
+                format!(
+                    "nickname={:?} avatar={}",
+                    info.nickname,
+                    if info.avatar.is_some() { "有" } else { "空" }
+                ),
+            ),
+            Ok(None) => probe.skip("profile", "None（联网后仍没有昵称/头像）"),
+            Err(err) => probe.fail("profile", err),
+        }
+        if probe.halted() {
+            probe.report();
+            return probe;
+        }
+
+        // --------------------------------------------------------- quota ---
+        match drive.quota().await {
+            Ok(Some(quota)) => {
+                let odd = quota.total == 0 || quota.used > quota.total;
+                probe.add(
+                    "quota",
+                    if odd { Status::Fail } else { Status::Pass },
+                    format!(
+                        "used={} total={}（{} / {}）",
+                        quota.used,
+                        quota.total,
+                        human(quota.used),
+                        human(quota.total)
+                    ),
+                );
+            }
+            Ok(None) => probe.add("quota", Status::Skipped, "None（该盘没有返回容量）"),
+            Err(err) => probe.fail("quota", err),
+        }
+        if probe.halted() {
+            probe.report();
+            return probe;
+        }
+
+        // ------------------------------------------------------ list root ---
+        match drive.list(root).await {
+            Ok(listing) => {
+                let files: Vec<&EntryDto> = listing.entries.iter().filter(|e| !e.is_dir).collect();
+                let dirs = listing.entries.len() - files.len();
+                let no_time = listing
+                    .entries
+                    .iter()
+                    .filter(|e| e.updated_at == 0)
+                    .count();
+                let zero_size = files.iter().filter(|e| e.size == 0).count();
+                let prefix = format!("{label}:");
+                let bare_fid = listing
+                    .entries
+                    .iter()
+                    .filter(|e| !e.fid.starts_with(&prefix))
+                    .count();
+                probe.pass(
+                    "list(根)",
+                    format!(
+                        "{} 条（目录 {} / 文件 {}）total={}；updated_at=0 的 {} 条；文件 size=0 的 {} 条；fid 未加前缀 {} 条",
+                        listing.entries.len(),
+                        dirs,
+                        files.len(),
+                        listing.total,
+                        no_time,
+                        zero_size,
+                        bare_fid
+                    ),
+                );
+                println!(
+                    "    样例: {:?}",
+                    listing
+                        .entries
+                        .iter()
+                        .take(3)
+                        .map(|e| format!(
+                            "{} dir={} size={} at={}",
+                            e.name, e.is_dir, e.size, e.updated_at
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+            Err(err) => {
+                probe.fail("list(根)", err);
+                probe.report();
+                return probe;
+            }
+        }
+
+        // ---------------------------------------------------- make_dir -----
+        let mut sandbox = match drive.make_dir(root, &base).await {
+            Ok(id) => {
+                probe.pass("make_dir", format!("{base} -> {id}"));
+                native_of(&id)
+            }
+            Err(err) => {
+                probe.fail("make_dir", err);
+                probe.report();
+                return probe;
+            }
+        };
+        match find_settled(drive, root, &base, 6).await {
+            Ok(Some((fid, entry))) => {
+                sandbox = fid;
+                probe.add(
+                    "list 确认新目录",
+                    if entry.is_dir { Status::Pass } else { Status::Fail },
+                    format!("fid={} is_dir={}", entry.fid, entry.is_dir),
+                );
+            }
+            Ok(None) => probe.add(
+                "list 确认新目录",
+                Status::Fail,
+                "make_dir 返回了 id，但根列表里没有这个目录",
+            ),
+            Err(err) => probe.fail("list 确认新目录", err),
+        }
+        match drive.list(&sandbox).await {
+            Ok(listing) => probe.add(
+                "list(新目录)",
+                if listing.entries.is_empty() {
+                    Status::Pass
+                } else {
+                    Status::Fail
+                },
+                format!("{} 条（期望 0）", listing.entries.len()),
+            ),
+            Err(err) => probe.fail("list(新目录)", err),
+        }
+
+        let mv_dir = match drive.make_dir(root, &mv_dir_name).await {
+            Ok(id) => {
+                probe.pass("make_dir(第二目录)", format!("{mv_dir_name} -> {id}"));
+                native_of(&id)
+            }
+            Err(err) => {
+                probe.fail("make_dir(第二目录)", err);
+                String::new()
+            }
+        };
+
+        // ------------------------------------------------------- upload ----
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let local = std::env::temp_dir().join(&file_name);
+        std::fs::write(&local, &payload).expect("写入临时文件");
+        let _temp = TempFile(local.clone());
+        let counter = Arc::new(CounterSink::new(Arc::new(AtomicU64::new(0))));
+        let sink: Arc<dyn UploadSink> = counter.clone();
+        let uploaded = drive
+            .upload(
+                &local,
+                &sandbox,
+                &file_name,
+                sink,
+                CancellationToken::new(),
+            )
+            .await;
+        match uploaded {
+            Ok(id) => probe.pass(
+                "upload",
+                format!(
+                    "4096 字节 -> id={:?} phase={} done={}",
+                    id,
+                    counter.current_phase(),
+                    counter.done.load(std::sync::atomic::Ordering::Relaxed)
+                ),
+            ),
+            Err(err) => probe.fail("upload", err),
+        }
+        if probe.halted() {
+            probe.report();
+            return probe;
+        }
+
+        let mut current_file = file_name.clone();
+        let mut file_fid = match find_settled(drive, &sandbox, &current_file, 6).await {
+            Ok(Some((fid, entry))) => {
+                let size_ok = entry.size == payload.len() as u64;
+                probe.add(
+                    "list 确认上传",
+                    if size_ok { Status::Pass } else { Status::Fail },
+                    format!(
+                        "{} 字节（期望 {}）updated_at={} is_dir={}",
+                        entry.size,
+                        payload.len(),
+                        entry.updated_at,
+                        entry.is_dir
+                    ),
+                );
+                Some(fid)
+            }
+            Ok(None) => {
+                probe.add(
+                    "list 确认上传",
+                    Status::Fail,
+                    format!("对话目录里找不到 {current_file}"),
+                );
+                None
+            }
+            Err(err) => {
+                probe.fail("list(沙箱)", err);
+                None
+            }
+        };
+
+        // ----------------------------------------------------- rename ------
+        match drive.rename(&sandbox, &format!("{base}-renameddir")).await {
+            Ok(()) => {
+                match find_settled(drive, root, &format!("{base}-renameddir"), 6).await {
+                    Ok(Some((fid, _))) => {
+                        sandbox = fid;
+                        probe.pass("rename(目录)", format!("{base} -> {base}-renameddir"));
+                    }
+                    Ok(None) => probe.add(
+                        "rename(目录)",
+                        Status::Fail,
+                        "返回成功但列表里没有新名字",
+                    ),
+                    Err(err) => probe.fail("rename(目录) 确认", err),
+                }
+                // Put the name back so later steps keep a stable sandbox name.
+                if drive.rename(&sandbox, &base).await.is_ok() {
+                    if let Ok(Some((fid, _))) = find_settled(drive, root, &base, 6).await {
+                        sandbox = fid;
+                    }
+                }
+            }
+            Err(err) => probe.fail("rename(目录)", err),
+        }
+
+        if let Some(fid) = file_fid.clone() {
+            match drive.rename(&fid, &renamed_file).await {
+                Ok(()) => match find_settled(drive, &sandbox, &renamed_file, 6).await {
+                    Ok(Some((new_fid, entry))) => {
+                        file_fid = Some(new_fid);
+                        current_file = renamed_file.clone();
+                        probe.pass(
+                            "rename(文件)",
+                            format!("-> {renamed_file}（size={}）", entry.size),
+                        );
+                    }
+                    Ok(None) => probe.add(
+                        "rename(文件)",
+                        Status::Fail,
+                        "返回成功但新名字不在目录里",
+                    ),
+                    Err(err) => probe.fail("rename(文件) 确认", err),
+                },
+                Err(err) => probe.fail("rename(文件)", err),
+            }
+        } else {
+            probe.skip("rename(文件)", "没有可用的文件 id");
+        }
+
+        // ---------------------------------------------------- download -----
+        if let Some(fid) = file_fid.clone() {
+            match drive.open_download(&fid, 0).await {
+                Ok(handle) => {
+                    let size = handle.size;
+                    match read_first(handle, 1024).await {
+                        Ok(bytes) => probe.add(
+                            "open_download(0)",
+                            if bytes == payload[..bytes.len()] {
+                                Status::Pass
+                            } else {
+                                Status::Fail
+                            },
+                            format!(
+                                "首 {} 字节，内容与上传一致={}，handle.size={}",
+                                bytes.len(),
+                                bytes == payload[..bytes.len()],
+                                size
+                            ),
+                        ),
+                        Err(err) => probe.fail("open_download(0)", err),
+                    }
+                }
+                Err(err) => probe.fail("open_download(0)", err),
+            }
+            match drive.open_download(&fid, 100).await {
+                Ok(handle) => match read_first(handle, 64).await {
+                    Ok(bytes) => {
+                        let expect = &payload[100..100 + bytes.len()];
+                        probe.add(
+                            "open_download(100)",
+                            if bytes == expect {
+                                Status::Pass
+                            } else {
+                                Status::Fail
+                            },
+                            format!(
+                                "偏移 100 首块 {} 字节，内容一致={}",
+                                bytes.len(),
+                                bytes == expect
+                            ),
+                        );
+                    }
+                    Err(err) => probe.fail("open_download(100)", err),
+                },
+                Err(err) => probe.fail("open_download(100)", err),
+            }
+            probe.add(
+                "supports_ranges",
+                Status::Skipped,
+                format!("{}", drive.supports_ranges()),
+            );
+        } else {
+            probe.skip("open_download", "上传失败，没有可下载的文件");
+        }
+        if probe.halted() {
+            probe.report();
+            return probe;
+        }
+
+        // -------------------------------------------------- copy / move ----
+        let mut copy_fid: Option<String> = None;
+        if caps.copy {
+            if let (Some(fid), false) = (file_fid.clone(), mv_dir.is_empty()) {
+                match drive.transfer_entries(&[fid], &mv_dir, true).await {
+                    Ok(count) => match find_settled(drive, &mv_dir, &current_file, 6).await {
+                        Ok(Some((new_fid, entry))) => {
+                            copy_fid = Some(new_fid);
+                            probe.pass(
+                                "copy",
+                                format!(
+                                    "返回 {count}；目标目录出现 {}（{} 字节）",
+                                    entry.name, entry.size
+                                ),
+                            );
+                        }
+                        Ok(None) => probe.add(
+                            "copy",
+                            Status::Fail,
+                            format!("返回 {count}，但目标目录里没有 {}", current_file),
+                        ),
+                        Err(err) => probe.fail("copy 确认", err),
+                    },
+                    Err(err) => probe.fail("copy", err),
+                }
+            } else {
+                probe.skip("copy", "没有可复制的文件或目标目录");
+            }
+        } else {
+            probe.missing("copy", "capabilities.copy=false");
+        }
+
+        // Rename the copy so the move test cannot collide with `current_file`.
+        if let Some(fid) = copy_fid.clone() {
+            if drive.rename(&fid, &copy_name).await.is_ok() {
+                if let Ok(Some((new_fid, _))) = find_settled(drive, &mv_dir, &copy_name, 6).await {
+                    copy_fid = Some(new_fid);
+                }
+            }
+        }
+
+        if caps.move_files {
+            match copy_fid.clone() {
+                Some(fid) if !sandbox.is_empty() => {
+                    match drive.transfer_entries(&[fid], &sandbox, false).await {
+                        Ok(count) => {
+                            let target = find_settled(drive, &sandbox, &copy_name, 6)
+                                .await
+                                .ok()
+                                .flatten();
+                            let source = find_settled(drive, &mv_dir, &copy_name, 4)
+                                .await
+                                .ok()
+                                .flatten();
+                            let from_gone = match source {
+                                None => true,
+                                Some(_) => gone_settled(drive, &mv_dir, &copy_name, 8).await,
+                            };
+                            let to_present = target.is_some();
+                            if let Some((new_fid, _)) = target {
+                                copy_fid = Some(new_fid);
+                            }
+                            probe.add(
+                                "move",
+                                if from_gone && to_present {
+                                    Status::Pass
+                                } else {
+                                    Status::Fail
+                                },
+                                format!(
+                                    "返回 {count}；源目录已空={from_gone} 目标目录已出现={to_present}"
+                                ),
+                            );
+                        }
+                        Err(err) => probe.fail("move", err),
+                    }
+                }
+                _ => probe.skip("move", "没有可移动的副本"),
+            }
+        } else {
+            probe.missing("move", "capabilities.move=false");
+        }
+
+        // ------------------------------------------------------- search ----
+        if caps.search {
+            // Indexing lags behind writes on every drive here (夸克 measured at
+            // ~2 s), so a single query right after an upload under-reports.
+            let mut hits = Vec::new();
+            let mut failure = None;
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+                match drive.search(root, &copy_name, 20).await {
+                    Ok(found) => {
+                        let hit = found.iter().any(|h| h.entry.name == copy_name);
+                        hits = found;
+                        if hit {
+                            failure = None;
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        failure = Some(err);
+                    }
+                }
+            }
+            match failure {
+                Some(err) => probe.fail("search", err),
+                None => {
+                    let hit = hits.iter().any(|h| h.entry.name == copy_name);
+                    probe.add(
+                        "search",
+                        if hit { Status::Pass } else { Status::Fail },
+                        format!("{} 条命中，包含沙箱文件={hit}", hits.len()),
+                    );
+                }
+            }
+        } else {
+            probe.missing("search", "capabilities.search=false");
+        }
+
+        // -------------------------------------------------------- shares ---
+        let mut share_open_done = false;
+        if caps.share_create {
+            let code = crate::share::random_code(4);
+            let title = format!("{base}-share");
+            // Share the file when there is one: a folder share hides the child
+            // behind `share_list`, so `share_link` would go untested.
+            let shared: Vec<String> = match file_fid.clone() {
+                Some(fid) => vec![fid],
+                None => vec![sandbox.clone()],
+            };
+            match drive.create_share(&shared, &title, 1, &code).await {
+                Ok(created) => {
+                    probe.pass(
+                        "create_share",
+                        format!(
+                            "url={} passcode={:?} share_id={} expired_at={}",
+                            created.url, created.passcode, created.share_id, created.expired_at
+                        ),
+                    );
+                    if caps.share_open {
+                        // The trait takes the drive-side id, not the browser
+                        // address: `commands` runs every link through
+                        // `share::parse_link` first, so the probe must too.
+                        let target = crate::share::parse_link(&created.url);
+                        let passcode = if created.passcode.is_empty() {
+                            code.clone()
+                        } else {
+                            created.passcode.clone()
+                        };
+                        probe.add(
+                            "parse_link",
+                            if target.is_ok() { Status::Pass } else { Status::Fail },
+                            format!("{:?}", target.as_ref().map(|t| (&t.id, &t.passcode))),
+                        );
+                        let target = target.unwrap_or(crate::share::ShareTarget {
+                            provider: ProviderId::Quark,
+                            id: created.share_id.clone(),
+                            passcode: passcode.clone(),
+                        });
+                        let pass = if target.passcode.is_empty() {
+                            passcode.clone()
+                        } else {
+                            target.passcode.clone()
+                        };
+                        share_roundtrip(drive, label, &target.id, &pass, &mut probe).await;
+                        share_open_done = true;
+                    } else {
+                        probe.missing("share_open", "capabilities.share_open=false");
+                    }
+                    match drive
+                        .revoke_share(&created.share_id, &[sandbox.clone()])
+                        .await
+                    {
+                        Ok(()) => probe.pass("revoke_share", "已取消"),
+                        Err(err) => probe.fail("revoke_share", err),
+                    }
+                }
+                Err(err) => probe.fail("create_share", err),
+            }
+        } else {
+            probe.missing("create_share", "capabilities.share_create=false");
+        }
+
+        // A drive that cannot create a share on this account may still open
+        // one: fall back to a share the account already owns so `share_open`
+        // is measured rather than assumed.
+        if caps.share_open && !share_open_done && !probe.halted() {
+            match drive.share_records().await {
+                Ok(records) if !records.is_empty() => {
+                    let record = &records[0];
+                    probe.add(
+                        "share_records",
+                        Status::Pass,
+                        format!(
+                            "{} 条，取 url={} passcode={:?}",
+                            records.len(),
+                            truncate(&record.url, 60),
+                            record.passcode
+                        ),
+                    );
+                    let target = crate::share::parse_link(&record.url);
+                    let (id, pass) = match &target {
+                        Ok(t) => (
+                            t.id.clone(),
+                            if t.passcode.is_empty() {
+                                record.passcode.clone()
+                            } else {
+                                t.passcode.clone()
+                            },
+                        ),
+                        Err(_) => (record.share_id.clone(), record.passcode.clone()),
+                    };
+                    share_roundtrip(drive, label, &id, &pass, &mut probe).await;
+                }
+                Ok(_) => probe.skip("share_open", "该盘没有可用的既有分享"),
+                Err(err) => probe.skip("share_open", format!("既无可建分享，也读不到分享列表：{err}")),
+            }
+        }
+        if probe.halted() {
+            probe.report();
+            return probe;
+        }
+
+        // ------------------------------------------------------- recycle ---
+        // `delete` is checked on every drive: even without a bin the entry has
+        // to disappear from the listing.
+        let deleted = copy_fid.clone().or_else(|| file_fid.clone());
+        if let Some(fid) = deleted.clone() {
+            match drive.delete(&[fid]).await {
+                Ok(()) => {
+                    let gone = find_settled(drive, &sandbox, &copy_name, 5)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_none();
+                    probe.add(
+                        "delete",
+                        if gone { Status::Pass } else { Status::Fail },
+                        format!("已删除 {copy_name}；列表里已消失={gone}"),
+                    );
+                }
+                Err(err) => probe.fail("delete", err),
+            }
+        } else {
+            probe.skip("delete", "没有可删除的探针文件");
+        }
+
+        if caps.recycle {
+            match deleted {
+                Some(_) => {
+                    match bin_mine(drive, &base, 5).await {
+                        Ok((rows, mine)) => {
+                            let mine: Vec<RecycleEntry> = mine;
+                            probe.add(
+                                "recycle_list",
+                                if mine.is_empty() {
+                                    Status::Fail
+                                } else {
+                                    Status::Pass
+                                },
+                                format!(
+                                    "{} 条，本探针 {} 条：{}",
+                                    rows,
+                                    mine.len(),
+                                    mine.iter()
+                                        .map(|r| format!("{}({}B)", r.name, r.size))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ),
+                            );
+                            if !mine.is_empty() {
+                                match drive.recycle_restore(&mine).await {
+                                    Ok(count) => {
+                                        let back = find_settled(drive, &sandbox, &copy_name, 6)
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .is_some();
+                                        probe.add(
+                                            "recycle_restore",
+                                            if back { Status::Pass } else { Status::Fail },
+                                            format!("恢复 {count} 条，list 里回来={back}"),
+                                        );
+                                    }
+                                    Err(err) => probe.fail("recycle_restore", err),
+                                }
+                                // Trash it again, then purge.
+                                let again = find_settled(drive, &sandbox, &copy_name, 4)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|(fid, _)| fid)
+                                    .or_else(|| copy_fid.clone());
+                                if let Some(fid) = again {
+                                    if let Err(err) = drive.delete(&[fid]).await {
+                                        probe.fail("delete(二次)", err);
+                                    }
+                                    let mine2 = bin_mine(drive, &base, 4)
+                                        .await
+                                        .map(|(_, mine)| mine)
+                                        .unwrap_or_default();
+                                    match drive.recycle_purge(&mine2).await {
+                                        Ok(count) => {
+                                            probe.pass("recycle_purge", format!("{count} 条"))
+                                        }
+                                        Err(err) if err.to_string().contains("暂不支持") => {
+                                            probe.missing("recycle_purge", err.to_string())
+                                        }
+                                        Err(err) => probe.fail("recycle_purge", err),
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => probe.fail("recycle_list", err),
+                    }
+                }
+                None => probe.skip("delete", "没有可删除的探针文件"),
+            }
+        } else {
+            probe.missing("recycle_list", "capabilities.recycle=false");
+            probe.missing("recycle_restore", "capabilities.recycle=false");
+            probe.missing("recycle_purge", "capabilities.recycle=false");
+        }
+
+        // ------------------------------------------------------- cleanup ---
+        // Everything we created lives under `base*`; delete the contents first
+        // so the folders themselves can go.
+        if let Ok(listing) = drive.list(&sandbox).await {
+            let fids: Vec<String> = listing
+                .entries
+                .iter()
+                .filter(|e| e.name.starts_with(&base))
+                .map(|e| native_of(&e.fid))
+                .collect();
+            if !fids.is_empty() {
+                let _ = drive.delete(&fids).await;
+            }
+        }
+        if !mv_dir.is_empty() {
+            if let Ok(listing) = drive.list(&mv_dir).await {
+                let fids: Vec<String> = listing
+                    .entries
+                    .iter()
+                    .map(|e| native_of(&e.fid))
+                    .collect();
+                if !fids.is_empty() {
+                    let _ = drive.delete(&fids).await;
+                }
+            }
+        }
+        let mut doomed = vec![sandbox.clone()];
+        if !mv_dir.is_empty() {
+            doomed.push(mv_dir.clone());
+        }
+        let _ = drive.delete(&doomed).await;
+
+        // Sweep stale `yunyu-probe-pf-*` leftovers from earlier probe runs too:
+        // a run that died before its cleanup leaves them behind, and the
+        // namespace is ours alone so no user data can match.
+        let sweep = |listing: &DirListing| {
+            listing
+                .entries
+                .iter()
+                .filter(|e| e.name.starts_with("yunyu-probe-pf-"))
+                .map(|e| native_of(&e.fid))
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..3 {
+            let stale = match drive.list(root).await {
+                Ok(listing) => sweep(&listing),
+                Err(_) => break,
+            };
+            if stale.is_empty() {
+                break;
+            }
+            let _ = drive.delete(&stale).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        }
+
+        let mut root_clean: Vec<String> = Vec::new();
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            }
+            match drive.list(root).await {
+                Ok(listing) => {
+                    root_clean = listing
+                        .entries
+                        .iter()
+                        .filter(|e| e.name.starts_with(&base))
+                        .map(|e| e.name.clone())
+                        .collect();
+                    if root_clean.is_empty() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    probe.fail("清理(根目录)", err);
+                    break;
+                }
+            }
+        }
+        probe.add(
+            "清理(根目录)",
+            if root_clean.is_empty() {
+                Status::Pass
+            } else {
+                Status::Fail
+            },
+            if root_clean.is_empty() {
+                format!("{base}* 已全部移除")
+            } else {
+                format!("仍残留：{}", root_clean.join(", "))
+            },
+        );
+        scrub_bin(drive, &base, aliyun, &mut probe, "回收站").await;
+
+        probe.report();
+        probe
+    }
+
+    // --------------------------------------------------------------- tests ---
+
+    fn quark_drive() -> QuarkProvider {
+        let dir = config_dir();
+        let cookie = std::fs::read_to_string(dir.join("cookie.txt"))
+            .expect("cookie.txt")
+            .trim()
+            .to_string();
+        let client = libquarkpan::QuarkPan::builder()
+            .cookie(cookie.clone())
+            .api_base_url("https://drive.quark.cn")
+            .prepare()
+            .expect("quark client");
+        QuarkProvider::new(
+            client,
+            cookie,
+            dir.join("cookie.txt").to_string_lossy().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_quark() {
+        let drive = quark_drive();
+        probe_drive("quark", &drive, "0", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_yun139() {
+        let drive = Yun139Provider::load(&config_dir()).expect("yun139");
+        probe_drive("yun139", &drive, "0", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_aliyun() {
+        let drive = AliyunProvider::load(&config_dir()).expect("aliyun");
+        probe_drive("aliyun", &drive, "0", Some(&drive)).await;
+    }
+
+    /// 阿里云盘 returns bare 401/403s that the provider maps to 「登录已过期」;
+    /// the real body is only in the app log. This drives the same probe with
+    /// the logger pointed at a temp dir so the original text can be quoted.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_aliyun_with_log() {
+        let dir = std::env::temp_dir().join(format!("yunyu-probe-log-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::logging::init(&dir);
+        let drive = AliyunProvider::load(&config_dir()).expect("aliyun");
+        probe_drive("aliyun", &drive, "0", Some(&drive)).await;
+        if let Ok(text) = std::fs::read_to_string(dir.join("app.log")) {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.contains("aliyun:"))
+                .collect();
+            if !lines.is_empty() {
+                eprintln!("    ── 诊断日志（aliyun: 行，尾部）──");
+                for line in lines.iter().rev().take(8).rev() {
+                    eprintln!("    {line}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_pan123() {
+        let drive = Pan123Provider::load(&config_dir()).expect("pan123");
+        probe_drive("pan123", &drive, "0", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_baidu() {
+        let drive = BaiduProvider::load(&config_dir()).expect("baidu");
+        probe_drive("baidu", &drive, "0", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_cloud189() {
+        let drive = Cloud189Provider::load(&config_dir()).expect("cloud189");
+        probe_drive("cloud189", &drive, "0", None).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_pan115() {
+        let drive = Pan115Provider::load(&config_dir()).expect("pan115");
+        probe_drive("pan115", &drive, "0", None).await;
+    }
+}

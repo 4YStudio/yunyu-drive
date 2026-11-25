@@ -17,7 +17,7 @@ fn config_dir() -> std::path::PathBuf {
     crate::config::AppPaths::resolve().unwrap().config_dir
 }
 
-fn drive(provider: ProviderId) -> Option<Arc<dyn DriveProvider>> {
+pub(crate) fn drive(provider: ProviderId) -> Option<Arc<dyn DriveProvider>> {
     let dir = config_dir();
     let built: AppResult<Arc<dyn DriveProvider>> = match provider {
         ProviderId::Quark => {

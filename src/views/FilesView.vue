@@ -939,8 +939,8 @@ async function upload(paths: string[]) {
   if (paths.length === 0) return;
   uploading.value = true;
   try {
-    await api.uploadFiles(paths, currentFid.value);
-    toast(`已加入上传队列 ${paths.length} 项`, "success");
+    const tasks = await api.uploadFiles(paths, currentFid.value);
+    toast(`已加入上传队列 ${tasks.length} 项`, "success");
     await load(currentFid.value);
     void loadQuota(app.activeProvider, true);
   } catch (err) {

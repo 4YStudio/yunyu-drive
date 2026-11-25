@@ -147,9 +147,19 @@ function isFolder(task: TransferTask) {
   return task.kind === "folder";
 }
 
+/** A whole local folder uploaded as one row. */
+function isFolderUpload(task: TransferTask) {
+  return task.kind === "upload" && !!task.uploadDir;
+}
+
+/** Either direction: a row that stands for many files. */
+function isFolderish(task: TransferTask) {
+  return isFolder(task) || isFolderUpload(task);
+}
+
 function kindLabel(task: TransferTask) {
   if (isCross(task)) return task.kind === "copy" ? "跨盘复制" : "跨盘移动";
-  if (isFolder(task)) return "文件夹";
+  if (isFolderish(task)) return "文件夹";
   return task.kind === "download" ? "下载" : "上传";
 }
 
@@ -211,7 +221,10 @@ function statusLabel(task: TransferTask) {
       if (isCross(task)) return task.kind === "copy" ? "复制中" : "移动中";
       // A folder is walking and downloading at the same time; before the first
       // file shows up there is nothing to count, so say what it is doing.
-      if (isFolder(task)) return task.listing && !task.size ? "读取中" : "下载中";
+      if (isFolderish(task)) {
+        if (task.listing && !task.size) return "读取中";
+        return isFolder(task) ? "下载中" : "上传中";
+      }
       return task.kind === "download" ? "下载中" : "上传中";
     case "done":
       return task.rapid ? "秒传完成" : "已完成";
@@ -469,7 +482,7 @@ onActivated(() => {
               :name="
                 isCross(task)
                   ? 'arrow-up-down'
-                  : isFolder(task)
+                  : isFolderish(task)
                     ? 'folder'
                     : task.kind === 'download'
                       ? 'download'
@@ -509,7 +522,7 @@ onActivated(() => {
                 {{ formatSize(task.transferred + preparedSize(task)) }} /
                 {{ formatSize(task.size) }}
               </span>
-              <template v-if="isFolder(task)">
+              <template v-if="isFolderish(task)">
                 <span class="dot">·</span>
                 <span class="mono">
                   {{ task.childrenDone ?? 0 }} / {{ task.childrenTotal ?? 0 }} 个文件
@@ -550,9 +563,15 @@ onActivated(() => {
               <Icon name="pause" :size="14" />
             </button>
             <button
-              v-if="isFolder(task)"
+              v-if="isFolderish(task)"
               class="icon-btn"
-              :title="expanded === task.id ? '收起文件明细' : '查看正在下载的文件'"
+              :title="
+                expanded === task.id
+                  ? '收起文件明细'
+                  : isFolder(task)
+                    ? '查看正在下载的文件'
+                    : '查看正在上传的文件'
+              "
               @click="toggleExpand(task)"
             >
               <Icon :name="expanded === task.id ? 'chevron-down' : 'list'" :size="14" />
@@ -582,14 +601,19 @@ onActivated(() => {
               <Icon name="folder" :size="14" />
             </button>
             <button
-              v-if="(isDownload(task) || isCross(task)) && ['failed', 'canceled', 'paused'].includes(task.status)"
+              v-if="
+                (isDownload(task) || isCross(task) || isFolderUpload(task)) &&
+                ['failed', 'canceled', 'paused'].includes(task.status)
+              "
               class="icon-btn"
               :title="
                 isCross(task)
                   ? '继续传输'
                   : isFolder(task)
                     ? '继续下载（已下好的文件会跳过）'
-                    : '继续下载（断点续传）'
+                    : isFolderUpload(task)
+                      ? '继续上传（已传好的文件会跳过）'
+                      : '继续下载（断点续传）'
               "
               @click="retry(task)"
             >
@@ -607,7 +631,13 @@ onActivated(() => {
 
           <div v-if="expanded === task.id" class="kids">
             <p v-if="activeKids.length === 0" class="kids-empty">
-              {{ task.listing ? "正在读取文件夹…" : "没有正在下载的文件" }}
+              {{
+                task.listing
+                  ? "正在读取文件夹…"
+                  : isFolderUpload(task)
+                    ? "没有正在上传的文件"
+                    : "没有正在下载的文件"
+              }}
             </p>
             <div v-for="kid in activeKids" :key="kid.id" class="kid">
               <div class="kid-head">
