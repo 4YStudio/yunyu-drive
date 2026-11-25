@@ -534,13 +534,14 @@ async fn run_shared(
                 break;
             }
             let completed = state.completed();
-            // Snap progress back to what is durably complete. A worker that
-            // died mid-segment already counted the bytes it had written, and
-            // the next round fetches that segment again from its start —
-            // leaving the counter alone would count those bytes twice and push
-            // the bar past 100 %. The dip is honest: those bytes are about to
-            // be fetched a second time.
-            done.store(base + completed, Ordering::Relaxed);
+            // Snap progress back to what the plan says is on disk. A worker
+            // that died mid-segment counted bytes the plan also remembers
+            // (`written`), and the next round resumes that segment *from*
+            // them rather than refetching it — so the count must keep them.
+            // Snapping to `completed()` would drop a partially written
+            // segment from the total, and nothing later would add it back:
+            // the bar then sits below the truth for the rest of the run.
+            done.store(base + state.bytes(), Ordering::Relaxed);
             completed
         };
 
@@ -1153,6 +1154,162 @@ mod tests {
         let mut progress = meta::Progress::new(10, vec![Segment { start: 0, end: 10 }]);
         progress.mark(0);
         assert!(reused_is_partial(&part, &progress));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod resume_bytes_tests {
+    use super::source::Source as _;
+    use super::*;
+    use futures_util::StreamExt as _;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    struct Fake {
+        size: u64,
+        delay_ms: u64,
+    }
+
+    struct Chan(tokio::sync::mpsc::Receiver<Result<bytes::Bytes, crate::error::AppError>>);
+
+    impl futures_util::Stream for Chan {
+        type Item = Result<bytes::Bytes, crate::error::AppError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    fn byte_at(i: u64) -> u8 {
+        (i % 251) as u8
+    }
+
+    #[async_trait::async_trait]
+    impl source::Source for Fake {
+        async fn open(&self, start: u64, end: Option<u64>) -> crate::providers::RangeResult {
+            let last = end.unwrap_or(self.size);
+            let size = self.size;
+            let delay = self.delay_ms;
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, crate::error::AppError>>(4);
+            tokio::spawn(async move {
+                let mut cursor = start;
+                while cursor < last {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    let take = (last - cursor).min(32 * 1024);
+                    let chunk: Vec<u8> = (cursor..cursor + take).map(byte_at).collect();
+                    cursor += take;
+                    if tx.send(Ok(bytes::Bytes::from(chunk))).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            crate::providers::RangeResult::body(
+                crate::providers::DownloadHandle {
+                    size,
+                    md5: None,
+                    stream: Box::new(Chan(rx)),
+                },
+                start,
+                Some(&format!("bytes {start}-{}/{size}", last.max(start + 1) - 1)),
+            )
+        }
+
+        fn label(&self) -> &str {
+            "fake"
+        }
+
+        fn fingerprint(&self) -> String {
+            format!("fake|{}", self.size)
+        }
+    }
+
+    async fn one_round(
+        src: Arc<Fake>,
+        part: &std::path::Path,
+        size: u64,
+        done: Arc<std::sync::atomic::AtomicU64>,
+        stop_at: Option<u64>,
+        connections: usize,
+    ) -> crate::error::AppResult<bool> {
+        let token = tokio_util::sync::CancellationToken::new();
+        let state = meta::Progress::load(part)
+            .filter(|plan| plan.belongs_to(size, &src.fingerprint()));
+        let plan = match state {
+            Some(saved) if super::reused_is_partial(part, &saved) => saved,
+            _ => {
+                meta::Progress::discard(part);
+                meta::Progress::with_source(
+                    size,
+                    plan::split(size, connections),
+                    src.fingerprint(),
+                )
+            }
+        };
+        if let Some(limit) = stop_at {
+            let token = token.clone();
+            let done = Arc::clone(&done);
+            tokio::spawn(async move {
+                loop {
+                    if done.load(Ordering::Relaxed) >= limit {
+                        token.cancel();
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            });
+        }
+        super::run_shared(
+            src,
+            part,
+            size,
+            done,
+            0,
+            token,
+            budget::Profile::QUARK,
+            connections,
+            plan,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paused_download_resumes_without_counting_a_byte_twice() {
+        let dir = std::env::temp_dir().join(format!("yy-resume-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("big.part");
+        let size = 24 * 1024 * 1024u64;
+
+        for connections in [1usize, 4] {
+            let _ = std::fs::remove_file(&part);
+            meta::Progress::discard(&part);
+            let src = Arc::new(Fake { size, delay_ms: 3 });
+            let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+            // Pause at roughly a third of the file.
+            let first = one_round(Arc::clone(&src), &part, size, Arc::clone(&done), Some(size / 3), connections).await;
+            let after_pause = super::plan_bytes(&part);
+            assert!(first.is_err() || first.as_ref().is_ok_and(|v| !v), "round 1 should stop early: {first:?}");
+            assert!(after_pause > 0, "connections={connections}: nothing recorded");
+            assert!(after_pause <= size / 2 + 1024 * 1024, "connections={connections}: plan claims {after_pause} after pausing near 1/3");
+
+            // Continue: the counter must never exceed the file.
+            let resumed = one_round(Arc::clone(&src), &part, size, Arc::clone(&done), None, connections).await;
+            assert!(resumed.as_ref().is_ok_and(|v| *v), "connections={connections}: resume failed {resumed:?}");
+            let total = done.load(Ordering::Relaxed);
+            assert!(total <= size, "connections={connections}: counted {total} for a {size} byte file");
+
+            // Every byte on disk must be the right one.
+            let bytes = std::fs::read(&part).unwrap();
+            assert_eq!(bytes.len() as u64, size);
+            let bad = bytes.iter().enumerate().position(|(i, b)| *b != byte_at(i as u64));
+            assert!(bad.is_none(), "connections={connections}: corrupt at {bad:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
