@@ -123,6 +123,8 @@ pub struct FolderRef {
 }
 
 /// One file found by the folder walker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct FolderFile {
     /// Native id on the folder's drive.
     fid: String,
@@ -363,13 +365,26 @@ impl TransferManager {
             }
             restored.push(task);
         }
-        if restored.is_empty() {
-            return;
-        }
         let mut tasks = self.tasks.write().await;
         for task in restored {
             tasks.insert(task.id.clone(), task.clone());
             task.emit(app);
+        }
+        drop(tasks);
+
+        // A folder task removed while the app was closed leaves its sidecar
+        // behind; nothing can resume it now.
+        if let Some(root) = self.manifest_root() {
+            let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+                return;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let id = name.trim_end_matches(".jsonl").to_string();
+                if !self.tasks.read().await.contains_key(&id) {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+            }
         }
     }
 
@@ -530,6 +545,7 @@ impl TransferManager {
         for child in self.remove_children(id).await {
             discard_partial(&child).await;
         }
+        self.drop_manifest(id).await;
         let _ = app.emit(EVENT_REMOVED, id.to_string());
         self.persist().await;
         Ok(())
@@ -646,6 +662,7 @@ impl TransferManager {
             for child in self.remove_children(id).await {
                 discard_partial(&child).await;
             }
+            self.drop_manifest(id).await;
         }
         if !removed.is_empty() {
             self.persist().await;
@@ -919,21 +936,58 @@ impl TransferManager {
         .await;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<FolderFile>(256);
-        {
-            let walker = Arc::clone(&drive);
-            let walker_token = token.clone();
-            let start = folder.fid.clone();
-            tokio::spawn(async move {
-                walk_folder(walker, start, PathBuf::new(), tx, walker_token).await;
-            });
+        // A previous run of this folder left a complete listing behind: replay it
+        // instead of walking the drive again. That is what makes resuming a
+        // 20 000-file folder cheap, and it also means the totals are known up
+        // front instead of growing as the walk discovers more.
+        let manifest = self.manifest_path(&id);
+        let replay = match &manifest {
+            Some(path) => read_manifest(path).await,
+            None => None,
+        };
+        let replaying = replay.is_some();
+        let replay_stats = replay.as_ref().map(|files| {
+            (
+                files.len() as u64,
+                files.iter().map(|file| file.size).sum::<u64>(),
+            )
+        });
+        match replay {
+            Some(files) => {
+                let source = token.clone();
+                tokio::spawn(async move {
+                    for file in files {
+                        if source.is_cancelled() || tx.send(file).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            None => {
+                if let Some(path) = &manifest {
+                    // Half a listing is worse than none: a folder would look
+                    // finished while its rest was never discovered.
+                    let _ = tokio::fs::remove_file(path).await;
+                    if let Some(dir) = path.parent() {
+                        let _ = tokio::fs::create_dir_all(dir).await;
+                    }
+                }
+                let walker = Arc::clone(&drive);
+                let walker_token = token.clone();
+                let start = folder.fid.clone();
+                tokio::spawn(async move {
+                    walk_folder(walker, start, PathBuf::new(), tx, walker_token).await;
+                });
+            }
         }
 
         let mut live: Vec<String> = Vec::new();
         let mut walking = true;
         let mut made_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        let mut bytes_found = 0u64;
+        // A replayed listing already knows both numbers, so the bar has a stable
+        // denominator from the first frame instead of growing with the walk.
+        let (mut total, mut bytes_found) = replay_stats.unwrap_or((0, 0));
         let mut bytes_finished = 0u64;
-        let mut total = 0u64;
         let mut done = 0u64;
         let mut failed = 0u64;
         let mut first_error: Option<String> = None;
@@ -958,8 +1012,13 @@ impl TransferManager {
                 }
                 file = rx.recv(), if can_take => match file {
                     Some(file) => {
-                        total += 1;
-                        bytes_found += file.size;
+                        if !replaying {
+                            total += 1;
+                            bytes_found += file.size;
+                            if let Some(path) = &manifest {
+                                append_manifest(path, &file).await;
+                            }
+                        }
                         let dir = if file.relative_dir.as_os_str().is_empty() {
                             root.clone()
                         } else {
@@ -1007,7 +1066,14 @@ impl TransferManager {
                             }
                         }
                     }
-                    None => walking = false,
+                    None => {
+                        walking = false;
+                        if !replaying {
+                            if let Some(path) = &manifest {
+                                append_manifest_end(path).await;
+                            }
+                        }
+                    }
                 },
                 _ = tokio::time::sleep(Duration::from_millis(FOLDER_TICK_MS)) => {}
             }
@@ -1079,6 +1145,9 @@ impl TransferManager {
             None
         };
         let ok = message.is_none();
+        if ok {
+            self.drop_manifest(&id).await;
+        }
         self.patch(&id, &app, move |t| {
             t.status = if ok { "done".to_string() } else { "failed".to_string() };
             t.listing = false;
@@ -1091,6 +1160,26 @@ impl TransferManager {
             t.size = bytes_found.max(bytes_finished);
         })
         .await;
+    }
+
+    /// Sidecar listing of a folder task's files, next to `transfers.json`.
+    ///
+    /// The parent task itself stays one row no matter how big the folder is, so
+    /// the file list has to live somewhere for a resume to skip the walk: the
+    /// listing is written as it is discovered and ends with an `end` marker.
+    fn manifest_path(&self, id: &str) -> Option<PathBuf> {
+        Some(self.manifest_root()?.join(format!("{id}.jsonl")))
+    }
+
+    fn manifest_root(&self) -> Option<PathBuf> {
+        Some(self.store.as_ref()?.parent()?.join("folders"))
+    }
+
+    /// Drops the sidecar of a folder task (done, cancelled for good, removed).
+    async fn drop_manifest(&self, id: &str) {
+        if let Some(path) = self.manifest_path(id) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
     }
 
     /// Hidden children belong to their folder task: dropping the folder drops
@@ -1808,6 +1897,69 @@ async fn file_complete(path: &Path, size: u64) -> bool {
         .await
         .map(|meta| meta.len() == size)
         .unwrap_or(false)
+}
+
+/// Reads a folder listing that finished being written. A truncated listing (no
+/// end marker) returns `None`: the folder would look complete while the rest of
+/// it was never seen.
+async fn read_manifest(path: &Path) -> Option<Vec<FolderFile>> {
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    let mut files = Vec::new();
+    let mut ended = false;
+    let mut broken = false;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            // A line we cannot read means the file was written by a version that
+            // knew fields this one does not; replaying it would silently drop
+            // files, so the folder gets walked again instead.
+            broken = true;
+            continue;
+        };
+        if value.get("end").and_then(|v| v.as_bool()).unwrap_or(false) {
+            ended = true;
+            continue;
+        }
+        match serde_json::from_value::<FolderFile>(value) {
+            Ok(file) => files.push(file),
+            Err(_) => broken = true,
+        }
+    }
+    if ended && !broken {
+        Some(files)
+    } else {
+        None
+    }
+}
+
+/// Appends one file to a folder's sidecar listing.
+async fn append_manifest(path: &Path, file: &FolderFile) {
+    let Ok(mut line) = serde_json::to_vec(file) else {
+        return;
+    };
+    line.push(b'\n');
+    if let Ok(mut handle) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        let _ = handle.write_all(&line).await;
+    }
+}
+
+/// Marks a sidecar listing as complete, which is what makes it replayable.
+async fn append_manifest_end(path: &Path) {
+    if let Ok(mut handle) = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        let _ = handle.write_all(b"{\"end\":true}\n").await;
+    }
 }
 
 /// Test hook: runs a cross-drive batch without a Tauri app handle so the live
@@ -2536,6 +2688,39 @@ pub fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listing that finished writing is replayable; a truncated one is not,
+    /// or a folder would resume with half its files and call itself complete.
+    #[tokio::test]
+    async fn folder_listing_replays_only_when_it_ended() {
+        let dir = std::env::temp_dir().join(format!("quark-m-{}", now_millis()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("listing.jsonl");
+        let file = FolderFile {
+            fid: "b".to_string(),
+            name: "b.txt".to_string(),
+            relative_dir: PathBuf::from("sub"),
+            size: 3,
+        };
+        append_manifest(&path, &file).await;
+        assert!(read_manifest(&path).await.is_none(), "no end marker yet");
+
+        append_manifest_end(&path).await;
+        let files = read_manifest(&path).await.expect("complete listing");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "b.txt");
+        assert_eq!(files[0].relative_dir, PathBuf::from("sub"));
+        assert_eq!(files[0].size, 3);
+
+        // A line this version cannot read (written by a newer one) must not be
+        // silently skipped: the folder is walked again instead.
+        let mut text = tokio::fs::read_to_string(&path).await.unwrap();
+        text.push_str("{\"fid\":\"c\",\"name\":\"c.txt\",\"size\":1}\n");
+        tokio::fs::write(&path, text).await.unwrap();
+        assert!(read_manifest(&path).await.is_none(), "a broken line forces a walk");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 
     /// Minimal drive: a fixed tree, so the folder walk can be tested without a
     /// network or an `AppHandle`.
