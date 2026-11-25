@@ -469,10 +469,8 @@ export const mockApi = {
     ];
   },
   recycleRestore: async (_provider: string, entries: RecycleEntry[]): Promise<number> => entries.length,
-  recyclePurge: async (provider: string, entries: RecycleEntry[]): Promise<number> => {
-    if (provider === "pan123") throw new Error("123 云盘不提供接口彻底删除回收站内容，请在网页版操作");
-    return entries.length;
-  },
+  recyclePurge: async (_provider: string, entries: RecycleEntry[]): Promise<number> =>
+    entries.length,
   recycleClear: async (): Promise<void> => {},
   // A 1×1 grey pixel stands in for every preview, so the grid's thumbnail
   // branch renders in mock builds without network access.

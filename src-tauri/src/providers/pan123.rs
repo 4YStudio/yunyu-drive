@@ -200,6 +200,21 @@ impl Pan123Provider {
 
     /// GET/POST helper that unwraps the `{code, message, data}` envelope.
     async fn call(&self, method: &str, url: &str, body: Option<Value>) -> AppResult<Value> {
+        self.call_accepting(method, url, body, &[]).await
+    }
+
+    /// `call`, but the listed non-zero codes count as success.
+    ///
+    /// The permanent-delete endpoint answers `7301` ("已删除，系统释放空间需要
+    /// 一段时间") on a request that *did* work, so it cannot go through the
+    /// generic "any non-zero code is an error" path.
+    async fn call_accepting(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<Value>,
+        extra_ok: &[i64],
+    ) -> AppResult<Value> {
         let client = self.http()?;
         let creds = self.creds.read().await.clone();
         let mut req = match method {
@@ -232,7 +247,7 @@ impl Pan123Provider {
                 "123 云盘：本月下载流量已用完，请下个月再试（code=5113/5114）",
             ));
         }
-        if code != 0 && code != 200 {
+        if code != 0 && code != 200 && !extra_ok.contains(&code) {
             let msg = value
                 .get("message")
                 .and_then(|v| v.as_str())
@@ -858,7 +873,10 @@ impl DriveProvider for Pan123Provider {
         let mut list: Vec<Value> = Vec::with_capacity(fids.len());
         for fid in fids {
             // A bad id used to become 0 (the root), i.e. the wrong delete target.
-            list.push(json!({ "FileId": numeric_id(fid)? }));
+            // `native_of` makes this tolerant of a qualified id as well: the
+            // commands strip the prefix, but a probe (or a future caller) may
+            // hand over `pan123:123` straight from a listing.
+            list.push(json!({ "FileId": numeric_id(&super::native_of(fid))? }));
         }
         let body = json!({
             "driveId": 0,
@@ -1245,16 +1263,45 @@ impl DriveProvider for Pan123Provider {
     }
 
     async fn recycle_purge(&self, entries: &[RecycleEntry]) -> AppResult<u32> {
-        // No public endpoint deletes from the bin for good: every plausible
-        // path (`/a/api/file/trash/delete`, `.../clear`, the `goapi/v1`
-        // variants) answers 404, and `file/clean/trash` only works on a scan
-        // task id. Say so instead of pretending the rows went away.
+        // The web client's "彻底删除" call, captured 2026-11. It is the *file*
+        // delete endpoint with `event: recycleDelete` — the `/trash/delete` and
+        // `/trash/clear` paths people assume exist are 404.
         if entries.is_empty() {
             return Err(AppError::new("请先选择要彻底删除的内容"));
         }
-        Err(AppError::new(
-            "123 云盘不提供接口彻底删除回收站内容，请在网页版操作",
-        ))
+        let mut list: Vec<Value> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            list.push(json!({ "fileId": numeric_id(&super::native_of(&entry.fid))? }));
+        }
+        self.call_accepting(
+            "POST",
+            &format!("{BASE}/b/api/file/delete"),
+            Some(json!({
+                "fileIdList": list,
+                "event": "recycleDelete",
+                "operatePlace": 1,
+                "RequestSource": Value::Null,
+            })),
+            // 7301 = "已删除，系统释放空间需要一段时间".
+            &[7301],
+        )
+        .await?;
+        Ok(entries.len() as u32)
+    }
+
+    async fn recycle_clear(&self) -> AppResult<()> {
+        // There is no "empty the bin" endpoint, so this is purge-everything in
+        // chunks. Re-listing after each chunk is deliberate: ids that were
+        // already freeing space are still listed for a while, and a blind
+        // pagination walk would miss the ones that shift up.
+        for _ in 0..200 {
+            let items = self.recycle_list(0, 100).await?;
+            if items.is_empty() {
+                return Ok(());
+            }
+            self.recycle_purge(&items).await?;
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------- shares ---
@@ -2027,6 +2074,69 @@ mod live_tests {
             Ok(None) => println!("quota: none"),
             Err(err) => panic!("quota failed: {err}"),
         }
+    }
+
+    /// Recycle bin: delete a folder, find it, purge it for good.
+    ///
+    /// `cargo test --lib pan123_live_recycle -- --ignored --nocapture`
+    ///
+    /// Covers the endpoint the previous implementation could not find: "彻底
+    /// 删除" is `POST /b/api/file/delete` with `event: recycleDelete`, not any
+    /// of the `/trash/delete` paths. It also sweeps this project's own probe
+    /// leftovers (`yunyu-*`) out of the bin, so a run leaves the account
+    /// tidier than it found it. `recycle_clear` is deliberately **not** called:
+    /// it empties the whole bin, including the user's own files.
+    #[tokio::test]
+    #[ignore]
+    async fn pan123_live_recycle() {
+        let dir = crate::config::AppPaths::resolve().unwrap().config_dir;
+        let drive = Pan123Provider::load(&dir).expect("pan123.json");
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name = format!("yunyu-rb-{stamp}");
+
+        let folder = drive.make_dir(ROOT, &name).await.expect("make_dir");
+        drive
+            .delete(std::slice::from_ref(&folder))
+            .await
+            .expect("delete into the bin");
+
+        let items = drive.recycle_list(0, 100).await.expect("recycle_list");
+        println!("bin: {} entries", items.len());
+        let hit = items
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} should be in the bin"));
+        assert!(hit.is_dir, "a deleted folder must be listed as a directory");
+        drive
+            .recycle_purge(std::slice::from_ref(hit))
+            .await
+            .expect("purge");
+
+        let items = drive.recycle_list(0, 100).await.expect("recycle_list");
+        assert!(
+            !items.iter().any(|e| e.name == name),
+            "a purged entry must not come back"
+        );
+        println!("purged {name}");
+
+        // Sweep our own leftovers out of the bin.
+        let leftovers: Vec<super::RecycleEntry> = items
+            .into_iter()
+            .filter(|e| e.name.starts_with("yunyu"))
+            .collect();
+        if !leftovers.is_empty() {
+            let done = drive
+                .recycle_purge(&leftovers)
+                .await
+                .expect("purge leftovers");
+            println!("swept {done} probe leftovers");
+        }
+        let items = drive.recycle_list(0, 100).await.expect("recycle_list");
+        println!("bin now: {} entries", items.len());
     }
 
     /// Upload → list → download → delete, checking the progress phases the UI
