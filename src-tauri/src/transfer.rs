@@ -1494,6 +1494,17 @@ impl TransferManager {
 
             match result {
                 Ok(()) => {
+                    // A pause that landed while the last chunk was in flight
+                    // has already set "paused"; finishing the bytes must not
+                    // flip the row to done behind the user's back.
+                    if token.is_cancelled() {
+                        manager
+                            .patch(&id, &handle, |t| {
+                                t.speed = 0.0;
+                            })
+                            .await;
+                        return;
+                    }
                     manager
                         .patch(&id, &handle, |t| {
                             t.status = "done".to_string();
@@ -1907,6 +1918,17 @@ impl TransferManager {
 
             match result {
                 Ok(()) => {
+                    // A pause that landed while the last chunk was in flight
+                    // has already set "paused"; finishing the bytes must not
+                    // flip the row to done behind the user's back.
+                    if token.is_cancelled() {
+                        manager
+                            .patch(&id, &handle, |t| {
+                                t.speed = 0.0;
+                            })
+                            .await;
+                        return;
+                    }
                     manager
                         .patch(&id, &handle, |t| {
                             t.status = "done".to_string();
@@ -2518,11 +2540,11 @@ async fn run_provider_download(
             // Work remains. Hand the offset to the engine, which resumes from
             // its own plan; starting at `size` would read as "already done".
             crate::engine::ResumeState::Partial => start = 0,
-            crate::engine::ResumeState::None => {
-                tokio::fs::rename(part_path, final_path).await?;
-                done.store(base + size, Ordering::Relaxed);
-                return Ok(());
-            }
+            // No plan, yet the file is at full length: the engine preallocates,
+            // so this is a file with holes in it, not a finished download.
+            // Trusting the length alone made a paused download report "done"
+            // the moment it was resumed. Re-fetch instead.
+            crate::engine::ResumeState::None => start = 0,
         }
     }
     if size > 0 && start > size {
@@ -2724,12 +2746,14 @@ async fn run_share_download(
         )
         .fingerprint();
         match crate::engine::resume_state(part_path, size, &identity) {
-            crate::engine::ResumeState::Partial => start = 0,
-            _ => {
+            // Only a plan that says every segment landed proves the file is
+            // whole; a preallocated file with no plan is sparse.
+            crate::engine::ResumeState::Finished => {
                 tokio::fs::rename(part_path, final_path).await?;
                 done.store(size, Ordering::Relaxed);
                 return Ok(());
             }
+            crate::engine::ResumeState::Partial | crate::engine::ResumeState::None => start = 0,
         }
     }
     if size > 0 && start > size {

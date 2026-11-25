@@ -310,6 +310,12 @@ async function loadChildren() {
   }
 }
 
+/** Only the files actually being fetched: the waiting ones would be a queue
+ *  of thousands and say nothing about what the folder is doing right now. */
+const activeKids = computed(() =>
+  children.value.filter((kid) => kid.status === "running" || kid.status === "hashing"),
+);
+
 function stopChildren() {
   if (childTimer !== undefined) clearInterval(childTimer);
   childTimer = undefined;
@@ -600,10 +606,10 @@ onActivated(() => {
           </div>
 
           <div v-if="expanded === task.id" class="kids">
-            <p v-if="children.length === 0" class="kids-empty">
+            <p v-if="activeKids.length === 0" class="kids-empty">
               {{ task.listing ? "正在读取文件夹…" : "没有正在下载的文件" }}
             </p>
-            <div v-for="kid in children" :key="kid.id" class="kid">
+            <div v-for="kid in activeKids" :key="kid.id" class="kid">
               <div class="kid-head">
                 <span class="kid-name truncate" :title="kid.name">{{ kid.name }}</span>
                 <span class="kid-size mono">
@@ -875,13 +881,21 @@ onActivated(() => {
 /* The detail panel drops to its own line under the row: it is a sibling of the
    row's flex items, so it takes a full basis and wraps. */
 .kids {
+  /* `flex-basis: 100%` plus a left margin pushed the panel past the row's
+     padding box and the list clipped it. Basis plus `min-width: 0` keeps it
+     inside, and a tall set of files scrolls instead of growing the row. */
   flex: 0 0 100%;
-  margin: 2px 0 2px 30px;
-  padding: 4px 0 6px 8px;
+  min-width: 0;
+  box-sizing: border-box;
+  margin: 2px 0 2px 0;
+  padding: 4px 0 6px 30px;
   border-left: 1px solid var(--line);
   display: flex;
   flex-direction: column;
   gap: 5px;
+  max-height: 240px;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .kids-empty {
   margin: 0;
@@ -891,6 +905,7 @@ onActivated(() => {
 .kid {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   gap: 4px;
   padding: 3px 0;
   font-size: 11.8px;

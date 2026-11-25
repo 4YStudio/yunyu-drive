@@ -374,11 +374,14 @@ async fn run_shared(
         stats.report(0, progress.segments.len(), progress.completed() as usize);
     }
 
+    // The plan goes to disk *before* the file is pinned to its full length:
+    // a preallocated part without a sidecar is indistinguishable from a
+    // finished download, and `ResumeState::None` would have to re-fetch it.
+    progress.save(part)?;
     let sink = worker::Sink::open(part, size)?;
     // Bytes already on disk count towards progress from the first tick.
     let already = progress.completed();
     done.store(base + already, Ordering::Relaxed);
-    progress.save(part)?;
 
     let limiter = Arc::new(worker::Limiter::new());
     let progress = Arc::new(Mutex::new(progress));
