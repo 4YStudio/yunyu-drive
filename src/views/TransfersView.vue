@@ -157,6 +157,11 @@ function isFolderish(task: TransferTask) {
   return isFolder(task) || isFolderUpload(task);
 }
 
+/** Colour of the speed readout: blue while uploading, dim while downloading. */
+function speedClass(task: TransferTask) {
+  return task.kind === "upload" ? "task-speed task-speed--up" : "task-speed task-speed--down";
+}
+
 function kindLabel(task: TransferTask) {
   if (isCross(task)) return task.kind === "copy" ? "跨盘复制" : "跨盘移动";
   if (isFolderish(task)) return "文件夹";
@@ -536,7 +541,7 @@ onActivated(() => {
               </template>
               <template v-if="task.status === 'running'">
                 <span class="dot">·</span>
-                <span class="mono">{{ formatSpeed(task.speed) }}</span>
+                <span class="mono" :class="speedClass(task)">{{ formatSpeed(task.speed) }}</span>
                 <span class="dot">·</span>
                 <span class="mono">{{ formatEta(task.size - task.transferred, task.speed) || "—" }}</span>
                 <template v-if="poolLabel(task)">
@@ -868,6 +873,15 @@ onActivated(() => {
 }
 .task-error {
   color: var(--text-2);
+}
+.task-speed {
+  font-variant-numeric: tabular-nums;
+}
+.task-speed--down {
+  color: var(--text-3);
+}
+.task-speed--up {
+  color: var(--up);
 }
 .task-pool {
   color: var(--text-2);

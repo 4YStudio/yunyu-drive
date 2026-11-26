@@ -20,6 +20,7 @@ import EmptyState from "@/components/EmptyState.vue";
 import ContextMenu from "@/components/ContextMenu.vue";
 import type { MenuItem } from "@/lib/menu";
 import Modal from "@/components/Modal.vue";
+import { type TrafficWarning, trafficWarning } from "@/lib/traffic";
 import Segmented from "@/components/Segmented.vue";
 
 import { api } from "@/lib/backend";
@@ -592,9 +593,13 @@ async function onMenuSelect(id: string) {
 }
 
 /** Opens the folder picker for a move or copy of the current selection. */
+/** Same allowance check, for a cross-drive copy that has to download first. */
+const relocateTraffic = ref<TrafficWarning | null>(null);
+
 async function openRelocate(mode: "move" | "copy") {
   const entries = selectedEntries.value;
   if (entries.length === 0) return;
+  relocateTraffic.value = null;
   relocate.value = {
     mode,
     entries,
@@ -606,6 +611,14 @@ async function openRelocate(mode: "move" | "copy") {
     provider: app.activeProvider,
   };
   await loadRelocate(rootFid.value, [rootNode()]);
+  if (mode === "copy") {
+    const bytes = entries.reduce((sum, entry) => sum + (entry.isDir ? 0 : entry.size), 0);
+    relocateTraffic.value = await trafficWarning(
+      app.activeProvider,
+      bytes,
+      entries.some((entry) => entry.isDir),
+    );
+  }
 }
 
 async function loadRelocate(fid: string, path: PathNode[]) {
@@ -753,9 +766,25 @@ const downloadSummary = computed(() => {
   return `${head}${bytes > 0 ? `，另有 ${formatSize(bytes)} 文件` : ""}（文件夹的实际大小在读取后显示）`;
 });
 
-function askDownload(items: { fid: string; name: string; size: number; isDir: boolean }[]) {
+/**
+ * Why this download may not fit the drive's monthly allowance, if it may not.
+ *
+ * 123 lets a transfer start and then cuts it off when the allowance runs out,
+ * which leaves an incomplete file — so say it before the queue starts, not
+ * after the failure.
+ */
+const downloadTraffic = ref<TrafficWarning | null>(null);
+
+async function askDownload(items: { fid: string; name: string; size: number; isDir: boolean }[]) {
   if (items.length === 0) return;
   downloadPrompt.value = { items, dir: defaultDownloadDir(), remember: false };
+  downloadTraffic.value = null;
+  const bytes = items.reduce((sum, item) => sum + (item.isDir ? 0 : item.size), 0);
+  downloadTraffic.value = await trafficWarning(
+    app.activeProvider,
+    bytes,
+    items.some((item) => item.isDir),
+  );
 }
 
 async function chooseDownloadDir() {
@@ -1466,6 +1495,10 @@ defineExpose({ refresh });
         />
         <span>同时把这个文件夹设为默认下载目录</span>
       </label>
+      <p v-if="downloadTraffic" class="dl-warn">
+        <strong>{{ downloadTraffic.short }}</strong>
+        {{ downloadTraffic.detail }}
+      </p>
       <p class="dl-hint">
         文件夹会以同名子目录保存；同名文件自动追加 (2)、(3) 序号，不会覆盖已有内容。
       </p>
@@ -1511,6 +1544,10 @@ defineExpose({ refresh });
         </div>
         <p v-if="relocateForeign" class="picker-hint">
           目标在另一个网盘：会先下载到本地，再上传过去，任务可以在传输列表里查看。
+        </p>
+        <p v-if="relocateForeign && relocateTraffic" class="dl-warn">
+          <strong>{{ relocateTraffic.short }}</strong>
+          {{ relocateTraffic.detail }}
         </p>
         <div class="picker-bar">
           <button
@@ -2276,6 +2313,23 @@ defineExpose({ refresh });
 }
 .dl-remember input {
   accent-color: var(--fill);
+}
+/* Allowance warning: the file may arrive truncated, so it reads as a caution. */
+.dl-warn {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, #e0554f 12%, transparent);
+  border: 1px solid color-mix(in srgb, #e0554f 30%, transparent);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+.dl-warn strong {
+  display: block;
+  margin-bottom: 2px;
+  font-weight: 600;
+  color: #e0554f;
 }
 .dl-hint {
   margin: 8px 0 0;

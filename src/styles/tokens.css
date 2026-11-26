@@ -49,6 +49,8 @@
   --text-inverse: #ffffff;
 
   --fill: #0b0b0c;
+  /* The one semantic colour in a monochrome system: upload speed. */
+  --up: #2f6feb;
   --fill-hover: #26262b;
   --on-fill: #ffffff;
 
@@ -80,6 +82,7 @@
   --text-inverse: #0a0a0b;
 
   --fill: #f4f4f5;
+  --up: #6f9dff;
   --fill-hover: #ffffff;
   --on-fill: #0a0a0b;
 
