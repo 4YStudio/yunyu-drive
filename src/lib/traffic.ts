@@ -15,6 +15,13 @@ const LOW_BYTES = 1024 ** 3;
 export interface TrafficWarning {
   short: string;
   detail: string;
+  /**
+   * True when the download is known to be larger than the allowance left.
+   * The dialog then keeps 「开始下载」 disabled until the user ticks a box,
+   * because the transfer would be cut off mid-file. Unknown-size folders
+   * stay advisory (`blocking: false`) — there is nothing solid to compare.
+   */
+  blocking: boolean;
 }
 
 /**
@@ -42,6 +49,7 @@ export async function trafficWarning(
     return {
       short,
       detail: `123 云盘免费账号每月有下载额度，超额后传输会被中断，文件可能下载不完整。还差 ${formatSize(bytes - traffic.left)}，可以等下个月额度刷新，或下载更少的内容。`,
+      blocking: true,
     };
   }
 
@@ -50,6 +58,7 @@ export async function trafficWarning(
       short: `剩余下载流量只有 ${left}`,
       detail:
         "这次包含文件夹，实际大小要读取后才知道；额度不足时传输会被中断，文件可能下载不完整。",
+      blocking: false,
     };
   }
 

@@ -595,11 +595,14 @@ async function onMenuSelect(id: string) {
 /** Opens the folder picker for a move or copy of the current selection. */
 /** Same allowance check, for a cross-drive copy that has to download first. */
 const relocateTraffic = ref<TrafficWarning | null>(null);
+/** Same opt-in as the download dialog, for a copy that will not fit. */
+const relocateQuotaAccepted = ref(false);
 
 async function openRelocate(mode: "move" | "copy") {
   const entries = selectedEntries.value;
   if (entries.length === 0) return;
   relocateTraffic.value = null;
+  relocateQuotaAccepted.value = false;
   relocate.value = {
     mode,
     entries,
@@ -774,11 +777,14 @@ const downloadSummary = computed(() => {
  * after the failure.
  */
 const downloadTraffic = ref<TrafficWarning | null>(null);
+/** Ticked when the user accepts a download that will not fit the allowance. */
+const quotaAccepted = ref(false);
 
 async function askDownload(items: { fid: string; name: string; size: number; isDir: boolean }[]) {
   if (items.length === 0) return;
   downloadPrompt.value = { items, dir: defaultDownloadDir(), remember: false };
   downloadTraffic.value = null;
+  quotaAccepted.value = false;
   const bytes = items.reduce((sum, item) => sum + (item.isDir ? 0 : item.size), 0);
   downloadTraffic.value = await trafficWarning(
     app.activeProvider,
@@ -1499,6 +1505,14 @@ defineExpose({ refresh });
         <strong>{{ downloadTraffic.short }}</strong>
         {{ downloadTraffic.detail }}
       </p>
+      <label v-if="downloadTraffic?.blocking" class="dl-check">
+        <input
+          type="checkbox"
+          :checked="quotaAccepted"
+          @change="quotaAccepted = ($event.target as HTMLInputElement).checked"
+        />
+        <span>我知道文件可能下载不完整，仍然开始</span>
+      </label>
       <p class="dl-hint">
         文件夹会以同名子目录保存；同名文件自动追加 (2)、(3) 序号，不会覆盖已有内容。
       </p>
@@ -1506,7 +1520,11 @@ defineExpose({ refresh });
         <button class="btn" @click="downloadPrompt = null">取消</button>
         <button
           class="btn btn--solid"
-          :disabled="downloading || !downloadPrompt?.dir"
+          :disabled="
+            downloading ||
+            !downloadPrompt?.dir ||
+            (!!downloadTraffic?.blocking && !quotaAccepted)
+          "
           @click="confirmDownload"
         >
           {{ downloading ? "正在加入队列…" : "开始下载" }}
@@ -1549,6 +1567,14 @@ defineExpose({ refresh });
           <strong>{{ relocateTraffic.short }}</strong>
           {{ relocateTraffic.detail }}
         </p>
+        <label v-if="relocateForeign && relocateTraffic?.blocking" class="dl-check">
+          <input
+            type="checkbox"
+            :checked="relocateQuotaAccepted"
+            @change="relocateQuotaAccepted = ($event.target as HTMLInputElement).checked"
+          />
+          <span>我知道文件可能不完整，仍然复制</span>
+        </label>
         <div class="picker-bar">
           <button
             class="icon-btn"
@@ -1581,7 +1607,14 @@ defineExpose({ refresh });
       </div>
       <template #footer>
         <button class="btn" @click="relocate = null">取消</button>
-        <button class="btn btn--solid" :disabled="relocate?.busy" @click="confirmRelocate">
+        <button
+          class="btn btn--solid"
+          :disabled="
+            relocate?.busy ||
+            (relocateForeign && !!relocateTraffic?.blocking && !relocateQuotaAccepted)
+          "
+          @click="confirmRelocate"
+        >
           {{ relocateLabel }}
         </button>
       </template>
@@ -2324,6 +2357,22 @@ defineExpose({ refresh });
   font-size: 11.5px;
   line-height: 1.6;
   color: var(--text-2);
+}
+.dl-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  font-size: 11.8px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.dl-check input {
+  width: 13px;
+  height: 13px;
+  accent-color: var(--fill);
+  cursor: pointer;
 }
 .dl-warn strong {
   display: block;

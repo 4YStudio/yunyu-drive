@@ -17,18 +17,32 @@ import { app, activeProviderState, refreshQuota, requestFilesRefresh, toast } fr
 /**
  * Recycle bin of the active drive.
  *
- * Only three drives expose one: 夸克 (list/recover/remove), 123 云盘
- * (list/restore — no permanent delete) and 阿里云盘 (list/restore/clear — no
- * per-item delete). 百度网盘 and 中国移动云盘 reject the API calls outright
- * (百度 answers `errno:2` to every restore, 139 needs an `mcloud-sign` header we
- * cannot produce), so their bins are not offered at all.
+ * 夸克、123 云盘、阿里云盘、天翼云盘 and 115 网盘 expose one. 百度网盘 and
+ * 中国移动云盘 reject the API calls outright (百度 answers `errno:2` to every
+ * restore, 139 needs an `mcloud-sign` header we cannot produce), so their bins
+ * are not offered at all.
  */
 const rows = ref<RecycleEntry[]>([]);
+
+/**
+ * Drives whose backend implements `recycle_clear` (aliyun, cloud189, pan115,
+ * pan123 in `src-tauri/src/providers/`). 夸克 has no whole-bin endpoint, so the
+ * button is hidden there instead of failing after a click.
+ */
+const CAN_CLEAR = new Set<string>(["aliyun", "cloud189", "pan115", "pan123"]);
+const canClear = computed(() => CAN_CLEAR.has(app.activeProvider));
 const loading = ref(false);
 const busy = ref(false);
 const error = ref<string | null>(null);
 const selected = ref<Set<string>>(new Set());
 const confirmClear = ref(false);
+/** Typing-free acknowledgement, but the button stays dead until it is ticked. */
+const clearAccepted = ref(false);
+
+function askClear() {
+  clearAccepted.value = false;
+  confirmClear.value = true;
+}
 
 /** Entries fetched per request; the bin is read incrementally. */
 const PAGE = 100;
@@ -234,11 +248,11 @@ watch(
           <span>彻底删除</span>
         </button>
         <button
-          v-if="app.activeProvider === 'aliyun'"
+          v-if="canClear"
           class="btn btn--danger"
           :disabled="busy || !rows.length"
           title="清空整个回收站"
-          @click="confirmClear = true"
+          @click="askClear"
         >
           <span>清空</span>
         </button>
@@ -313,15 +327,25 @@ watch(
     <Modal
       :open="confirmClear"
       title="清空回收站"
-      subtitle="阿里云盘只支持一次性清空整个回收站，此操作不可撤销。"
+      :subtitle="`会把${provider.name}回收站里的内容全部永久删除，无法恢复。`"
       :width="420"
       @close="confirmClear = false"
     >
-      <p class="clear-hint">回收站里的 {{ rows.length }} 项内容都会被永久删除。</p>
+      <p class="clear-hint">
+        当前已列出 {{ rows.length }} 项，回收站里其余的条目也会一并删除。这一步没有撤销入口，也没有接口能找回。
+      </p>
+      <label class="clear-check">
+        <input
+          type="checkbox"
+          :checked="clearAccepted"
+          @change="clearAccepted = ($event.target as HTMLInputElement).checked"
+        />
+        <span>我已了解这些内容会被永久删除</span>
+      </label>
       <template #footer>
         <button class="btn" @click="confirmClear = false">取消</button>
-        <button class="btn btn--solid" :disabled="busy" @click="clearAll">
-          {{ busy ? "正在清空…" : "清空" }}
+        <button class="btn btn--solid" :disabled="busy || !clearAccepted" @click="clearAll">
+          {{ busy ? "正在清空…" : "永久清空" }}
         </button>
       </template>
     </Modal>
@@ -460,6 +484,22 @@ watch(
   margin: 0;
   font-size: 12.5px;
   color: var(--text-2);
+}
+.clear-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+  user-select: none;
+}
+.clear-check input {
+  width: 13px;
+  height: 13px;
+  accent-color: var(--fill);
+  cursor: pointer;
 }
 
 @media (max-width: 1179px) {
