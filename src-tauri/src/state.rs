@@ -67,9 +67,11 @@ impl AppState {
         let cookie = crate::config::read_cookie(&paths);
         let transfers = TransferManager::new(
             settings.concurrent_transfers,
+            settings.concurrent_uploads,
             Some(paths.transfers_file()),
         );
         crate::transfer::set_speed_limit(settings.speed_limit_kbps);
+        crate::transfer::set_upload_speed_limit(settings.speed_limit_upload_kbps);
         Ok(Arc::new(Self {
             paths,
             close_to_tray: AtomicBool::new(settings.close_to_tray),
@@ -252,10 +254,13 @@ impl AppState {
             Ordering::Relaxed,
         );
         crate::config::save_settings(&self.paths, &next)?;
-        // The concurrency limit lives in the transfer manager so queued jobs
-        // can pick it up without a restart.
+        // The concurrency limits live in the transfer manager so queued jobs
+        // can pick them up without a restart. Downloads and uploads count
+        // separately, so a queue of uploads never blocks a download.
         self.transfers.set_limit(next.concurrent_transfers);
+        self.transfers.set_upload_limit(next.concurrent_uploads);
         crate::transfer::set_speed_limit(next.speed_limit_kbps);
+        crate::transfer::set_upload_speed_limit(next.speed_limit_upload_kbps);
         Ok(next)
     }
 }

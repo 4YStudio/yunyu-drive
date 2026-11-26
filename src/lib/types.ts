@@ -214,9 +214,14 @@ export interface TransferTask {
 export interface Settings {
   downloadDir: string;
   uploadConflict: string;
+  /** Simultaneous downloads. */
   concurrentTransfers: number;
-  /** Speed cap in KiB/s; 0 means unlimited. */
+  /** Simultaneous uploads, counted apart from downloads. */
+  concurrentUploads: number;
+  /** Download speed cap in KiB/s; 0 means unlimited. */
   speedLimitKbps: number;
+  /** Upload speed cap in KiB/s; 0 means unlimited. */
+  speedLimitUploadKbps: number;
   confirmDelete: boolean;
   apiBaseUrl: string;
   showHidden: boolean;

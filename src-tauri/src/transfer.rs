@@ -310,10 +310,16 @@ pub struct TransferManager {
     /// same files and count every byte twice.
     folder_runs: Mutex<HashMap<String, u64>>,
     counter: AtomicU64,
-    /// Number of transfers currently holding a worker slot.
-    active: std::sync::Mutex<usize>,
-    /// Maximum number of simultaneous transfers (`settings.concurrent_transfers`).
-    limit: AtomicU64,
+    /// Downloads currently holding a worker slot.
+    active_downloads: std::sync::Mutex<usize>,
+    /// Uploads currently holding a worker slot. Kept apart from downloads: one
+    /// big upload should not stall a download, and the two have separate
+    /// settings.
+    active_uploads: std::sync::Mutex<usize>,
+    /// Simultaneous downloads (`settings.concurrent_transfers`).
+    limit_downloads: AtomicU64,
+    /// Simultaneous uploads (`settings.concurrent_uploads`).
+    limit_uploads: AtomicU64,
     /// Wakes queued transfers when a slot frees up or the limit changes.
     notify: Notify,
     /// Where finished tasks are remembered between launches.
@@ -324,15 +330,29 @@ pub struct TransferManager {
 /// hundred KiB while still keeping a whole large queue alive across restarts.
 const PERSIST_LIMIT: usize = 4000;
 
-/// Process-wide speed cap in bytes per second (0 = unlimited).
+/// Process-wide download cap in bytes per second (0 = unlimited).
 ///
-/// A single number rather than one per task: the point of the setting is to
-/// stop the app from eating the whole link, and every transfer shares it.
+/// A single number for all downloads: the point of the setting is to stop the
+/// app from eating the whole link. Uploads have their own cap, because a slow
+/// uplink is usually the reason to set one at all.
 static SPEED_LIMIT: AtomicU64 = AtomicU64::new(0);
 
-/// Sets the cap. `kbps` is KiB/s, matching what the settings UI shows.
+/// Upload cap in bytes per second (0 = unlimited).
+static UPLOAD_SPEED_LIMIT: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the download cap. `kbps` is KiB/s, matching what the settings UI shows.
 pub fn set_speed_limit(kbps: u64) {
     SPEED_LIMIT.store(kbps.saturating_mul(1024), Ordering::Relaxed);
+}
+
+/// Sets the upload cap (KiB/s).
+pub fn set_upload_speed_limit(kbps: u64) {
+    UPLOAD_SPEED_LIMIT.store(kbps.saturating_mul(1024), Ordering::Relaxed);
+}
+
+/// The current upload cap in bytes per second (0 = unlimited).
+pub(crate) fn upload_speed_limit_bytes() -> u64 {
+    UPLOAD_SPEED_LIMIT.load(Ordering::Relaxed)
 }
 
 /// The current cap in bytes per second (0 = unlimited).
@@ -364,11 +384,17 @@ pub(crate) async fn throttle(started: Instant, written: u64) {
 /// Releases a worker slot when the task body finishes (including early returns).
 struct SlotGuard {
     manager: Arc<TransferManager>,
+    upload: bool,
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        if let Ok(mut active) = self.manager.active.lock() {
+        let counter = if self.upload {
+            &self.manager.active_uploads
+        } else {
+            &self.manager.active_downloads
+        };
+        if let Ok(mut active) = counter.lock() {
             *active = active.saturating_sub(1);
         }
         self.manager.notify.notify_waiters();
@@ -441,14 +467,16 @@ pub struct UploadJob {
 }
 
 impl TransferManager {
-    pub fn new(concurrent: u32, store: Option<PathBuf>) -> Arc<Self> {
+    pub fn new(downloads: u32, uploads: u32, store: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             tasks: RwLock::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             folder_runs: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
-            active: std::sync::Mutex::new(0),
-            limit: AtomicU64::new(normalize_limit(concurrent)),
+            active_downloads: std::sync::Mutex::new(0),
+            active_uploads: std::sync::Mutex::new(0),
+            limit_downloads: AtomicU64::new(normalize_limit(downloads)),
+            limit_uploads: AtomicU64::new(normalize_limit(uploads)),
             notify: Notify::new(),
             store,
         })
@@ -670,15 +698,23 @@ impl TransferManager {
         });
     }
 
-    /// Applies a new concurrency limit; queued tasks pick it up immediately.
+    /// Applies a new download concurrency limit; queued tasks pick it up.
     pub fn set_limit(&self, concurrent: u32) {
-        self.limit.store(normalize_limit(concurrent), Ordering::Relaxed);
+        self.limit_downloads
+            .store(normalize_limit(concurrent), Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    /// Applies a new upload concurrency limit.
+    pub fn set_upload_limit(&self, concurrent: u32) {
+        self.limit_uploads
+            .store(normalize_limit(concurrent), Ordering::Relaxed);
         self.notify.notify_waiters();
     }
 
     /// Waits until a worker slot is free. Returns `None` when cancelled while queued.
     async fn acquire(self: &Arc<Self>, token: &CancellationToken) -> Option<SlotGuard> {
-        self.acquire_priority(token, false).await
+        self.acquire_priority(token, false, false).await
     }
 
     /// `priority` is the "置顶" case: a pinned job may take one slot beyond the
@@ -688,22 +724,29 @@ impl TransferManager {
         self: &Arc<Self>,
         token: &CancellationToken,
         priority: bool,
+        upload: bool,
     ) -> Option<SlotGuard> {
         loop {
             if token.is_cancelled() {
                 return None;
             }
             {
-                let mut active = match self.active.lock() {
+                let (counter, configured) = if upload {
+                    (&self.active_uploads, &self.limit_uploads)
+                } else {
+                    (&self.active_downloads, &self.limit_downloads)
+                };
+                let mut active = match counter.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let limit = self.limit.load(Ordering::Relaxed);
+                let limit = configured.load(Ordering::Relaxed);
                 let ceiling = if priority { limit + 1 } else { limit };
                 if (*active as u64) < ceiling {
                     *active += 1;
                     return Some(SlotGuard {
                         manager: Arc::clone(self),
+                        upload,
                     });
                 }
             }
@@ -2079,7 +2122,7 @@ impl TransferManager {
         let manager = Arc::clone(self);
         let handle = app.clone();
         tokio::spawn(async move {
-            let Some(_slot) = manager.acquire_priority(&token, pinned).await else {
+            let Some(_slot) = manager.acquire_priority(&token, pinned, false).await else {
                 manager.cancels.lock().await.remove(&id);
                 return;
             };
@@ -2327,7 +2370,7 @@ impl TransferManager {
         let manager = Arc::clone(self);
         let handle = app.clone();
         tokio::spawn(async move {
-            let Some(_slot) = manager.acquire_priority(&token, pinned).await else {
+            let Some(_slot) = manager.acquire_priority(&token, pinned, true).await else {
                 manager.cancels.lock().await.remove(&id);
                 return;
             };
@@ -3264,10 +3307,10 @@ impl UploadSink for ThrottledSink {
     fn progress(&self, bytes: u64) {
         let cap = match self.cap {
             Some(own) => {
-                let global = SPEED_LIMIT.load(Ordering::Relaxed);
+                let global = upload_speed_limit_bytes();
                 if global == 0 { own } else { global.min(own) }
             }
-            None => SPEED_LIMIT.load(Ordering::Relaxed),
+            None => upload_speed_limit_bytes(),
         };
         if cap > 0 && bytes > 0 {
             let budget = Duration::from_secs_f64(bytes as f64 / cap as f64);
@@ -4362,13 +4405,13 @@ mod tests {
         tokio::fs::write(&part, vec![0u8; 400]).await.unwrap();
         let store = dir.join("transfers.json");
 
-        let manager = TransferManager::new(3, Some(store.clone()));
+        let manager = TransferManager::new(3, 3, Some(store.clone()));
         let task = sample("t1", "running", Some(part.to_str().unwrap()));
         manager.insert(task.clone()).await;
         manager.persist().await;
 
         // A fresh manager, as after a restart.
-        let restored_manager = TransferManager::new(3, Some(store));
+        let restored_manager = TransferManager::new(3, 3, Some(store));
         let saved = tokio::fs::read_to_string(dir.join("transfers.json")).await.unwrap();
         assert!(saved.contains("\"running\""), "running jobs are persisted too");
 
@@ -5683,7 +5726,7 @@ mod live_concurrency_probe {
 
         std::fs::create_dir_all(root.join("state")).expect("mkdir state");
         let store = root.join("state").join("transfers.json");
-        let manager = TransferManager::new(3, Some(store));
+        let manager = TransferManager::new(3, 3, Some(store));
 
         let mut rounds = Vec::new();
         if bigs.len() == BIG_COUNT {
@@ -5950,7 +5993,7 @@ mod live_upload_folder_probe {
             .to_string();
         println!("[probe] remote={remote_name} local_files={expected}");
 
-        let manager = TransferManager::new(4, None);
+        let manager = TransferManager::new(4, 4, None);
         let dir = UploadDirRef {
             provider: which.clone(),
             pdir_fid: remote_root.clone(),
