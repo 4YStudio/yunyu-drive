@@ -28,9 +28,22 @@ const FINISHED = ["done", "failed", "canceled"];
 
 const all = computed(() => app.transfers);
 
+/**
+ * Order: what is moving now, then what waits, then what is over — newest first
+ * inside each group. Rows therefore move up as they start and sink once they
+ * finish, instead of the list being chronological only.
+ */
+const STATUS_RANK: Record<string, number> = {
+  running: 0,
+  hashing: 0,
+  queued: 1,
+  paused: 1,
+};
+const rank = (status: string) => STATUS_RANK[status] ?? 2;
+
 const visible = computed(() => {
   const list = [...all.value];
-  list.sort((a, b) => b.createdAt - a.createdAt);
+  list.sort((a, b) => rank(a.status) - rank(b.status) || b.createdAt - a.createdAt);
   return list.filter((task) => {
     if (kindFilter.value === "cross" && !isCross(task)) return false;
     else if (kindFilter.value === "upload" && task.kind !== "upload") return false;

@@ -188,6 +188,16 @@ const WALK_BACKOFF_MS: u64 = 1_500;
 const FOLDER_WINDOW: usize = 24;
 /// How often a folder task re-reads its children and announces its progress.
 const FOLDER_TICK_MS: u64 = 400;
+
+/// Sort bucket for the transfer list: 0 = running, 1 = waiting (queued or
+/// paused), 2 = finished. Mirrored by `STATUS_RANK` in TransfersView.vue.
+fn status_rank(status: &str) -> u8 {
+    match status {
+        "running" | "hashing" => 0,
+        "queued" | "paused" => 1,
+        _ => 2,
+    }
+}
 /// Depth limit for the walk; deeper trees almost always mean a symlink loop.
 const FOLDER_MAX_DEPTH: usize = 32;
 
@@ -555,9 +565,13 @@ impl TransferManager {
             .filter(|task| !task.hidden)
             .cloned()
             .collect();
-        all.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+        // What is moving comes first, then what waits, then what is over; inside
+        // a group the newest task wins. Kept in step with the UI's own sort so a
+        // reload does not reshuffle the rows.
+        all.sort_by_key(|t| (status_rank(&t.status), std::cmp::Reverse(t.created_at)));
         all
     }
+
 
     async fn next_id(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);

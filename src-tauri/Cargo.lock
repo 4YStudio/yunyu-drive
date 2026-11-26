@@ -6666,6 +6666,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "http",
  "k256",
  "libquarkpan",
  "lz4_flex",
