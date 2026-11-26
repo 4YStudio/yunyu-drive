@@ -437,6 +437,34 @@ const theme = computed({
           </div>
         </div>
       </section>
+
+      <!-- diagnostics: deliberately tucked away, these are not user features -->
+      <section class="group">
+        <h2 class="group-title">诊断</h2>
+        <div class="card">
+          <div class="row">
+            <div class="row-copy">
+              <span class="row-label">运行日志</span>
+              <span class="row-hint">控制台输出、每次前后端调用与错误，排查问题时复制给开发者</span>
+            </div>
+            <button class="btn btn--ghost" @click="app.view = 'logs'">
+              <Icon name="list" :size="13" />
+              <span>查看</span>
+            </button>
+          </div>
+          <div class="divider" />
+          <div class="row">
+            <div class="row-copy">
+              <span class="row-label">网络请求</span>
+              <span class="row-hint">网盘 HTTP 调用的请求头/体与响应头/体，查看网盘拒绝上传的原因</span>
+            </div>
+            <button class="btn btn--ghost" @click="app.view = 'net'">
+              <Icon name="globe" :size="13" />
+              <span>查看</span>
+            </button>
+          </div>
+        </div>
+      </section>
     </div>
   </section>
 </template>

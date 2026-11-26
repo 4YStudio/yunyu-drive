@@ -600,9 +600,32 @@ pub async fn account_info(
     Ok(Some(info))
 }
 
+/// The shared client, wrapped so its calls land in the network panel.
+pub fn http_logged(tag: &'static str) -> AppResult<crate::net::Http> {
+    Ok(crate::net::Http::new(http()?, tag))
+}
+
+/// Anything that can hand out a `reqwest::Client`: a bare client (share code
+/// builds its own) or the recording [`crate::net::Http`] the drives use.
+pub trait AsHttpClient {
+    fn as_client(&self) -> &reqwest::Client;
+}
+
+impl AsHttpClient for reqwest::Client {
+    fn as_client(&self) -> &reqwest::Client {
+        self
+    }
+}
+
+impl AsHttpClient for crate::net::Http {
+    fn as_client(&self) -> &reqwest::Client {
+        self.client()
+    }
+}
+
 /// Downloads an avatar and inlines it as a `data:` URL — the app CSP does not
 /// allow remote images.
-pub async fn fetch_avatar(client: &reqwest::Client, url: &str) -> Option<String> {
+pub async fn fetch_avatar<C: AsHttpClient + ?Sized>(client: &C, url: &str) -> Option<String> {
     fetch_image(client, url, None).await
 }
 
@@ -611,13 +634,13 @@ pub async fn fetch_avatar(client: &reqwest::Client, url: &str) -> Option<String>
 /// Every drive's preview host is picky about it: 阿里云盘 answers 403 without
 /// `https://www.aliyundrive.com/`, and 百度/139/123 have their own. The referer
 /// is derived from the host so callers do not have to know.
-pub async fn fetch_image(
-    client: &reqwest::Client,
+pub async fn fetch_image<C: AsHttpClient + ?Sized>(
+    client: &C,
     url: &str,
     referer: Option<&str>,
 ) -> Option<String> {
     let url = decorate_avatar(url);
-    let mut request = client.get(&url);
+    let mut request = client.as_client().get(&url);
     if let Some(referer) = referer.or_else(|| image_referer(&url)) {
         request = request.header(reqwest::header::REFERER, referer);
     }
@@ -974,7 +997,7 @@ pub async fn stream_to_file(
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncWriteExt;
 
-    let client = http()?;
+    let client = crate::net::Http::new(http()?, "share");
     // The plan, not the length: the segmented engine pre-allocates the file to
     // its full size, so a leftover `.part` can be "full length" with only a
     // fraction of the bytes in it. Resuming at that offset would ask the CDN
@@ -983,7 +1006,7 @@ pub async fn stream_to_file(
     if start == 0 {
         let _ = tokio::fs::File::create(part).await;
     }
-    let mut request = client.get(url);
+    let mut request = client.get(url).streaming();
     for (name, value) in headers {
         request = request.header(name.as_str(), value.as_str());
     }

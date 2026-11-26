@@ -1044,11 +1044,14 @@ impl DriveProvider for Yun139Provider {
         ) else {
             return Ok(None);
         };
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
+        let client = crate::net::Http::new(
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?,
+            "139",
+        );
         let Ok(res) = client.post(url).headers(headers).json(&body).send().await else {
             return Ok(None);
         };
@@ -1088,12 +1091,15 @@ impl DriveProvider for Yun139Provider {
             return Err(AppError::new("没有拿到下载地址"));
         }
         // 139's CDN honours Range, so resume works the same as everywhere else.
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .read_timeout(std::time::Duration::from_secs(60))
-            .build()
-            .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
-        let mut request = client.get(&url);
+        let client = crate::net::Http::new(
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .read_timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?,
+            "139",
+        );
+        let mut request = client.get(&url).streaming();
         if start > 0 {
             request = request.header(reqwest::header::RANGE, format!("bytes={start}-"));
         }
@@ -1217,11 +1223,14 @@ impl DriveProvider for Yun139Provider {
         }
 
         sink.phase("uploading");
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .timeout(std::time::Duration::from_secs(600))
-            .build()
-            .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
+        let client = crate::net::Http::new(
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(15))
+                .timeout(std::time::Duration::from_secs(600))
+                .build()
+                .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?,
+            "139",
+        );
         let mut file = tokio::fs::File::open(local)
             .await
             .map_err(|e| AppError::new(format!("打开本地文件失败：{e}")))?;

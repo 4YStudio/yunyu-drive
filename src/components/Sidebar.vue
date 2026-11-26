@@ -57,7 +57,6 @@ const items = computed<{ view: View; label: string; icon: IconName }[]>(() => {
   }
   list.push(
     { view: "transfers", label: "传输列表", icon: "arrow-up-down" },
-    { view: "logs", label: "日志", icon: "list" },
     { view: "settings", label: "设置", icon: "settings" },
   );
   return list;

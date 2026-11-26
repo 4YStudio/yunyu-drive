@@ -23,6 +23,7 @@ import type {
   ShareRecord,
   TransferTask,
   LogEntry,
+  NetRecord,
 } from "@/lib/types";
 
 /**
@@ -55,6 +56,15 @@ export const api = {
     rawInvoke<LogEntry[]>("logs_tail", { since, limit }),
   logsClear: () => rawInvoke<void>("logs_clear"),
   logsFile: () => rawInvoke<string | null>("logs_file"),
+  /**
+   * Recorded HTTP requests newer than `since`, oldest first.
+   *
+   * `rawInvoke` again: the network panel polls this, and the wrapper would log
+   * every poll into the console it sits next to.
+   */
+  netTail: (since: number, limit = 200, failedOnly = false) =>
+    rawInvoke<NetRecord[]>("net_tail", { since, limit, failedOnly }),
+  netClear: () => rawInvoke<void>("net_clear"),
   /** Login state of every drive, for the sidebar switcher. */
   authStates: () => invoke<ProviderAuthState[]>("auth_states"),
   /**

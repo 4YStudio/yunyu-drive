@@ -13,6 +13,7 @@ import MySharesView from "@/views/MySharesView.vue";
 import TransfersView from "@/views/TransfersView.vue";
 import SettingsView from "@/views/SettingsView.vue";
 import LogsView from "@/views/LogsView.vue";
+import NetView from "@/views/NetView.vue";
 import ShareView from "@/views/ShareView.vue";
 import LoginView from "@/views/LoginView.vue";
 import { BRAND } from "@/lib/brand";
@@ -33,6 +34,7 @@ const currentView = computed(() => {
     transfers: TransfersView,
     settings: SettingsView,
     logs: LogsView,
+    net: NetView,
     login: LoginView,
   } as const;
   return map[app.view];
@@ -226,6 +228,12 @@ async function retryBoot() {
   display: grid;
   place-items: center;
   background: var(--bg);
+  /* A splash never needs clicks, and a stuck exit animation (motion-v on
+     WebKitGTK can leave the node behind) must not swallow them. */
+  pointer-events: none;
+}
+.boot--error {
+  pointer-events: auto;
 }
 .boot-inner {
   display: flex;

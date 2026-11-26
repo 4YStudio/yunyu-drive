@@ -237,7 +237,7 @@ impl DriveProvider for QuarkProvider {
         if self.cookie.trim().is_empty() {
             return Ok(None);
         }
-        let res = crate::share::http()?
+        let res = crate::share::http_logged("quark")?
             .get("https://pan.quark.cn/account/info?fr=pc&platform=pc")
             .headers(crate::share::quark_headers(&self.cookie))
             .send()
@@ -257,7 +257,7 @@ impl DriveProvider for QuarkProvider {
         };
         let url = text(&data, "avatarUri");
         if !url.is_empty() {
-            info.avatar = crate::share::fetch_avatar(&crate::share::http()?, &url).await;
+            info.avatar = crate::share::fetch_avatar(&crate::share::http_logged("quark")?, &url).await;
         }
         *self.account.write().await = Some(info.clone());
         Ok(Some(info))
@@ -617,7 +617,7 @@ impl DriveProvider for QuarkProvider {
         }
         let author = data.get("author").cloned().unwrap_or(Value::Null);
         let owner_avatar = match author.get("avatar_url").and_then(|v| v.as_str()) {
-            Some(url) => crate::share::fetch_avatar(&crate::share::http()?, url).await,
+            Some(url) => crate::share::fetch_avatar(&crate::share::http_logged("quark")?, url).await,
             None => None,
         };
         Ok(ShareSession {
@@ -800,7 +800,7 @@ impl DriveProvider for QuarkProvider {
         // adapter makes. `/1/clouddrive/member` also carries the membership
         // tier; we only read the two capacity fields.
         let url = format!("{QUOTA_BASE}/1/clouddrive/member?pr=ucpro&fr=pc&uc_param_str=");
-        let response = reqwest::Client::new()
+        let response = crate::share::http_logged("quark")?
             .get(&url)
             .header(reqwest::header::COOKIE, &self.cookie)
             .header(
@@ -890,7 +890,7 @@ impl DriveProvider for QuarkProvider {
         }
         // Unlike list/recover, this one rejects the request without an Origin
         // header (`401 require login [guest]`).
-        let res = crate::share::http()?
+        let res = crate::share::http_logged("quark")?
             .post(format!(
                 "{QUARK_API}/1/clouddrive/file/recycle/remove?pr=ucpro&fr=pc"
             ))
@@ -1091,7 +1091,7 @@ const QUOTA_BASE: &str = "https://drive-pc.quark.cn";
 const QUARK_API: &str = "https://drive.quark.cn";
 
 async fn post_json(url: &str, cookie: &str, body: &Value) -> AppResult<Value> {
-    let res = crate::share::http()?
+    let res = crate::share::http_logged("quark")?
         .post(url)
         .headers(crate::share::quark_headers(cookie))
         .json(body)
@@ -1109,7 +1109,7 @@ async fn post_json(url: &str, cookie: &str, body: &Value) -> AppResult<Value> {
 }
 
 async fn get_json(url: &str, cookie: &str, query: &[(&str, String)]) -> AppResult<Value> {
-    let res = crate::share::http()?
+    let res = crate::share::http_logged("quark")?
         .get(url)
         .headers(crate::share::quark_headers(cookie))
         .query(query)

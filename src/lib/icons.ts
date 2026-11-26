@@ -12,7 +12,7 @@ export type IconName =
   | "arrow-down" | "arrow-up-down" | "keyboard" | "palette" | "database" | "shield"
   | "window-minimize" | "window-maximize" | "window-restore"
   | "window-close" | "grip" | "share" | "link" | "save" | "user-circle"
-  | "move" | "retry" | "bell" | "tray" | "file";
+  | "move" | "retry" | "bell" | "tray" | "file" | "globe";
 
 export const ICON_PATHS: Record<IconName, string> = {
   search: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14ZM20 20l-4.2-4.2",
@@ -48,6 +48,7 @@ export const ICON_PATHS: Record<IconName, string> = {
   logout: "M15 17l5-5-5-5M20 12H9M12 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h6",
   sparkles: "M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3ZM18.5 15l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1Z",
   copy: "M9 9h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2ZM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1",
+  globe: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18ZM3 12h18M12 3c2.5 2.4 4 5.6 4 9s-1.5 6.6-4 9c-2.5-2.4-4-5.6-4-9s1.5-6.6 4-9Z",
   filter: "M4 6h16M7 12h10M10 18h4",
   pause: "M9 5v14M15 5v14",
   play: "M7 4.5v15l13-7.5-13-7.5Z",

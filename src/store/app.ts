@@ -20,6 +20,7 @@ export type View =
   | "transfers"
   | "settings"
   | "logs"
+  | "net"
   | "login"
   | "share";
 export type ThemeMode = "light" | "dark" | "system";

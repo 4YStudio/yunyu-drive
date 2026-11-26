@@ -139,9 +139,9 @@ impl Cloud189Provider {
         Ok(Self::new(creds, path.to_string_lossy().to_string()))
     }
 
-    fn http(&self) -> AppResult<reqwest::Client> {
+    fn http(&self) -> AppResult<crate::net::Http> {
         if let Some(client) = self.client.get() {
-            return Ok(client.clone());
+            return Ok(crate::net::Http::new(client.clone(), "cloud189"));
         }
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
@@ -149,7 +149,7 @@ impl Cloud189Provider {
             .build()
             .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
         let _ = self.client.set(client.clone());
-        Ok(client)
+        Ok(crate::net::Http::new(client, "cloud189"))
     }
 
     async fn persist(&self) {
@@ -405,14 +405,18 @@ impl Cloud189Provider {
         };
         // The signed URL answers with a 302 to a short-lived CDN link; the
         // reqwest default would follow it, but then the Range header is lost.
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
+        let client = crate::net::Http::new(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?,
+            "cloud189",
+        );
         let res = client
             .get(&url)
+            .streaming()
             .send()
             .await
             .map_err(|e| net_error("获取下载地址", &e))?;
@@ -1037,14 +1041,18 @@ impl Cloud189Provider {
         } else {
             url
         };
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
+        let client = crate::net::Http::new(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .read_timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?,
+            "cloud189",
+        );
         let res = client
             .get(&url)
+            .streaming()
             .send()
             .await
             .map_err(|e| net_error("获取下载地址", &e))?;

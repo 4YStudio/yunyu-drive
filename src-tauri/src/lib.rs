@@ -6,6 +6,7 @@ mod engine;
 mod error;
 mod logging;
 mod login;
+mod net;
 mod paths;
 mod providers;
 mod share;
@@ -235,6 +236,8 @@ pub fn run() {
             logging::logs_clear,
             logging::logs_file,
             logging::log_emit,
+            logging::net_tail,
+            logging::net_clear,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

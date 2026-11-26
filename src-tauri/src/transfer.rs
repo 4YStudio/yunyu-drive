@@ -1250,6 +1250,9 @@ impl TransferManager {
         let mut stored: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let mut done_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut failed_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Keeps the first few names so the folder's error can say *which* files
+        // the drive refused, not just how many.
+        let mut failed_names: Vec<String> = Vec::new();
         let mut skipped_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut first_error: Option<String> = None;
         let mut last_bytes = 0u64;
@@ -1313,7 +1316,10 @@ impl TransferManager {
                         live.push((child.id.clone(), key, file.size));
                     }
                     Err(err) => {
-                        failed_files.insert(key);
+                        crate::ylog!("{} 上传失败：{err}", file.name);
+                        if failed_files.insert(key.clone()) && failed_names.len() < 8 {
+                            failed_names.push(key);
+                        }
                         if first_error.is_none() {
                             first_error = Some(err.to_string());
                         }
@@ -1341,7 +1347,14 @@ impl TransferManager {
                         if unsupported {
                             skipped_files.insert(key.clone());
                         } else {
-                            failed_files.insert(key.clone());
+                            crate::ylog!(
+                                "{} 上传失败：{}",
+                                key,
+                                child.error.clone().unwrap_or_else(|| "未知原因".to_string())
+                            );
+                            if failed_files.insert(key.clone()) && failed_names.len() < 8 {
+                                failed_names.push(key.clone());
+                            }
                         }
                         stored.insert(key, child.transferred.min(size));
                         if first_error.is_none() && !unsupported {
@@ -1402,6 +1415,25 @@ impl TransferManager {
             let reason = first_error
                 .clone()
                 .unwrap_or_else(|| "未知原因".to_string());
+            // Name the files: "install.sh、setup.bat 等 3 个文件" tells the user
+            // it was the drive's file-type rule, not a flaky network.
+            let names = {
+                let mut shown: Vec<String> = failed_names
+                    .iter()
+                    .map(|key| {
+                        key.rsplit('/')
+                            .next()
+                            .unwrap_or(key.as_str())
+                            .to_string()
+                    })
+                    .collect();
+                shown.truncate(3);
+                if bad as usize > shown.len() {
+                    format!("{} 等 {bad} 个文件", shown.join("、"))
+                } else {
+                    shown.join("、")
+                }
+            };
             if bad == 0 {
                 t.status = "done".to_string();
                 t.children_failed = 0;
@@ -1411,11 +1443,11 @@ impl TransferManager {
                 // count + reason as a note instead of painting the whole row red.
                 t.status = "done".to_string();
                 t.error = Some(format!(
-                    "{bad} 个文件上传失败（成功 {ok} 个，跳过 {skipped} 个）：{reason}，可以点继续重试这些文件"
+                    "{names} 上传失败（成功 {ok} 个，跳过 {skipped} 个）：{reason}，可以点继续重试这些文件"
                 ));
             } else {
                 t.status = "failed".to_string();
-                t.error = Some(format!("{bad} 个文件上传失败：{reason}"));
+                t.error = Some(format!("{names} 上传失败：{reason}"));
             }
         })
         .await;

@@ -177,6 +177,22 @@ pub fn logs_file() -> Option<String> {
     path().map(|path| path.display().to_string())
 }
 
+/// Recorded requests newer than `since`, for the network panel.
+#[tauri::command]
+pub fn net_tail(
+    since: u64,
+    limit: Option<usize>,
+    failed_only: Option<bool>,
+) -> Vec<crate::net::Record> {
+    crate::net::tail(since, limit.unwrap_or(200), failed_only.unwrap_or(false))
+}
+
+/// Empties the recorded requests (the text log is untouched).
+#[tauri::command]
+pub fn net_clear() {
+    crate::net::clear();
+}
+
 /// A line from the frontend: `console.*`, a Vue error, or a finished command.
 #[tauri::command]
 pub fn log_emit(level: String, target: String, message: String) {

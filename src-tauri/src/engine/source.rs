@@ -138,11 +138,11 @@ impl Source for ShareSource {
             Err(result) => return result,
         };
         let client = match crate::share::http() {
-            Ok(client) => client,
+            Ok(client) => crate::net::Http::new(client, "download"),
             Err(err) => return RangeResult::Failed(err),
         };
 
-        let mut request = client.get(&link.url);
+        let mut request = client.get(&link.url).streaming();
         for (name, value) in &link.headers {
             request = request.header(name.as_str(), value.as_str());
         }

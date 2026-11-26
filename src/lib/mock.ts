@@ -7,6 +7,7 @@
  * instead: it mirrors `lib/api.ts` exactly and keeps state in memory.
  */
 import type {
+  NetRecord,
   AccountInfo,
   AppInfo,
   AuthStatus,
@@ -459,6 +460,49 @@ export const mockApi = {
     ];
     return lines.filter((line) => line.seq > since).slice(0, limit);
   },
+  /** A failed upload plus a healthy call, so the network panel has substance. */
+  netTail: async (since: number, limit = 200, failedOnly = false): Promise<NetRecord[]> => {
+    const rows: NetRecord[] = [
+      {
+        seq: 1,
+        at: "10:24:02.310",
+        tag: "quark",
+        method: "GET",
+        url: "https://drive-m.quark.cn/1/clouddrive/file/sort?pr=ucpro&fr=pc&pdir_fid=0",
+        status: 200,
+        ms: 128,
+        reqHeaders: [
+          ["cookie", "…（已脱敏）"],
+          ["user-agent", "Mozilla/5.0 (X11; Linux x86_64)"],
+        ],
+        reqBody: "",
+        respHeaders: [["content-type", "application/json"]],
+        respBody: '{\n  "status": 200,\n  "code": 0,\n  "data": { "list": [ … 128 项 ] }\n}',
+        bytes: 18_422,
+        error: null,
+      },
+      {
+        seq: 2,
+        at: "10:25:41.802",
+        tag: "quark",
+        method: "POST",
+        url: "https://drive-pc.quark.cn/1/clouddrive/file/upload/finish?pr=ucpro&fr=pc",
+        status: 200,
+        ms: 341,
+        reqHeaders: [
+          ["content-type", "application/json"],
+          ["cookie", "…（已脱敏）"],
+        ],
+        reqBody: '{\n  "fid": "a1b2c3",\n  "obj_key": "…",\n  "file_name": "install.sh"\n}',
+        respHeaders: [["content-type", "application/json"]],
+        respBody: '{\n  "status": 200,\n  "code": 23018,\n  "message": "该类型文件不允许分享和保存",\n  "data": null\n}',
+        bytes: 118,
+        error: null,
+      },
+    ];
+    return rows.filter((row) => row.seq > since && (!failedOnly || row.status === null || row.status >= 400 || row.respBody.includes('"code":23018'))).slice(0, limit);
+  },
+  netClear: async (): Promise<void> => {},
   logsClear: async (): Promise<void> => {},
   logsFile: async (): Promise<string | null> => "/home/henvei/.local/share/yunyu-drive/logs/app.log",
   recycleList: async (provider: string): Promise<RecycleEntry[]> => {

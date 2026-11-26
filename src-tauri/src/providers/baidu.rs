@@ -163,9 +163,9 @@ impl BaiduProvider {
         Ok(())
     }
 
-    fn http(&self) -> AppResult<reqwest::Client> {
+    fn http(&self) -> AppResult<crate::net::Http> {
         if let Some(client) = self.client.get() {
-            return Ok(client.clone());
+            return Ok(crate::net::Http::new(client.clone(), "baidu"));
         }
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
@@ -174,7 +174,7 @@ impl BaiduProvider {
             .build()
             .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
         let _ = self.client.set(client.clone());
-        Ok(client)
+        Ok(crate::net::Http::new(client, "baidu"))
     }
 
     async fn cookie(&self) -> String {

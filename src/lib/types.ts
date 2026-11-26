@@ -313,3 +313,25 @@ export interface LogEntry {
   target: string;
   message: string;
 }
+
+/** One recorded HTTP request (backend `net.rs`), for the network panel. */
+export interface NetRecord {
+  seq: number;
+  /** `HH:MM:SS.mmm`, local time. */
+  at: string;
+  /** Who made the call: `cloud189`, `quark`, `download`, … */
+  tag: string;
+  method: string;
+  /** Redacted: secret query values are already masked. */
+  url: string;
+  status: number | null;
+  /** Milliseconds from send to the last byte this recording waited for. */
+  ms: number;
+  reqHeaders: [string, string][];
+  reqBody: string;
+  respHeaders: [string, string][];
+  respBody: string;
+  /** Response body size, or the transferred size when it was streamed. */
+  bytes: number;
+  error: string | null;
+}

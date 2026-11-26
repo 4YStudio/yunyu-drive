@@ -6,7 +6,7 @@ import { api } from "@/lib/backend";
 import { copyText } from "@/lib/clipboard";
 import { errText } from "@/lib/format";
 import type { LogEntry } from "@/lib/types";
-import { toast } from "@/store/app";
+import { app, toast } from "@/store/app";
 
 /**
  * In-app console, the app's answer to "open DevTools".
@@ -169,6 +169,10 @@ onDeactivated(stop);
         </p>
       </div>
       <div class="actions">
+        <button class="btn btn--ghost" @click="app.view = 'settings'">
+          <Icon name="chevron-left" :size="13" />
+          <span>返回设置</span>
+        </button>
         <button class="btn btn--ghost" :disabled="loading" @click="load">
           <Icon name="refresh" :size="13" />
           <span>刷新</span>

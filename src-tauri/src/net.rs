@@ -90,6 +90,7 @@ pub fn clear() {
     }
 }
 
+#[allow(dead_code)]
 pub fn count() -> u64 {
     records().lock().map(|b| b.len() as u64).unwrap_or(0)
 }
@@ -97,22 +98,47 @@ pub fn count() -> u64 {
 impl Record {
     /// Anything the network panel should paint red: a transport error, an HTTP
     /// error status, or an API envelope that says it failed.
+    ///
+    /// The drives answer `200` with a failure envelope (`{"code":23018,
+    /// "message":"该类型文件不允许分享和保存"}`), which is exactly the case a
+    /// user needs to see when an upload is refused, so the body is parsed
+    /// rather than guessed at.
     pub fn is_failure(&self) -> bool {
         if self.error.is_some() {
             return true;
         }
-        match self.status {
-            Some(code) if code >= 400 => true,
-            // Drives answer `200` with `{"state":false}` or `{"code":-1}`, so
-            // the body has to have a say too.
-            _ => {
-                let body = self.resp_body.as_str();
-                body.contains("\"state\":false")
-                    || body.contains("\"success\":false")
-                    || body.contains("\"code\":-1")
-                    || body.contains("\"res_code\":-")
-            }
+        if self.status.is_some_and(|code| code >= 400) {
+            return true;
         }
+        let body = self.resp_body.as_str();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+            if value.get("state").and_then(|v| v.as_bool()) == Some(false)
+                || value.get("success").and_then(|v| v.as_bool()) == Some(false)
+            {
+                return true;
+            }
+            let bad_code = |key: &str| match value.get(key) {
+                Some(serde_json::Value::Number(number)) => {
+                    number.as_i64().is_some_and(|code| code != 0 && code != 200)
+                }
+                Some(serde_json::Value::String(text)) => {
+                    let text = text.trim();
+                    !text.is_empty() && text != "0" && text != "200"
+                }
+                _ => false,
+            };
+            // `code` is the one every drive uses; the other three are the
+            // provider-specific spellings of the same thing.
+            return bad_code("code")
+                || bad_code("res_code")
+                || bad_code("errno")
+                || bad_code("error_code");
+        }
+        // A clipped or non-JSON body falls back to looking at the shape.
+        body.contains("\"state\":false")
+            || body.contains("\"success\":false")
+            || body.contains("\"code\":-")
+            || body.contains("\"res_code\":-")
     }
 }
 
@@ -268,6 +294,7 @@ impl Http {
         self.call(Method::PUT, url)
     }
 
+    #[allow(dead_code)]
     pub fn delete(&self, url: impl reqwest::IntoUrl) -> Call {
         self.call(Method::DELETE, url)
     }
@@ -290,6 +317,14 @@ impl Http {
             streaming: false,
             started: Instant::now(),
         }
+    }
+}
+
+impl std::ops::Deref for Http {
+    type Target = reqwest::Client;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
     }
 }
 
@@ -358,16 +393,19 @@ impl Call {
         self
     }
 
+    #[allow(dead_code)]
     pub fn bearer_auth<T: std::fmt::Display>(mut self, token: T) -> Self {
         self.inner = self.inner.bearer_auth(token);
         self
     }
 
+    #[allow(dead_code)]
     pub fn basic_auth<U: std::fmt::Display>(mut self, user: U, password: Option<&str>) -> Self {
         self.inner = self.inner.basic_auth(user, password);
         self
     }
 
+    #[allow(dead_code)]
     pub fn build(self) -> reqwest::Result<reqwest::Request> {
         self.inner.build()
     }
@@ -428,6 +466,7 @@ impl Call {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn capture(
     tag: &'static str,
     method: &Method,
@@ -538,7 +577,7 @@ fn empty_like(status: reqwest::StatusCode, headers: HeaderMap) -> Response {
     Response::from(
         builder
             .body(Body::from(Vec::new()))
-            .unwrap_or_else(|_| http::Response::new(Body::empty())),
+            .unwrap_or_else(|_| http::Response::new(Body::from(Vec::new()))),
     )
 }
 
@@ -590,5 +629,59 @@ mod tests {
         assert!(record.is_failure());
         record.resp_body = "{\"state\":true}".into();
         assert!(!record.is_failure());
+    }
+
+    /// End to end: a real socket, a real response, and the record that lands in
+    /// the ring. This is the contract the panel depends on, so it is worth a
+    /// test that does not mock the transport.
+    #[tokio::test]
+    async fn records_a_completed_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let body = "{\"code\":23018,\"message\":\"该类型文件不允许分享和保存\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+
+        clear();
+        let client = reqwest::Client::new();
+        let http = Http::new(client, "probe");
+        let res = http
+            .post(format!("http://{addr}/b/api/file/upload?token=secret-value"))
+            .header("authorization", "Bearer abcdefghijklmnop")
+            .json(&serde_json::json!({ "file_name": "install.sh" }))
+            .send()
+            .await
+            .expect("request should complete");
+        assert_eq!(res.status(), 200);
+        let body = res.text().await.unwrap();
+        assert!(body.contains("23018"), "body should be readable: {body}");
+
+        let rows = tail(0, 10, false);
+        let row = rows.last().expect("one record");
+        assert_eq!(row.tag, "probe");
+        assert_eq!(row.status, Some(200));
+        assert!(row.url.contains("token="), "{}", row.url);
+        assert!(!row.url.contains("secret-value"), "{}", row.url);
+        assert!(row.resp_body.contains("23018"));
+        assert!(row.req_body.contains("install.sh"));
+        let auth = row
+            .req_headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        assert!(!auth.contains("abcdefghijklmnop"), "{auth}");
+        assert!(row.is_failure(), "a 200 with code 23018 is a failure");
     }
 }

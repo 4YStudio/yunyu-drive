@@ -157,13 +157,14 @@ impl Pan123Provider {
         Ok(format!("Bearer {token}"))
     }
 
-    fn http(&self) -> AppResult<reqwest::Client> {
+    fn http(&self) -> AppResult<crate::net::Http> {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             // No total timeout: this client also streams downloads.
             .read_timeout(std::time::Duration::from_secs(90))
             .build()
             .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))
+            .map(|client| crate::net::Http::new(client, "123pan"))
     }
 
     /// Headers the Android client sends; the API rejects requests without them.
@@ -514,15 +515,19 @@ struct Pan123Entry {
 /// `redirect_url`, or "this url already serves the file".
 async fn resolve_cdn_url(raw: &str) -> AppResult<String> {
     let mut url = unproxy(raw);
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?;
+    let client = crate::net::Http::new(
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| AppError::new(format!("网络初始化失败：{e}")))?,
+        "123pan",
+    );
     for _ in 0..3 {
         let res = client
             .get(&url)
+            .streaming()
             // The edge host rejects requests without a referer.
             .header(reqwest::header::REFERER, "https://yun.123pan.com/")
             .header(reqwest::header::USER_AGENT, "Mozilla/5.0")
