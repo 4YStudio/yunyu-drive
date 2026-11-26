@@ -124,6 +124,107 @@ onDeactivated(() => {
   }
 });
 
+/** Right-click menu: the actions that belong to one specific row. */
+const menu = ref<{ task: TransferTask; x: number; y: number } | null>(null);
+
+function openMenu(ev: MouseEvent, task: TransferTask) {
+  // Keep the menu inside the window: opening it near the right edge used to
+  // clip the labels.
+  const width = 178;
+  const height = 196;
+  menu.value = {
+    task,
+    x: Math.min(ev.clientX, window.innerWidth - width - 8),
+    y: Math.min(ev.clientY, window.innerHeight - height - 8),
+  };
+}
+
+function closeMenu() {
+  menu.value = null;
+}
+
+async function togglePin(task: TransferTask) {
+  closeMenu();
+  try {
+    await api.transferPin(task.id, !task.pinned);
+    toast(task.pinned ? "已取消置顶" : "已置顶，会优先开始", "success");
+  } catch (err) {
+    toast(errText(err), "error");
+  }
+}
+
+async function copyPath(task: TransferTask) {
+  closeMenu();
+  try {
+    await navigator.clipboard.writeText(task.localPath);
+    toast("已复制路径", "success");
+  } catch {
+    toast("复制失败，剪贴板不可用", "error");
+  }
+}
+
+async function revealTask(task: TransferTask) {
+  closeMenu();
+  try {
+    await revealPath(task.localPath);
+  } catch (err) {
+    toast(errText(err), "error");
+  }
+}
+
+async function removeOne(task: TransferTask) {
+  closeMenu();
+  await runRemove([task]);
+}
+
+async function resumeOne(task: TransferTask) {
+  closeMenu();
+  if (task.status === "paused") {
+    try {
+      await api.transferRetry(task.id);
+    } catch (err) {
+      toast(errText(err), "error");
+    }
+    return;
+  }
+  await pause(task);
+}
+
+/** Keyboard: the same actions without reaching for the mouse. */
+function onKey(ev: KeyboardEvent) {
+  const target = ev.target as HTMLElement | null;
+  const typing =
+    !!target &&
+    (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+  if (ev.ctrlKey && ev.key.toLowerCase() === "a" && !typing) {
+    ev.preventDefault();
+    toggleSelectAll();
+    return;
+  }
+  if (ev.ctrlKey && ev.key.toLowerCase() === "f") {
+    ev.preventDefault();
+    const input = document.querySelector<HTMLInputElement>(".filters .search input");
+    input?.focus();
+    input?.select();
+    return;
+  }
+  if (typing) return;
+  if (ev.key === "Delete" && picked.value.length) {
+    ev.preventDefault();
+    void bulk("remove");
+    return;
+  }
+  if (ev.key === " " && picked.value.length) {
+    ev.preventDefault();
+    const anyMoving = picked.value.some((t) => t.status === "running" || t.status === "hashing");
+    void bulk(anyMoving ? "pause" : "resume");
+  }
+  if (ev.key === "Escape") closeMenu();
+}
+
+onActivated(() => window.addEventListener("keydown", onKey));
+onDeactivated(() => window.removeEventListener("keydown", onKey));
+
 /** Rows the user chose to draw as a dense table. */
 const compact = computed(() => (app.settings?.transferDensity ?? "card") === "compact");
 
@@ -385,6 +486,43 @@ function cancelRemove() {
   removeAsk.value = null;
 }
 
+const limitAsk = ref<TransferTask | null>(null);
+const limitDraft = ref("");
+
+function openLimit(task: TransferTask) {
+  closeMenu();
+  limitAsk.value = task;
+  limitDraft.value = task.limitKbps ? String(task.limitKbps) : "";
+}
+
+async function applyLimit(kbps: number | null) {
+  const task = limitAsk.value;
+  if (!task) return;
+  limitAsk.value = null;
+  try {
+    const next = await api.transferLimit(task.id, kbps);
+    app.transfers = app.transfers.map((row) => (row.id === next.id ? next : row));
+    toast(
+      kbps
+        ? `已把「${task.name}」限速为 ${kbps} KB/s`
+        : `已取消「${task.name}」的限速`,
+      "success",
+    );
+  } catch (err) {
+    toast(errText(err), "error");
+  }
+}
+
+function commitLimit() {
+  const raw = limitDraft.value.trim();
+  const kbps = Math.round(Number(raw));
+  if (!raw || !Number.isFinite(kbps) || kbps <= 0) {
+    void applyLimit(null);
+    return;
+  }
+  void applyLimit(kbps);
+}
+
 async function applyRemove(tasks: TransferTask[], purgeLocal: boolean) {
   const ids = tasks.map((task) => task.id);
   try {
@@ -594,8 +732,9 @@ onActivated(() => {
           v-for="(task, i) in pagedRows"
           :key="task.id"
           class="task"
-          :class="`task--${task.status}`"
+          :class="[`task--${task.status}`, { 'task--pinned': task.pinned }]"
           v-bind="rowEnter(i)"
+          @contextmenu.prevent="openMenu($event, task)"
         >
           <label class="pick" @click.stop>
             <input
@@ -631,6 +770,14 @@ onActivated(() => {
                 draggable="false"
               />
               <span class="task-name truncate" :title="task.name">{{ task.name }}</span>
+              <Icon
+                v-if="task.pinned"
+                class="task-pin"
+                name="arrow-up"
+                :size="11"
+                :stroke="2"
+                title="已置顶"
+              />
               <span class="task-state">{{ statusLabel(task) }}</span>
               <span v-if="retryHint(task)" class="task-state task-state--retry">{{
                 retryHint(task)
@@ -669,6 +816,10 @@ onActivated(() => {
                 <span class="mono" :class="speedClass(task)">{{ formatSpeed(task.speed) }}</span>
                 <span class="dot">·</span>
                 <span class="mono">{{ formatEta(task.size - task.transferred, task.speed) || "—" }}</span>
+                <template v-if="task.limitKbps">
+                  <span class="dot">·</span>
+                  <span class="mono task-limit">限速 {{ task.limitKbps }} KB/s</span>
+                </template>
                 <template v-if="poolLabel(task)">
                   <span class="dot">·</span>
                   <span class="mono task-pool">{{ poolLabel(task) }}</span>
@@ -812,11 +963,173 @@ onActivated(() => {
           <button class="btn btn--solid" @click="confirmRemove(false)">只移除记录</button>
         </template>
       </Modal>
+
+      <Modal
+        :open="limitAsk !== null"
+        title="单任务限速"
+        :width="400"
+        @close="limitAsk = null"
+      >
+        <p class="rm-text"><b>{{ limitAsk?.name }}</b></p>
+        <div class="lim-row">
+          <input v-model="limitDraft" class="lim-input mono" inputmode="numeric" placeholder="留空 = 不限速" />
+          <span class="lim-unit">KB/s</span>
+        </div>
+        <div class="lim-chips">
+          <button class="lim-chip" @click="applyLimit(null)">不限速</button>
+          <button v-for="n in [256, 512, 1024, 2048]" :key="n" class="lim-chip" @click="applyLimit(n)">
+            {{ n >= 1024 ? `${n / 1024} MB/s` : `${n} KB/s` }}
+          </button>
+        </div>
+        <p class="rm-hint">
+          只作用于这一条任务。正在传输的文件会在下次继续时按新速度跑。
+        </p>
+        <template #footer>
+          <button class="btn" @click="limitAsk = null">取消</button>
+          <button class="btn btn--solid" @click="commitLimit">保存</button>
+        </template>
+      </Modal>
+    </div>
+
+    <!-- right-click menu: actions that belong to one row -->
+    <div v-if="menu" class="menu-scrim" @click="closeMenu" @contextmenu.prevent="closeMenu">
+      <div class="menu" :style="{ left: `${menu.x}px`, top: `${menu.y}px` }" @click.stop>
+        <button class="menu-item" @click="togglePin(menu.task)">
+          <Icon name="arrow-up" :size="13" />
+          <span>{{ menu.task.pinned ? "取消置顶" : "置顶，优先开始" }}</span>
+        </button>
+        <button
+          v-if="menu.task.status === 'running' || menu.task.status === 'hashing'"
+          class="menu-item"
+          @click="resumeOne(menu.task)"
+        >
+          <Icon name="pause" :size="13" />
+          <span>暂停</span>
+        </button>
+        <button
+          v-else-if="menu.task.status === 'paused'"
+          class="menu-item"
+          @click="resumeOne(menu.task)"
+        >
+          <Icon name="play" :size="13" />
+          <span>继续</span>
+        </button>
+        <button class="menu-item" @click="copyPath(menu.task)">
+          <Icon name="copy" :size="13" />
+          <span>复制路径</span>
+        </button>
+        <button class="menu-item" @click="revealTask(menu.task)">
+          <Icon name="external" :size="13" />
+          <span>在文件夹中显示</span>
+        </button>
+        <button class="menu-item" @click="openLimit(menu.task)">
+          <Icon name="gauge" :size="13" />
+          <span>限速…</span>
+          <span class="menu-note">{{ menu.task.limitKbps ? menu.task.limitKbps + " KB/s" : "不限速" }}</span>
+        </button>
+        <div class="menu-sep" />
+        <button class="menu-item menu-item--bad" @click="removeOne(menu.task)">
+          <Icon name="trash" :size="13" />
+          <span>移除任务</span>
+        </button>
+      </div>
     </div>
   </section>
 </template>
 
 <style scoped>
+.task--pinned {
+  box-shadow: inset 2px 0 0 var(--up);
+}
+.task-pin {
+  flex: none;
+  color: var(--up);
+}
+.task-limit {
+  color: var(--up);
+}
+.menu-note {
+  margin-left: auto;
+  color: var(--text-3);
+  font-size: 11.8px;
+}
+.lim-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 10px;
+}
+.lim-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--bg-input, transparent);
+  color: var(--text);
+  font-size: 13px;
+}
+.lim-unit {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.lim-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.lim-chip {
+  padding: 4px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.lim-chip:hover {
+  border-color: var(--fill);
+  color: var(--text);
+}
+.menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+.menu {
+  position: fixed;
+  min-width: 178px;
+  padding: 4px;
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 12px 28px rgb(0 0 0 / 18%);
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-1);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.menu-item:hover {
+  background: var(--bg-sunken);
+}
+.menu-item--bad {
+  color: var(--danger, #e0554f);
+}
+.menu-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--line);
+}
 .transfers {
   display: flex;
   flex-direction: column;

@@ -249,6 +249,7 @@ pub async fn download_with_stats(
     base: u64,
     token: CancellationToken,
     stats: Option<Arc<Stats>>,
+    cap: Option<u64>,
 ) -> AppResult<bool> {
     if size < MIN_SEGMENTED || !drive.supports_ranges() {
         return Ok(false);
@@ -310,6 +311,7 @@ pub async fn download_with_stats(
         connections,
         progress,
         stats.clone(),
+        cap,
     )
     .await;
     // The pool is gone once this returns; a readout still claiming 256 open
@@ -363,6 +365,7 @@ async fn run_shared(
     connections: usize,
     mut progress: meta::Progress,
     stats: Option<Arc<Stats>>,
+    cap: Option<u64>,
 ) -> AppResult<bool> {
     // Pre-flight before fanning out: one DNS resolve and one request. Hundreds
     // of connections starting at once would otherwise all fail together on a
@@ -394,7 +397,12 @@ async fn run_shared(
     let already = progress.bytes();
     done.store(base + already, Ordering::Relaxed);
 
-    let limiter = Arc::new(worker::Limiter::new());
+    // One limiter per segmented download: with a per-task cap the workers of a
+    // single file share it, while other files keep their own budget.
+    let limiter = Arc::new(match cap {
+        Some(own) => worker::Limiter::with_cap(own),
+        None => worker::Limiter::new(),
+    });
     let progress = Arc::new(Mutex::new(progress));
     // Start from this file's share of the drive's budget rather than the whole
     // of it, and let adaptation work inside that share.
@@ -1272,6 +1280,7 @@ mod resume_bytes_tests {
             connections,
             plan,
             None,
+            None,
         )
         .await
     }
@@ -1431,7 +1440,7 @@ mod live_resume_probe {
         }
         tokio::time::timeout(
             std::time::Duration::from_secs(secs),
-            super::download_with_stats(drive, source, provider, part, size, done, 0, token, None),
+            super::download_with_stats(drive, source, provider, part, size, done, 0, token, None, None),
         )
         .await
     }

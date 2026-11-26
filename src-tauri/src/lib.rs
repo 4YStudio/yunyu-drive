@@ -201,6 +201,8 @@ pub fn run() {
             commands::transfer_children,
             commands::transfer_clear,
             commands::transfer_retry,
+            commands::transfer_pin,
+            commands::transfer_limit,
             commands::transfers_bulk,
             commands::aliyun_qr_start,
             commands::aliyun_qr_poll_with,

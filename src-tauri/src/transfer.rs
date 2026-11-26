@@ -115,6 +115,13 @@ pub struct TransferTask {
     /// supervisor polls it once a second.
     #[serde(default)]
     pub retry_at: Option<i64>,
+    /// Pinned jobs sort above their peers and start as soon as a slot frees.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Per-task speed cap in KiB/s. `None` follows the global setting; a value
+    /// caps this transfer alone (whichever is lower wins).
+    #[serde(default)]
+    pub limit_kbps: Option<u32>,
     /// Root of the folder, so a retry can walk it again after a restart without
     /// keeping the whole file list.
     #[serde(default)]
@@ -484,6 +491,48 @@ impl TransferManager {
         }
     }
 
+    /// Pins a job: it sorts above its peers and, if it is waiting, is handed the
+    /// next free slot first.
+    /// Caps this transfer alone. A running transfer picks the new cap up on its
+    /// next attempt (or after pause/resume): the limiter is built once per
+    /// attempt, and rebuilding it mid-flight would restart the file.
+    pub async fn set_task_limit(
+        &self,
+        app: &AppHandle,
+        id: &str,
+        kbps: Option<u32>,
+    ) -> AppResult<TransferTask> {
+        let mut guard = self.tasks.write().await;
+        let task = guard
+            .get_mut(id)
+            .ok_or_else(|| AppError::new("找不到该任务"))?;
+        task.limit_kbps = kbps.filter(|kbps| *kbps > 0);
+        task.updated_at = now_millis();
+        let copy = task.clone();
+        drop(guard);
+        copy.emit(app);
+        Ok(copy)
+    }
+
+    pub async fn set_pinned(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        id: &str,
+        pinned: bool,
+    ) -> AppResult<TransferTask> {
+        let Some(task) = self.snapshot(id).await else {
+            return Err(AppError::new("任务不存在"));
+        };
+        self.patch(id, app, |t| t.pinned = pinned).await;
+        if pinned && task.status == "queued" {
+            // Re-announce the slot so the pinned job is considered again.
+            self.notify.notify_waiters();
+        }
+        self.snapshot(id)
+            .await
+            .ok_or_else(|| AppError::new("任务不存在"))
+    }
+
     /// Tasks the supervisor should pick up right now: queued, not owned by a
     /// live worker (a queued task waiting for a slot already has its token) and
     /// past its retry deadline as well as ones that never had one — that is
@@ -629,6 +678,17 @@ impl TransferManager {
 
     /// Waits until a worker slot is free. Returns `None` when cancelled while queued.
     async fn acquire(self: &Arc<Self>, token: &CancellationToken) -> Option<SlotGuard> {
+        self.acquire_priority(token, false).await
+    }
+
+    /// `priority` is the "置顶" case: a pinned job may take one slot beyond the
+    /// configured limit, which is exactly what makes it jump the queue instead
+    /// of merely being listed first.
+    async fn acquire_priority(
+        self: &Arc<Self>,
+        token: &CancellationToken,
+        priority: bool,
+    ) -> Option<SlotGuard> {
         loop {
             if token.is_cancelled() {
                 return None;
@@ -638,7 +698,9 @@ impl TransferManager {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                if (*active as u64) < self.limit.load(Ordering::Relaxed) {
+                let limit = self.limit.load(Ordering::Relaxed);
+                let ceiling = if priority { limit + 1 } else { limit };
+                if (*active as u64) < ceiling {
                     *active += 1;
                     return Some(SlotGuard {
                         manager: Arc::clone(self),
@@ -667,7 +729,13 @@ impl TransferManager {
         // What is moving comes first, then what waits, then what is over; inside
         // a group the newest task wins. Kept in step with the UI's own sort so a
         // reload does not reshuffle the rows.
-        all.sort_by_key(|t| (status_rank(&t.status), std::cmp::Reverse(t.created_at)));
+        all.sort_by_key(|t| {
+            (
+                status_rank(&t.status),
+                !t.pinned,
+                std::cmp::Reverse(t.created_at),
+            )
+        });
         all
     }
 
@@ -998,6 +1066,8 @@ impl TransferManager {
             children_failed: 0,
             attempts: 0,
             retry_at: None,
+            pinned: false,
+            limit_kbps: None,
             folder: None,
             upload_dir: None,
         };
@@ -1066,6 +1136,8 @@ impl TransferManager {
             children_failed: 0,
             attempts: 0,
             retry_at: None,
+            pinned: false,
+            limit_kbps: None,
             folder: Some(folder),
             upload_dir: None,
         };
@@ -1204,6 +1276,8 @@ impl TransferManager {
             children_failed: 0,
             attempts: 0,
             retry_at: None,
+            pinned: false,
+            limit_kbps: None,
             folder: None,
             upload_dir: Some(dir),
         };
@@ -1998,13 +2072,14 @@ impl TransferManager {
         // outcome once, and a per-file notification for a thousand-file folder
         // buried the desktop in popups.
         let announce = task.parent.is_none();
+        let pinned = task.pinned;
         let token = CancellationToken::new();
         self.cancels.lock().await.insert(id.clone(), token.clone());
 
         let manager = Arc::clone(self);
         let handle = app.clone();
         tokio::spawn(async move {
-            let Some(_slot) = manager.acquire(&token).await else {
+            let Some(_slot) = manager.acquire_priority(&token, pinned).await else {
                 manager.cancels.lock().await.remove(&id);
                 return;
             };
@@ -2073,6 +2148,7 @@ impl TransferManager {
                             done.clone(),
                             token.clone(),
                             Some(Arc::clone(&stats)),
+                            task.limit_kbps.map(|kbps| u64::from(kbps) * 1024),
                         )
                         .await
                     }
@@ -2087,6 +2163,7 @@ impl TransferManager {
                             token.clone(),
                             0,
                             Some(Arc::clone(&stats)),
+                            task.limit_kbps.map(|kbps| u64::from(kbps) * 1024),
                         )
                         .await
                     }
@@ -2230,6 +2307,8 @@ impl TransferManager {
             children_failed: 0,
             attempts: 0,
             retry_at: None,
+            pinned: false,
+            limit_kbps: None,
             folder: None,
             upload_dir: None,
         };
@@ -2237,6 +2316,10 @@ impl TransferManager {
         if job.parent.is_none() {
             task.emit(&app);
         }
+        let pinned = task.pinned;
+        // Read once: a cap changed while the file is going up applies on the
+        // next run, which matches what the row shows afterwards.
+        let cap = task.limit_kbps.map(|kbps| u64::from(kbps) * 1024);
 
         let token = CancellationToken::new();
         self.cancels.lock().await.insert(id.clone(), token.clone());
@@ -2244,7 +2327,7 @@ impl TransferManager {
         let manager = Arc::clone(self);
         let handle = app.clone();
         tokio::spawn(async move {
-            let Some(_slot) = manager.acquire(&token).await else {
+            let Some(_slot) = manager.acquire_priority(&token, pinned).await else {
                 manager.cancels.lock().await.remove(&id);
                 return;
             };
@@ -2272,6 +2355,7 @@ impl TransferManager {
             let sink_trait: Arc<dyn UploadSink> = Arc::new(ThrottledSink {
                 inner: sink.clone(),
                 started: Instant::now(),
+                cap,
             });
             // Providers report `"uploading"` once the local file is prepared and
             // bytes start moving. Without this the task stayed on `"hashing"`
@@ -2462,6 +2546,8 @@ impl TransferManager {
             children_failed: 0,
             attempts: 0,
             retry_at: None,
+            pinned: false,
+            limit_kbps: None,
             folder: None,
             upload_dir: None,
         };
@@ -3130,6 +3216,7 @@ async fn run_cross_file(
         token.clone(),
         base,
         stats,
+        None,
     )
     .await
     .map_err(|err| AppError::new(format!("{}：{err}", file.name)))?;
@@ -3158,12 +3245,15 @@ pub fn throttled_sink(done: Arc<AtomicU64>) -> Arc<dyn crate::providers::UploadS
     Arc::new(ThrottledSink {
         inner: Arc::new(crate::providers::CounterSink::new(done)),
         started: Instant::now(),
+        cap: None,
     })
 }
 
 struct ThrottledSink {
     inner: Arc<crate::providers::CounterSink>,
     started: Instant,
+    /// Per-task cap (bytes/s). `None` uses the global setting.
+    cap: Option<u64>,
 }
 
 impl UploadSink for ThrottledSink {
@@ -3172,7 +3262,13 @@ impl UploadSink for ThrottledSink {
     }
 
     fn progress(&self, bytes: u64) {
-        let cap = SPEED_LIMIT.load(Ordering::Relaxed);
+        let cap = match self.cap {
+            Some(own) => {
+                let global = SPEED_LIMIT.load(Ordering::Relaxed);
+                if global == 0 { own } else { global.min(own) }
+            }
+            None => SPEED_LIMIT.load(Ordering::Relaxed),
+        };
         if cap > 0 && bytes > 0 {
             let budget = Duration::from_secs_f64(bytes as f64 / cap as f64);
             let elapsed = self.started.elapsed();
@@ -3440,6 +3536,7 @@ async fn run_provider_download(
     token: CancellationToken,
     base: u64,
     stats: Option<Arc<crate::engine::Stats>>,
+    cap: Option<u64>,
 ) -> AppResult<()> {
     let mut start = 0u64;
     if let Ok(meta) = tokio::fs::metadata(part_path).await {
@@ -3508,6 +3605,7 @@ async fn run_provider_download(
             base,
             token.clone(),
             stats,
+            cap,
         )
         .await;
         match segmented {
@@ -3596,7 +3694,7 @@ pub async fn run_provider_download_for_test(
     done: Arc<AtomicU64>,
     token: CancellationToken,
 ) -> AppResult<()> {
-    run_provider_download(drive, fid, part_path, final_path, size, done, token, 0, None).await
+    run_provider_download(drive, fid, part_path, final_path, size, done, token, 0, None, None).await
 }
 
 /// Drains `stream` into `part_path`, appending at `start` and reporting progress.
@@ -3659,6 +3757,7 @@ async fn run_share_download(
     done: Arc<AtomicU64>,
     token: CancellationToken,
     stats: Option<Arc<crate::engine::Stats>>,
+    cap: Option<u64>,
 ) -> AppResult<()> {
     let mut start = 0u64;
     if let Ok(meta) = tokio::fs::metadata(part_path).await {
@@ -3716,6 +3815,7 @@ async fn run_share_download(
             0,
             token.clone(),
             stats,
+            cap,
         )
         .await;
         match segmented {
@@ -4245,6 +4345,8 @@ mod tests {
             children_failed: 0,
             attempts: 0,
             retry_at: None,
+            pinned: false,
+            limit_kbps: None,
             folder: None,
             upload_dir: None,
         }
@@ -4422,6 +4524,8 @@ mod retry_tests {
             error: None,
             attempts: 0,
             retry_at: None,
+            pinned: false,
+            limit_kbps: None,
             created_at: 0,
             updated_at: 0,
             rapid: false,
@@ -4881,6 +4985,7 @@ mod live_concurrency_probe {
                         token.clone(),
                         0,
                         Some(Arc::clone(&stat)),
+                        None,
                     )
                     .await;
                     match result {

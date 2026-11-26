@@ -167,6 +167,10 @@ export interface TransferTask {
   attempts?: number;
   /** Epoch ms; while `queued`, the moment the automatic retry fires. */
   retryAt?: number | null;
+  /** Pinned jobs sort above their peers and start before them. */
+  pinned?: boolean;
+  /** Per-task cap in KiB/s; absent follows the global setting. */
+  limitKbps?: number | null;
   createdAt: number;
   updatedAt: number;
   rapid: boolean;

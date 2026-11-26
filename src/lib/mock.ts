@@ -942,6 +942,16 @@ export const mockApi = {
     })!;
   },
 
+  transferPin: async (id: string, pinned: boolean): Promise<TransferTask> => {
+    const task = patchTask(id, { pinned });
+    if (!task) throw new Error("任务不存在");
+    return task;
+  },
+  transferLimit: async (id: string, kbps: number | null): Promise<TransferTask> => {
+    const task = patchTask(id, { limitKbps: kbps });
+    if (!task) throw new Error("任务不存在");
+    return task;
+  },
   transferBulk: async (
     ids: string[],
     action: "pause" | "cancel" | "remove" | "resume",

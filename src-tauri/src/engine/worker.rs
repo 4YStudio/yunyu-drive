@@ -192,12 +192,25 @@ fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Resul
 /// limiter cannot do.
 pub struct Limiter {
     next_free: Mutex<Instant>,
+    /// Per-task cap in bytes per second. `None` follows the global setting.
+    cap: Option<u64>,
 }
 
 impl Limiter {
     pub fn new() -> Self {
         Self {
             next_free: Mutex::new(Instant::now()),
+            cap: None,
+        }
+    }
+
+    /// A limiter with its own cap: the transfer spends at most `cap` bytes per
+    /// second even when the global setting allows more (a lower global setting
+    /// still wins, so one task cannot exceed the app-wide budget).
+    pub fn with_cap(cap: u64) -> Self {
+        Self {
+            next_free: Mutex::new(Instant::now()),
+            cap: Some(cap),
         }
     }
 
@@ -211,8 +224,19 @@ impl Limiter {
     pub async fn acquire(&self, bytes: u64) {
         // Read the cap every time so a settings change applies to downloads
         // already in flight.
-        self.acquire_with(bytes, crate::transfer::speed_limit_bytes())
-            .await;
+        let cap = self.effective_cap(crate::transfer::speed_limit_bytes());
+        self.acquire_with(bytes, cap).await;
+    }
+
+    /// The cap actually applied: this task's own limit, or the app-wide one,
+    /// whichever is lower. A global cap of zero means "unlimited", so an own
+    /// cap still applies on its own.
+    pub fn effective_cap(&self, global: u64) -> u64 {
+        match self.cap {
+            Some(own) if global == 0 => own,
+            Some(own) => global.min(own),
+            None => global,
+        }
     }
 
     /// `acquire` with the cap passed in. Tests use this: the setting is a
@@ -713,6 +737,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yyworker-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_task_cap_never_raises_the_global_one() {
+        // No own cap: the global setting rules, including "0 = unlimited".
+        assert_eq!(Limiter::new().effective_cap(0), 0);
+        assert_eq!(Limiter::new().effective_cap(2048), 2048);
+
+        // Own cap with no global cap: the task still gets capped.
+        assert_eq!(Limiter::with_cap(1024).effective_cap(0), 1024);
+
+        // Both set: the lower one wins, so one task cannot exceed the app-wide
+        // budget and the budget cannot override the task either.
+        assert_eq!(Limiter::with_cap(1024).effective_cap(2048), 1024);
+        assert_eq!(Limiter::with_cap(2048).effective_cap(512), 512);
     }
 
     #[test]

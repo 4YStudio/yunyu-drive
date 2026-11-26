@@ -1205,6 +1205,29 @@ pub async fn transfers_bulk(
     }
 }
 
+/// Pins or unpins one job ("置顶"): it sorts above its peers and takes the next
+/// free transfer slot even when the concurrency limit is already reached.
+/// Per-task speed cap in KiB/s (`None` = follow the global setting).
+#[tauri::command]
+pub async fn transfer_limit(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    id: String,
+    kbps: Option<u32>,
+) -> AppResult<TransferTask> {
+    state.transfers.set_task_limit(&app, &id, kbps).await
+}
+
+#[tauri::command]
+pub async fn transfer_pin(
+    state: State<'_, Arc<AppState>>,
+    app: AppHandle,
+    id: String,
+    pinned: bool,
+) -> AppResult<TransferTask> {
+    state.transfers.set_pinned(&app, &id, pinned).await
+}
+
 /// The single-task retry body, shared by `transfer_retry`, `transfers_bulk` and
 /// the auto-resume supervisor.
 pub(crate) async fn resume_task(

@@ -2111,6 +2111,7 @@ async fn engine_compare(drive: Arc<dyn DriveProvider>, fid: &str, name: &str, si
         0,
         token,
         None,
+        None,
     )
     .await;
     let elapsed = started.elapsed();
@@ -2272,6 +2273,7 @@ async fn engine_live_quark_verify() {
         Arc::clone(&done),
         0,
         token.clone(),
+        None,
         None,
     )
     .await;

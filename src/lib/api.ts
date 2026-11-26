@@ -185,6 +185,13 @@ export const api = {
    * Looping `transferPause` over 3000 ids meant 3000 IPC round trips and 3000
    * events; the backend does it in one pass and announces the batch once.
    */
+  /** "置顶": sorts above its peers and takes the next free slot. */
+  transferPin: (id: string, pinned: boolean) =>
+    invoke<TransferTask>("transfer_pin", { id, pinned }),
+
+  transferLimit: (id: string, kbps: number | null) =>
+    invoke<TransferTask>("transfer_limit", { id, kbps }),
+
   transferBulk: (
     ids: string[],
     action: "pause" | "cancel" | "remove" | "resume",
