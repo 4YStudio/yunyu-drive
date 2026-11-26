@@ -333,6 +333,10 @@ pub struct DownloadJob {
     /// rebuild the context.
     #[serde(default)]
     pub provider: String,
+    /// Set when this file is one entry of a folder download. The task is then
+    /// created hidden and never gets a row of its own.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 /// Everything needed to fetch a single file out of a share.
@@ -373,6 +377,10 @@ pub struct UploadJob {
     pub path: String,
     pub pdir_fid: String,
     pub name: Option<String>,
+    /// Set when this file is one entry of a folder upload: the task is created
+    /// hidden, so the list keeps a single row for the whole folder.
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 impl TransferManager {
@@ -866,8 +874,11 @@ impl TransferManager {
             share: job.share.clone(),
             provider: job.provider.clone(),
             cross: None,
-            parent: None,
-            hidden: false,
+            // A child of a folder download is created hidden: it must never
+            // reach the list, not even for the instant between `insert` and a
+            // later `patch`.
+            parent: job.parent.clone(),
+            hidden: job.parent.is_some(),
             listing: false,
             children_total: 0,
             children_done: 0,
@@ -1275,20 +1286,17 @@ impl TransferManager {
                     path: file.absolute.to_string_lossy().to_string(),
                     pdir_fid: crate::providers::qualify(provider, &parent_fid),
                     name: Some(name),
+                    parent: Some(id.clone()),
                 };
                 match self
                     .start_upload(app.clone(), DownloadCtx::Provider(Arc::clone(&drive)), job)
                     .await
                 {
                     Ok(child) => {
-                        let cid = child.id.clone();
-                        let parent_id = id.clone();
-                        self.patch(&cid, &app, |t| {
-                            t.hidden = true;
-                            t.parent = Some(parent_id);
-                        })
-                        .await;
-                        live.push((cid, key, file.size));
+                        // `start_upload` builds a child with `hidden` already
+                        // set (the job carries the parent), so the row never
+                        // appears in the list even briefly.
+                        live.push((child.id.clone(), key, file.size));
                     }
                     Err(err) => {
                         failed_files.insert(key);
@@ -1397,12 +1405,23 @@ impl TransferManager {
             }
         })
         .await;
-        if failed_files.is_empty() {
-            crate::tray::notify(
-                &app,
-                "上传完成",
-                &format!("{} 共 {ok} 个文件已上传", parent.name),
-            );
+        // One popup for the whole folder, on success or failure: the child
+        // uploads stay silent (they carry a `parent`), so a 400-file folder no
+        // longer fires a notification per file.
+        if !token.is_cancelled() {
+            if failed_files.is_empty() {
+                crate::tray::notify(
+                    &app,
+                    "上传完成",
+                    &format!("{} 共 {ok} 个文件已上传", parent.name),
+                );
+            } else {
+                crate::tray::notify(
+                    &app,
+                    "上传结束，有文件失败",
+                    &format!("{}：成功 {ok} 个，失败 {bad} 个", parent.name),
+                );
+            }
         }
     }
 
@@ -1417,6 +1436,7 @@ impl TransferManager {
         generation: u64,
     ) {
         let id = parent.id.clone();
+        let folder_name = parent.name.clone();
         let Some(folder) = parent.folder.clone() else {
             return;
         };
@@ -1566,6 +1586,7 @@ impl TransferManager {
                                 dir: dir.to_string_lossy().to_string(),
                                 share: None,
                                 provider: folder.provider.clone(),
+                                parent: Some(id.clone()),
                             };
                             match self
                                 .start_download_quiet(
@@ -1576,15 +1597,10 @@ impl TransferManager {
                                 .await
                             {
                                 Ok(child) => {
-                                    let cid = child.id.clone();
-                                    // Marked hidden *before* any event can leave,
-                                    // so the row never flashes in the list.
-                                    self.patch(&cid, &app, |t| {
-                                        t.hidden = true;
-                                        t.parent = Some(id.clone());
-                                    })
-                                    .await;
-                                    live.push((cid, key));
+                                    // Created hidden by `start_download_task`
+                                    // (the job carries the parent), so nothing
+                                    // ever reaches the list.
+                                    live.push((child.id.clone(), key));
                                 }
                                 Err(err) => {
                                     failed_files.insert(key);
@@ -1711,6 +1727,15 @@ impl TransferManager {
             t.size = bytes_found.max(bytes_total);
         })
         .await;
+        // Same rule as folder uploads: the files underneath stay silent, the
+        // folder reports once.
+        if total > 0 {
+            crate::tray::notify(
+                &app,
+                if ok { "下载完成" } else { "下载结束，有文件失败" },
+                &format!("{}：{done} / {total} 个文件", folder_name),
+            );
+        }
     }
 
     /// Sidecar listing of a folder task's files, next to `transfers.json`.
@@ -1818,6 +1843,10 @@ impl TransferManager {
     ) {
         let id = task.id.clone();
         let size = task.size;
+        // A child of a folder download stays silent: its parent row reports the
+        // outcome once, and a per-file notification for a thousand-file folder
+        // buried the desktop in popups.
+        let announce = task.parent.is_none();
         let token = CancellationToken::new();
         self.cancels.lock().await.insert(id.clone(), token.clone());
 
@@ -1953,11 +1982,13 @@ impl TransferManager {
                             t.error = None;
                         })
                         .await;
-                    crate::tray::notify(
-                        &handle,
-                        "下载完成",
-                        &format!("{} 已保存", task.name),
-                    );
+                    if announce {
+                        crate::tray::notify(
+                            &handle,
+                            "下载完成",
+                            &format!("{} 已保存", task.name),
+                        );
+                    }
                 }
                 Err(err) => {
                     let canceled = token.is_cancelled();
@@ -1979,7 +2010,7 @@ impl TransferManager {
                             t.speed = 0.0;
                         })
                         .await;
-                    if !canceled {
+                    if !canceled && announce {
                         crate::tray::notify(
                             &handle,
                             "下载失败",
@@ -2040,8 +2071,8 @@ impl TransferManager {
             share: None,
             provider: drive.id().as_str().to_string(),
             cross: None,
-            parent: None,
-            hidden: false,
+            parent: job.parent.clone(),
+            hidden: job.parent.is_some(),
             listing: false,
             children_total: 0,
             children_done: 0,
@@ -2050,7 +2081,9 @@ impl TransferManager {
             upload_dir: None,
         };
         let task = self.insert(task).await;
-        task.emit(&app);
+        if job.parent.is_none() {
+            task.emit(&app);
+        }
 
         let token = CancellationToken::new();
         self.cancels.lock().await.insert(id.clone(), token.clone());
@@ -2123,6 +2156,9 @@ impl TransferManager {
                 })
             };
             let native_parent = crate::providers::native_of(&job.pdir_fid);
+        // Silent for children of a folder upload — the folder row announces the
+        // result once instead of one popup per file.
+        let announce = job.parent.is_none();
             // Racing the provider future against the cancel token is what makes
             // "暂停/取消" mean something for uploads: quark (and others) ignore
             // the token inside `upload()`, so a 50 MB request used to run to
@@ -2152,12 +2188,14 @@ impl TransferManager {
                             t.error = None;
                         })
                         .await;
-                    crate::tray::notify(&handle, "上传完成", &format!("{file_name} 已上传到网盘"));
+                    if announce {
+                        crate::tray::notify(&handle, "上传完成", &format!("{file_name} 已上传到网盘"));
+                    }
                 }
                 Err(err) => {
                     let canceled = token.is_cancelled();
                     finish_failed(&manager, &handle, &id, err.to_string(), canceled).await;
-                    if !canceled {
+                    if !canceled && announce {
                         crate::tray::notify(
                             &handle,
                             "上传失败",
@@ -4769,6 +4807,7 @@ mod live_concurrency_probe {
                         dir: single_dir.to_string_lossy().to_string(),
                         share: None,
                         provider: PROVIDER.to_string(),
+                        parent: None,
                     },
                 )
                 .await
@@ -4803,6 +4842,15 @@ mod live_concurrency_probe {
             }
 
             let list = manager.list().await;
+            // Children of a folder task must never surface as rows of their own.
+            for row in &list {
+                assert!(
+                    row.parent.is_none(),
+                    "a folder child leaked into the list: {} ({})",
+                    row.name,
+                    row.id
+                );
+            }
             if let Some(parent) = list.iter().find(|t| t.id == folder_task.id) {
                 if parent.transferred < last_parent_transferred {
                     parent_monotonic = false;
@@ -4936,6 +4984,7 @@ mod live_concurrency_probe {
                         dir: dir.to_string_lossy().to_string(),
                         share: None,
                         provider: PROVIDER.to_string(),
+                        parent: None,
                     },
                 )
                 .await
@@ -5544,6 +5593,7 @@ mod live_upload_folder_probe {
         let id = task.id.clone();
 
         let mut paused = false;
+        let mut visible_max = 0usize;
         let started = Instant::now();
         let finished = loop {
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -5555,6 +5605,17 @@ mod live_upload_folder_probe {
                 "transferred {} > size {}",
                 now.transferred,
                 now.size
+            );
+            // A folder upload is *one* row: the per-file children must stay
+            // hidden while they run, otherwise the list turns into a thousand
+            // rows next to the folder (and the desktop into a thousand popups).
+            let visible = manager.list().await;
+            visible_max = visible_max.max(visible.len());
+            assert!(
+                visible.len() <= 1,
+                "folder children leaked into the list: {} rows ({:?})",
+                visible.len(),
+                visible.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
             );
             if !paused && now.transferred * 3 > now.size.max(1) && now.status == "running" {
                 paused = true;
@@ -5586,13 +5647,14 @@ mod live_upload_folder_probe {
             );
         };
         println!(
-            "[probe] final status={} transferred={} size={} children={}/{} failed={} error={:?} in {:?}",
+            "[probe] final status={} transferred={} size={} children={}/{} failed={} visible_max={} error={:?} in {:?}",
             finished.status,
             finished.transferred,
             finished.size,
             finished.children_done,
             finished.children_total,
             finished.children_failed,
+            visible_max,
             finished.error,
             started.elapsed()
         );

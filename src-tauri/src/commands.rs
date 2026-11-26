@@ -841,6 +841,7 @@ pub async fn download_entries(
                 dir: target.clone(),
                 share: None,
                 provider: id.provider.as_str().to_string(),
+                parent: None,
             };
             tasks.push(
                 state
@@ -1036,6 +1037,7 @@ pub async fn upload_files(
             path: raw,
             pdir_fid: qualify(id.provider, &target_fid),
             name: Some(name),
+            parent: None,
         };
         tasks.push(
             state

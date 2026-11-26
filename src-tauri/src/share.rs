@@ -884,6 +884,7 @@ pub async fn share_download(
                 dir: target.clone(),
                 share: Some(share),
                 provider: provider.clone(),
+                parent: None,
             };
             tasks.push(
                 state
@@ -925,6 +926,7 @@ pub async fn share_download(
                 dir: dir.to_string_lossy().to_string(),
                 share: Some(share),
                 provider: provider.clone(),
+                parent: None,
             };
             tasks.push(
                 state
