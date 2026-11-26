@@ -287,6 +287,21 @@ const theme = computed({
             />
           </div>
           <div class="divider" />
+          <div class="row">
+            <div class="row-copy">
+              <span class="row-label">传输列表布局</span>
+              <span class="row-hint">「紧凑」一行一条任务，一屏能看十几条</span>
+            </div>
+            <Segmented
+              :model-value="draft.transferDensity"
+              :options="[
+                { value: 'card', label: '卡片' },
+                { value: 'compact', label: '紧凑' },
+              ]"
+              @update:model-value="(v: string) => draft && (draft.transferDensity = v)"
+            />
+          </div>
+          <div class="divider" />
           <Switch
             :model-value="draft.confirmDelete"
             label="删除前确认"
@@ -309,10 +324,26 @@ const theme = computed({
           <div class="divider" />
           <Switch
             :model-value="draft.notifications"
-            label="系统通知"
-            hint="传输完成、下载失败或收到分享链接时发送桌面通知"
+            label="传输提醒"
+            hint="传输完成、下载失败或收到分享链接时提醒"
             @update:model-value="(v) => draft && (draft.notifications = v)"
           />
+          <div class="divider" />
+          <div class="row">
+            <div class="row-copy">
+              <span class="row-label">提醒方式</span>
+              <span class="row-hint">「应用内」只在窗口里弹一条提示，不打扰系统托盘</span>
+            </div>
+            <Segmented
+              :model-value="draft.notifyMode"
+              :options="[
+                { value: 'system', label: '系统通知' },
+                { value: 'inapp', label: '应用内' },
+                { value: 'silent', label: '静默' },
+              ]"
+              @update:model-value="(v: string) => draft && (draft.notifyMode = v)"
+            />
+          </div>
           <div class="divider" />
           <div class="row">
             <div class="row-copy">

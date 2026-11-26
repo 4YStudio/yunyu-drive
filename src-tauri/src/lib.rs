@@ -124,14 +124,19 @@ pub fn run() {
                 bridge::spawn(app.handle().clone(), on_link);
             }
 
-            // Bring back the last session's tasks (unfinished ones as paused)
-            // and keep the file refreshed while transfers run.
+            // Bring back the last session's tasks — anything that was still
+            // moving when the app closed comes back as `queued` and the
+            // supervisor starts it within a second — and keep the file
+            // refreshed while transfers run.
             let transfers = Arc::clone(&state.transfers);
             let handle = app.handle().clone();
             transfers.start_persister();
-            app.manage(state);
+            app.manage(Arc::clone(&state));
+            let supervisor_state = Arc::clone(&state);
+            let supervisor_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 transfers.restore(&handle).await;
+                commands::supervise_transfers(supervisor_state, supervisor_handle).await;
             });
 
             // Dev aid: `QUARK_DEV_LOGIN=1` opens the web login window on boot so

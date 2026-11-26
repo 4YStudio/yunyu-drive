@@ -82,6 +82,16 @@ pub fn notify(app: &AppHandle, title: &str, body: &str) {
     if !enabled {
         return;
     }
+    if let Some(state) = app.try_state::<std::sync::Arc<AppState>>() {
+        if state.notify_mode() == 1 {
+            // In-app mode: the window shows a toast instead of the tray bubble.
+            let _ = app.emit(
+                "notify://inapp",
+                serde_json::json!({ "title": title, "body": body }),
+            );
+            return;
+        }
+    }
     let _ = app
         .notification()
         .builder()

@@ -163,6 +163,10 @@ export interface TransferTask {
     | "failed"
     | "canceled";
   error: string | null;
+  /** Times the queue restarted this job by itself after a hiccup. */
+  attempts?: number;
+  /** Epoch ms; while `queued`, the moment the automatic retry fires. */
+  retryAt?: number | null;
   createdAt: number;
   updatedAt: number;
   rapid: boolean;
@@ -218,6 +222,10 @@ export interface Settings {
   closeToTray: boolean;
   /** Desktop notifications for transfers and share links. */
   notifications: boolean;
+  /** Transfers list layout: `card` or `compact`. */
+  transferDensity: string;
+  /** `system`, `inapp` or `silent`. */
+  notifyMode: string;
 }
 
 export interface AppInfo {

@@ -1137,7 +1137,7 @@ pub async fn transfer_retry(
     app: AppHandle,
     id: String,
 ) -> AppResult<TransferTask> {
-    retry_task(state.inner(), app, &id).await
+    resume_task(state.inner(), app, &id).await
 }
 
 /// Batch pause / cancel / remove / resume for a multi-selection.
@@ -1185,7 +1185,7 @@ pub async fn transfers_bulk(
             let mut started = 0;
             let mut first: Option<String> = None;
             for id in &ids {
-                match retry_task(state.inner(), app.clone(), id).await {
+                match resume_task(state.inner(), app.clone(), id).await {
                     Ok(_) => started += 1,
                     Err(err) => {
                         if first.is_none() {
@@ -1205,15 +1205,19 @@ pub async fn transfers_bulk(
     }
 }
 
-/// The single-task retry body, shared by `transfer_retry` and `transfers_bulk`.
-async fn retry_task(state: &Arc<AppState>, app: AppHandle, id: &str) -> AppResult<TransferTask> {
+/// The single-task retry body, shared by `transfer_retry`, `transfers_bulk` and
+/// the auto-resume supervisor.
+pub(crate) async fn resume_task(
+    state: &Arc<AppState>,
+    app: AppHandle,
+    id: &str,
+) -> AppResult<TransferTask> {
     let id = id.to_string();
-    let task = {
-        let list = state.transfers.list().await;
-        list.into_iter()
-            .find(|t| t.id == id)
-            .ok_or_else(|| AppError::new("任务不存在"))?
-    };
+    let task = state
+        .transfers
+        .snapshot(&id)
+        .await
+        .ok_or_else(|| AppError::new("任务不存在"))?;
     if task.kind == "copy" || task.kind == "move" {
         // Cross-drive jobs remember which files are still missing, so a retry
         // only re-runs those.
@@ -1246,9 +1250,25 @@ async fn retry_task(state: &Arc<AppState>, app: AppHandle, id: &str) -> AppResul
         return state.transfers.resume_folder(app, drive, &id).await;
     }
     if task.kind == "upload" {
-        // Folder uploads resume; single files are sent again from scratch.
+        // Folder uploads resume. A single file cannot: the drive has to be sent
+        // every byte again, so the retry becomes a brand-new task and the failed
+        // row is dropped (its file on disk is untouched either way).
         let Some(dir) = task.upload_dir.clone() else {
-            return Err(AppError::new("上传任务无法续传，请重新上传"));
+            let provider = ProviderId::parse(&task.provider)
+                .ok_or_else(|| AppError::new(format!("未知的网盘：{}", task.provider)))?;
+            let drive = state.drive_of(provider).await?;
+            let job = crate::transfer::UploadJob {
+                path: task.local_path.clone(),
+                pdir_fid: task.remote_dir_fid.clone().unwrap_or_default(),
+                name: Some(task.name.clone()),
+                parent: task.parent.clone(),
+            };
+            let fresh = state
+                .transfers
+                .start_upload(app.clone(), crate::transfer::DownloadCtx::Provider(drive), job)
+                .await?;
+            let _ = state.transfers.remove(&id, &app, false).await;
+            return Ok(fresh);
         };
         let provider = ProviderId::parse(&dir.provider)
             .ok_or_else(|| AppError::new(format!("未知的网盘：{}", dir.provider)))?;
@@ -1458,6 +1478,33 @@ pub async fn app_info(state: State<'_, Arc<AppState>>) -> AppResult<AppInfo> {
 // unit test), so these tests drive `DriveProvider::upload` directly and reuse the
 // very helpers `upload_files` uses (`collect_local_files`, `ensure_remote_dir`,
 // `resolve_conflict`), plus the same `CancellationToken` that pause/cancel use.
+/// Keeps the queue moving without the user watching it.
+///
+/// Two situations need this: a task whose drive hiccuped (a timeout, a dropped
+/// connection, a rate limit) waits out a backoff and starts again by itself, and
+/// a task that was still running when the app closed continues right after the
+/// next start. Both look identical in the task list — "queued" with no worker
+/// behind it — so one loop covers them.
+pub(crate) async fn supervise_transfers(state: Arc<AppState>, app: AppHandle) {
+    // Let the first moments of startup (windows, providers, restore) settle.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    loop {
+        for id in state.transfers.due_retries().await {
+            match resume_task(&state, app.clone(), &id).await {
+                Ok(task) => crate::ylog!("自动继续 {}（{}）", task.name, task.id),
+                Err(err) => {
+                    // The task stays queued and would be picked again every
+                    // second; push its deadline out instead and give up for good
+                    // once the attempts are used up.
+                    let retry = state.transfers.defer_retry(&id, &app, &err.to_string()).await;
+                    crate::ylog!("自动继续 {} 失败（{retry}）：{err}", id);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
+}
+
 #[cfg(test)]
 mod live_upload_probe {
     use super::*;

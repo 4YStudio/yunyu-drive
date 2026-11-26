@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onDeactivated, onMounted, ref } from "vue";
+import { computed, onActivated, onDeactivated, onMounted, ref, watch } from "vue";
 
 import { motion } from "motion-v";
 import { barTransition, rowEnter } from "@/lib/motion";
@@ -21,7 +21,10 @@ import { app, forgetTransfers, refreshTransfers, toast } from "@/store/app";
  *   status — all / in progress / finished (done, failed and canceled alike)
  */
 const kindFilter = ref<"all" | "upload" | "download" | "cross">("all");
-const statusFilter = ref<"all" | "active" | "finished">("all");
+const statusFilter = ref<"all" | "active" | "waiting" | "failed" | "done">("all");
+
+/** Free-text filter: file name or drive name. */
+const query = ref("");
 
 const ACTIVE = ["running", "hashing", "queued", "paused"];
 const FINISHED = ["done", "failed", "canceled"];
@@ -41,18 +44,88 @@ const STATUS_RANK: Record<string, number> = {
 };
 const rank = (status: string) => STATUS_RANK[status] ?? 2;
 
+const WAITING = ["queued", "paused"];
+
 const visible = computed(() => {
   const list = [...all.value];
   list.sort((a, b) => rank(a.status) - rank(b.status) || b.createdAt - a.createdAt);
+  const needle = query.value.trim().toLowerCase();
   return list.filter((task) => {
     if (kindFilter.value === "cross" && !isCross(task)) return false;
     else if (kindFilter.value === "upload" && task.kind !== "upload") return false;
     else if (kindFilter.value === "download" && !isDownload(task)) return false;
-    if (statusFilter.value === "active") return ACTIVE.includes(task.status);
-    if (statusFilter.value === "finished") return FINISHED.includes(task.status);
-    return true;
+    if (statusFilter.value === "active" && !ACTIVE.includes(task.status)) return false;
+    if (statusFilter.value === "waiting" && !WAITING.includes(task.status)) return false;
+    if (statusFilter.value === "failed" && task.status !== "failed") return false;
+    if (statusFilter.value === "done" && task.status !== "done") return false;
+    if (!needle) return true;
+    return (
+      task.name.toLowerCase().includes(needle) ||
+      providerName(task).toLowerCase().includes(needle)
+    );
   });
 });
+
+/**
+ * One line that answers "how much longer", without opening any row: what is
+ * moving, what is queued behind it, and how much data is still on the wire.
+ */
+const summary = computed(() => {
+  const live = all.value.filter((t) => t.status === "running" || t.status === "hashing");
+  const speed = live.reduce((sum, t) => sum + (t.speed || 0), 0);
+  const waiting = all.value.filter((t) => WAITING.includes(t.status)).length;
+  const failed = all.value.filter((t) => t.status === "failed").length;
+  const left = live.reduce(
+    (sum, t) => sum + Math.max(0, (t.size || 0) - (t.transferred || 0)),
+    0,
+  );
+  return {
+    live: live.length,
+    waiting,
+    failed,
+    speed,
+    left,
+    eta: speed > 0 ? left / speed : 0,
+  };
+});
+
+/**
+ * A queued task with a `retryAt` was parked by the auto-retry supervisor; the
+ * row counts down to the moment it starts again.
+ */
+const clock = ref(Date.now());
+let clockTimer: number | undefined;
+
+function retryHint(task: TransferTask): string {
+  if (task.status !== "queued" || !task.retryAt) return "";
+  const left = Math.max(0, Math.ceil((task.retryAt - clock.value) / 1000));
+  if (left <= 0) return "马上继续";
+  return `${left} 秒后自动继续`;
+}
+
+function syncClock() {
+  const needed = all.value.some((t) => t.status === "queued" && t.retryAt);
+  if (needed && clockTimer === undefined) {
+    clockTimer = window.setInterval(() => {
+      clock.value = Date.now();
+    }, 1000);
+  } else if (!needed && clockTimer !== undefined) {
+    window.clearInterval(clockTimer);
+    clockTimer = undefined;
+  }
+}
+
+watch(all, syncClock, { immediate: true });
+
+onDeactivated(() => {
+  if (clockTimer !== undefined) {
+    window.clearInterval(clockTimer);
+    clockTimer = undefined;
+  }
+});
+
+/** Rows the user chose to draw as a dense table. */
+const compact = computed(() => (app.settings?.transferDensity ?? "card") === "compact");
 
 /**
  * Only the first chunk is mounted; a folder download can add thousands of rows
@@ -141,6 +214,8 @@ async function bulk(action: "pause" | "cancel" | "remove" | "resume") {
 
 const counts = computed(() => ({
   active: all.value.filter((t) => ACTIVE.includes(t.status)).length,
+  waiting: all.value.filter((t) => WAITING.includes(t.status)).length,
+  failed: all.value.filter((t) => t.status === "failed").length,
   upload: all.value.filter((t) => t.kind === "upload").length,
   download: all.value.filter((t) => isDownload(t)).length,
   cross: all.value.filter(isCross).length,
@@ -227,6 +302,7 @@ function poolLabel(task: TransferTask): string {
 function statusLabel(task: TransferTask) {
   switch (task.status) {
     case "queued":
+      if (task.attempts) return `第 ${task.attempts} 次重试`;
       return "排队中";
     case "paused":
       return "已暂停";
@@ -448,13 +524,46 @@ onActivated(() => {
         :options="[
           { value: 'all', label: '全部' },
           { value: 'active', label: '进行中' },
-          { value: 'finished', label: '已完成' },
+          { value: 'waiting', label: counts.waiting ? `等待 ${counts.waiting}` : '等待' },
+          { value: 'failed', label: counts.failed ? `失败 ${counts.failed}` : '失败' },
+          { value: 'done', label: '已完成' },
         ]"
       />
+      <label class="search">
+        <Icon name="search" :size="13" />
+        <input v-model="query" type="search" placeholder="搜索文件名或网盘" spellcheck="false" />
+      </label>
       <label v-if="visible.length" class="pick pick--all">
         <input type="checkbox" :checked="selectedAll" @change="toggleSelectAll" />
         <span>全选 {{ visible.length }} 项</span>
       </label>
+    </div>
+
+    <div v-if="summary.live || summary.waiting || summary.failed" class="summary">
+      <span v-if="summary.live" class="summary-item">
+        <span class="mono">{{ formatSpeed(summary.speed) }}</span>
+        <span class="summary-hint">合计速度</span>
+      </span>
+      <span v-if="summary.live" class="summary-item">
+        <span class="mono">{{ formatSize(summary.left) }}</span>
+        <span class="summary-hint">剩余数据</span>
+      </span>
+      <span v-if="summary.live && summary.eta > 0" class="summary-item">
+        <span class="mono">{{ formatEta(summary.left, summary.speed) }}</span>
+        <span class="summary-hint">预计剩余</span>
+      </span>
+      <span class="summary-item">
+        <span class="mono">{{ summary.live }}</span>
+        <span class="summary-hint">进行中</span>
+      </span>
+      <span v-if="summary.waiting" class="summary-item">
+        <span class="mono">{{ summary.waiting }}</span>
+        <span class="summary-hint">等待</span>
+      </span>
+      <span v-if="summary.failed" class="summary-item summary-item--bad">
+        <span class="mono">{{ summary.failed }}</span>
+        <span class="summary-hint">失败</span>
+      </span>
     </div>
 
     <div v-if="picked.length" class="bulk">
@@ -480,7 +589,7 @@ onActivated(() => {
         />
       </div>
 
-      <div v-else class="tasks">
+      <div v-else class="tasks" :class="{ 'tasks--compact': compact }">
         <motion.article
           v-for="(task, i) in pagedRows"
           :key="task.id"
@@ -523,6 +632,9 @@ onActivated(() => {
               />
               <span class="task-name truncate" :title="task.name">{{ task.name }}</span>
               <span class="task-state">{{ statusLabel(task) }}</span>
+              <span v-if="retryHint(task)" class="task-state task-state--retry">{{
+                retryHint(task)
+              }}</span>
               <span v-if="isCross(task)" class="task-kind">{{ kindLabel(task) }}</span>
             </div>
 
@@ -737,6 +849,50 @@ onActivated(() => {
   padding: 12px 24px 14px;
   flex-wrap: wrap;
 }
+/* "How much longer" at a glance: one line of numbers above the list. */
+.summary {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 0 24px 10px;
+  padding: 0 2px 2px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.summary-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+.summary-hint {
+  color: var(--text-3);
+}
+.summary-item--bad .mono {
+  color: var(--danger, #e0554f);
+}
+.search {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-sunken);
+  box-shadow: inset 0 0 0 1px var(--line);
+  color: var(--text-3);
+}
+.search input {
+  width: 168px;
+  border: 0;
+  background: transparent;
+  color: var(--text-1);
+  font-size: 11.8px;
+  outline: none;
+}
+.search input::-webkit-search-cancel-button {
+  display: none;
+}
 .body {
   flex: 1;
   min-height: 0;
@@ -795,6 +951,50 @@ onActivated(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+/* Dense layout: same information, roughly half the height per row. */
+.tasks--compact {
+  gap: 2px;
+}
+.tasks--compact .task {
+  gap: 10px;
+  padding: 5px 10px 5px 12px;
+  border-radius: var(--radius-sm);
+}
+.tasks--compact .task-glyph {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  box-shadow: none;
+  background: transparent;
+}
+.tasks--compact .task-main {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+.tasks--compact .task-line {
+  flex: 1 1 42%;
+  min-width: 0;
+  gap: 8px;
+}
+.tasks--compact .task-bar {
+  flex: 1 1 22%;
+  margin: 0;
+}
+.tasks--compact .task-meta {
+  flex: 0 0 auto;
+  gap: 4px;
+  font-size: 11px;
+}
+.tasks--compact .task-name {
+  font-size: 12.2px;
+}
+.task-state--retry {
+  color: var(--text-2);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
 }
 .task {
   display: flex;

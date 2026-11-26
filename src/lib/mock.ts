@@ -156,6 +156,8 @@ let settings: Settings = {
   lastDirFid: "0",
   closeToTray: true,
   notifications: true,
+  transferDensity: "card",
+  notifyMode: "system",
 };
 
 const children = (fid: string) =>
@@ -1017,6 +1019,7 @@ export const mockEvents = {
       removedManyListeners.delete(cb);
     };
   },
+  onInAppNotify: async (_cb: (evt: { title: string; body: string }) => void) => () => {},
   onDeeplink: async (_cb: (link: string) => void) => () => {},
   onNavigate: async (_cb: (view: string) => void) => () => {},
 };

@@ -552,6 +552,7 @@ export async function bootstrap() {
     if (index >= 0) app.transfers.splice(index, 1);
   });
   await events.onTransfersBatch(applyTransfers);
+  await events.onInAppNotify((evt) => toast(evt.body ? `${evt.title} · ${evt.body}` : evt.title, "success"));
   await events.onTransfersRemovedMany(forgetTransfers);
   await events.onDeeplink((link) => openShareLink(link));
   // The tray's "传输列表" item switches screens from outside the UI.

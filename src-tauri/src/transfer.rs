@@ -105,6 +105,16 @@ pub struct TransferTask {
     pub children_done: u64,
     #[serde(default)]
     pub children_failed: u64,
+    /// How many times the transfer was restarted automatically after a network
+    /// error (or after the app closed mid-transfer). Reset by a manual retry, so
+    /// the counter never lies about what the user asked for.
+    #[serde(default)]
+    pub attempts: u32,
+    /// When the automatic retry may start, as epoch milliseconds. Only set while
+    /// `status == "queued"` and a retry is waiting out its backoff; the
+    /// supervisor polls it once a second.
+    #[serde(default)]
+    pub retry_at: Option<i64>,
     /// Root of the folder, so a retry can walk it again after a restart without
     /// keeping the whole file list.
     #[serde(default)]
@@ -188,6 +198,36 @@ const WALK_BACKOFF_MS: u64 = 1_500;
 const FOLDER_WINDOW: usize = 24;
 /// How often a folder task re-reads its children and announces its progress.
 const FOLDER_TICK_MS: u64 = 400;
+
+/// How many automatic restarts a transfer gets before it is left failed.
+pub const MAX_AUTO_RETRIES: u32 = 10;
+
+/// Backoff for attempt `n` (1-based): 5s, 15s, 45s, then 2 minutes.
+pub fn retry_delay(attempt: u32) -> i64 {
+    match attempt {
+        0 | 1 => 5_000,
+        2 => 15_000,
+        3 => 45_000,
+        _ => 120_000,
+    }
+}
+
+/// Is this failure the kind a retry can fix? One classifier only — the engine
+/// already asks `is_retryable` before spending another round on a file.
+pub fn retryable(message: &str) -> bool {
+    is_retryable(&AppError::new(message))
+}
+
+/// Kinds the supervisor can hand back to a worker without inventing a new row.
+/// A single-file upload is *not* resumable: the drive has to be sent the file
+/// again from the first byte, so it restarts as a fresh task instead.
+fn resumable_kind(task: &TransferTask) -> bool {
+    match task.kind.as_str() {
+        "download" | "folder" | "cross" | "copy" | "move" => true,
+        "upload" => task.upload_dir.is_some(),
+        _ => false,
+    }
+}
 
 /// Sort bucket for the transfer list: 0 = running, 1 = waiting (queued or
 /// paused), 2 = finished. Mirrored by `STATUS_RANK` in TransfersView.vue.
@@ -414,6 +454,55 @@ impl TransferManager {
     /// resume it. (Previously only finished tasks survived, which is why an
     /// interrupted download vanished from the list while its `.part` stayed
     /// behind on disk.)
+    /// Called when the supervisor could not restart a queued task: parks it for
+    /// another backoff, or marks it failed once the attempts are used up.
+    pub async fn defer_retry(&self, id: &str, app: &AppHandle, message: &str) -> String {
+        let now = now_millis();
+        let too_many = std::sync::atomic::AtomicBool::new(false);
+        let delay = std::sync::atomic::AtomicI64::new(0);
+        let text = message.to_string();
+        self.patch(id, app, |t| {
+            t.attempts += 1;
+            if t.attempts > MAX_AUTO_RETRIES {
+                too_many.store(true, std::sync::atomic::Ordering::Relaxed);
+                t.status = "failed".into();
+                t.retry_at = None;
+                t.error = Some(format!("自动重试 {} 次仍未成功：{text}", MAX_AUTO_RETRIES));
+                return;
+            }
+            let wait = retry_delay(t.attempts);
+            delay.store(wait, std::sync::atomic::Ordering::Relaxed);
+            t.status = "queued".into();
+            t.retry_at = Some(now + wait);
+            t.error = Some(text.clone());
+        })
+        .await;
+        if too_many.load(std::sync::atomic::Ordering::Relaxed) {
+            "已放弃".to_string()
+        } else {
+            format!("{} 秒后重试", delay.load(std::sync::atomic::Ordering::Relaxed) / 1000)
+        }
+    }
+
+    /// Tasks the supervisor should pick up right now: queued, not owned by a
+    /// live worker (a queued task waiting for a slot already has its token) and
+    /// past its retry deadline as well as ones that never had one — that is
+    /// exactly the set `restore()` left behind and the set an auto-retry parked.
+    pub async fn due_retries(&self) -> Vec<String> {
+        let now = now_millis();
+        let tasks = self.tasks.read().await;
+        let cancels = self.cancels.lock().await;
+        let mut due: Vec<String> = tasks
+            .values()
+            .filter(|t| t.status == "queued")
+            .filter(|t| !cancels.contains_key(&t.id))
+            .filter(|t| t.retry_at.is_none_or(|at| at <= now))
+            .map(|t| t.id.clone())
+            .collect();
+        due.sort();
+        due
+    }
+
     pub async fn restore(self: &Arc<Self>, app: &AppHandle) {
         let Some(path) = self.store.clone() else {
             return;
@@ -431,9 +520,19 @@ impl TransferManager {
         let skip = saved.len().saturating_sub(100);
         for mut task in saved.into_iter().rev().skip(skip) {
             if !matches!(task.status.as_str(), "done" | "failed" | "canceled") {
-                task.status = "paused".to_string();
+                // A job that was moving (or waiting its turn) when the app died
+                // continues on start; only an explicit pause keeps it parked.
+                // The supervisor picks it up within a second.
+                task.status = if task.status == "paused" {
+                    "paused".to_string()
+                } else {
+                    "queued".to_string()
+                };
                 task.error = None;
                 task.speed = 0.0;
+                task.attempts = 0;
+                task.retry_at = None;
+                task.listing = false;
                 // Believe the partial file's plan rather than the saved
                 // counter — and not its length: the engine pre-allocates the
                 // file to its full size on the first write, so the length says
@@ -897,6 +996,8 @@ impl TransferManager {
             children_total: 0,
             children_done: 0,
             children_failed: 0,
+            attempts: 0,
+            retry_at: None,
             folder: None,
             upload_dir: None,
         };
@@ -963,6 +1064,8 @@ impl TransferManager {
             children_total: 0,
             children_done: 0,
             children_failed: 0,
+            attempts: 0,
+            retry_at: None,
             folder: Some(folder),
             upload_dir: None,
         };
@@ -1099,6 +1202,8 @@ impl TransferManager {
             children_total: 0,
             children_done: 0,
             children_failed: 0,
+            attempts: 0,
+            retry_at: None,
             folder: None,
             upload_dir: Some(dir),
         };
@@ -1178,7 +1283,7 @@ impl TransferManager {
         });
     }
 
-    async fn snapshot(&self, id: &str) -> Option<TransferTask> {
+    pub async fn snapshot(&self, id: &str) -> Option<TransferTask> {
         self.tasks.read().await.get(id).cloned()
     }
 
@@ -2123,6 +2228,8 @@ impl TransferManager {
             children_total: 0,
             children_done: 0,
             children_failed: 0,
+            attempts: 0,
+            retry_at: None,
             folder: None,
             upload_dir: None,
         };
@@ -2353,6 +2460,8 @@ impl TransferManager {
             children_total: 0,
             children_done: 0,
             children_failed: 0,
+            attempts: 0,
+            retry_at: None,
             folder: None,
             upload_dir: None,
         };
@@ -3114,7 +3223,7 @@ fn is_retryable(err: &AppError) -> bool {
     // A verdict that will not change on a second attempt. These are checked
     // first: a message can mention a connection ("连接已关闭，写入磁盘失败")
     // while the real problem is the disk.
-    const TERMINAL: [&str; 10] = [
+    const TERMINAL: [&str; 15] = [
         "登录状态",
         "校验失败",
         "不一致",
@@ -3125,11 +3234,16 @@ fn is_retryable(err: &AppError) -> bool {
         "无权限",
         "不存在",
         "不支持",
+        "不允许",
+        "违规",
+        "找不到",
+        "forbidden",
+        "not found",
     ];
     if TERMINAL.iter().any(|needle| text.contains(needle)) {
         return false;
     }
-    const NEEDLES: [&str; 16] = [
+    const NEEDLES: [&str; 23] = [
         "timed out",
         "timeout",
         "connection",
@@ -3149,8 +3263,28 @@ fn is_retryable(err: &AppError) -> bool {
         "链接已失效",
         "连接过慢",
         "连接中断",
+        "网络",
+        "超时",
+        "限流",
+        "too many requests",
+        "429",
+        "不可用",
+        "temporarily",
     ];
-    NEEDLES.iter().any(|needle| text.contains(needle))
+    NEEDLES.iter().any(|needle| text.contains(needle)) || transient_status(&text)
+}
+
+/// A bare "503" in the message counts, but only as a standalone number: a
+/// byte count ("已下载 500 字节") must not look like an HTTP status.
+fn transient_status(text: &str) -> bool {
+    ["429", "500", "502", "503", "504"].iter().any(|code| {
+        text.match_indices(code).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + code.len()..].chars().next();
+            before.is_none_or(|c| !c.is_ascii_digit())
+                && after.is_none_or(|c| !c.is_ascii_digit())
+        })
+    })
 }
 
 async fn finish_failed(
@@ -3160,13 +3294,35 @@ async fn finish_failed(
     message: String,
     canceled: bool,
 ) {
+    let now = now_millis();
+    let mut retried = 0u32;
     manager
-        .patch(id, app, move |t| {
-            t.status = if canceled { "canceled".into() } else { "failed".into() };
-            t.error = if canceled { None } else { Some(message) };
+        .patch(id, app, |t| {
             t.speed = 0.0;
+            t.listing = false;
+            if canceled {
+                t.status = "canceled".into();
+                t.error = None;
+                return;
+            }
+            // A timeout, a dropped connection or a drive's rate limit is worth
+            // another go: the supervisor picks the task up once `retry_at`
+            // passes, so the user does not have to babysit an overnight queue.
+            if resumable_kind(t) && retryable(&message) && t.attempts < MAX_AUTO_RETRIES {
+                t.attempts += 1;
+                retried = t.attempts;
+                t.status = "queued".into();
+                t.retry_at = Some(now + retry_delay(t.attempts));
+                t.error = Some(message.clone());
+            } else {
+                t.status = "failed".into();
+                t.error = Some(message.clone());
+            }
         })
         .await;
+    if retried > 0 {
+        crate::ylog!("{} 失败，第 {retried} 次自动重试：{message}", id);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4087,6 +4243,8 @@ mod tests {
             children_total: 0,
             children_done: 0,
             children_failed: 0,
+            attempts: 0,
+            retry_at: None,
             folder: None,
             upload_dir: None,
         }
@@ -4229,6 +4387,69 @@ mod retry_tests {
         ] {
             assert!(is_retryable(&AppError::new(msg)), "should retry: {msg}");
         }
+    }
+
+    #[test]
+    fn the_queue_backs_off_and_then_stops_growing() {
+        assert_eq!(retry_delay(1), 5_000);
+        assert_eq!(retry_delay(2), 15_000);
+        assert_eq!(retry_delay(3), 45_000);
+        assert_eq!(retry_delay(9), 120_000);
+        assert_eq!(retry_delay(200), 120_000);
+    }
+
+    #[test]
+    fn a_refused_file_type_is_never_retried() {
+        assert!(retryable("115 网盘：连接被重置（connection reset）"));
+        assert!(retryable("服务器返回 503"));
+        assert!(!retryable("云盘不允许上传此类文件（.sh）"));
+        assert!(!retryable("没有权限"));
+    }
+
+    #[test]
+    fn a_single_file_upload_is_not_resumable() {
+        let mut task = TransferTask {
+            id: "t1".into(),
+            kind: "upload".into(),
+            name: "a.bin".into(),
+            fid: None,
+            local_path: "/tmp/a.bin".into(),
+            remote_dir_fid: Some("0".into()),
+            size: 10,
+            transferred: 0,
+            speed: 0.0,
+            status: "failed".into(),
+            error: None,
+            attempts: 0,
+            retry_at: None,
+            created_at: 0,
+            updated_at: 0,
+            rapid: false,
+            prepared: 0,
+            connections: 0,
+            segments: 0,
+            segments_done: 0,
+            part_path: None,
+            share: None,
+            provider: "quark".into(),
+            cross: None,
+            parent: None,
+            hidden: false,
+            listing: false,
+            children_total: 0,
+            children_done: 0,
+            children_failed: 0,
+            folder: None,
+            upload_dir: None,
+        };
+        assert!(
+            !resumable_kind(&task),
+            "a plain upload restarts, it does not resume"
+        );
+        task.kind = "folder".into();
+        assert!(resumable_kind(&task));
+        task.kind = "download".into();
+        assert!(resumable_kind(&task));
     }
 }
 // ---------------------------------------------------------------------------

@@ -26,6 +26,12 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// Desktop notifications for finished/failed transfers and share links.
     pub notifications: bool,
+    /// Row layout of the transfers list: `card` (roomy) or `compact` (dense table).
+    #[serde(default)]
+    pub transfer_density: String,
+    /// How a finished transfer announces itself: `system`, `inapp` or `silent`.
+    #[serde(default)]
+    pub notify_mode: String,
 }
 
 impl Default for Settings {
@@ -42,6 +48,8 @@ impl Default for Settings {
             last_dir_fid: "0".to_string(),
             close_to_tray: true,
             notifications: true,
+            transfer_density: "card".to_string(),
+            notify_mode: "system".to_string(),
         }
     }
 }

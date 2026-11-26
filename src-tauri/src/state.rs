@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -44,6 +44,8 @@ pub struct AppState {
     /// read from both worlds safely.
     pub close_to_tray: AtomicBool,
     pub notifications: AtomicBool,
+    /// 0 = system notification, 1 = in-app toast, 2 = silent.
+    pub notify_mode: AtomicU8,
     /// Every drive, built lazily the first time one is used.
     ///
     /// `RwLock<Option<...>>` rather than a plain field because construction is
@@ -72,6 +74,11 @@ impl AppState {
             paths,
             close_to_tray: AtomicBool::new(settings.close_to_tray),
             notifications: AtomicBool::new(settings.notifications),
+            notify_mode: AtomicU8::new(match settings.notify_mode.as_str() {
+                "inapp" => 1,
+                "silent" => 2,
+                _ => 0,
+            }),
             cookie: RwLock::new(cookie),
             client: RwLock::new(None),
             providers: RwLock::new(None),
@@ -220,6 +227,12 @@ impl AppState {
     /// True when desktop notifications are enabled. Safe from any thread.
     pub fn notifications_enabled(&self) -> bool {
         self.notifications.load(Ordering::Relaxed)
+            && self.notify_mode.load(Ordering::Relaxed) != 2
+    }
+
+    /// 0 = system notification, 1 = in-app toast, 2 = silent.
+    pub fn notify_mode(&self) -> u8 {
+        self.notify_mode.load(Ordering::Relaxed)
     }
 
     pub async fn update_settings(&self, next: Settings) -> AppResult<Settings> {
@@ -230,6 +243,14 @@ impl AppState {
         self.close_to_tray.store(next.close_to_tray, Ordering::Relaxed);
         self.notifications
             .store(next.notifications, Ordering::Relaxed);
+        self.notify_mode.store(
+            match next.notify_mode.as_str() {
+                "inapp" => 1,
+                "silent" => 2,
+                _ => 0,
+            },
+            Ordering::Relaxed,
+        );
         crate::config::save_settings(&self.paths, &next)?;
         // The concurrency limit lives in the transfer manager so queued jobs
         // can pick it up without a restart.
