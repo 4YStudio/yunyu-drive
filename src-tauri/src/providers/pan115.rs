@@ -768,6 +768,7 @@ impl DriveProvider for Pan115Provider {
             req = req.header(reqwest::header::RANGE, format!("bytes={start}-"));
         }
         let res = req
+            .streaming()
             .send()
             .await
             .map_err(|e| AppError::new(format!("115 下载请求失败：{e}")))?;

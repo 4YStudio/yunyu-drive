@@ -223,6 +223,7 @@ impl AliyunProvider {
         for referer in candidates {
             let mut request = client
                 .get(url)
+                .streaming()
                 .header(reqwest::header::REFERER, referer)
                 .header(reqwest::header::USER_AGENT, UA)
                 .header(reqwest::header::ACCEPT, "*/*")

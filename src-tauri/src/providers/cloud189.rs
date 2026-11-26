@@ -1345,6 +1345,7 @@ impl DriveProvider for Cloud189Provider {
             req = req.header("Range", format!("bytes={start}-"));
         }
         let res = req
+            .streaming()
             .send()
             .await
             .map_err(|e| net_error("下载文件", &e))?;
